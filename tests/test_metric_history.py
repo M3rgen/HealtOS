@@ -116,9 +116,7 @@ async def test_month_pages_cover_full_archive_and_filter_sources(
     assert second["end_date"] == "2026-08-31"
     assert len(second["days"]) == 30
     assert not any(row["partial"] for row in second["days"])
-    assert {row["date"] for row in first["days"]}.isdisjoint(
-        row["date"] for row in second["days"]
-    )
+    assert {row["date"] for row in first["days"]}.isdisjoint(row["date"] for row in second["days"])
     assert next(row for row in second["days"] if row["date"] == "2026-08-12")["value"] == expected
     assert (
         await client.get("/api/dashboard/history", params={"metric": metric, "page": 3})
@@ -161,9 +159,7 @@ async def test_archive_has_no_history_cutoff_and_uses_requested_civil_days(clien
     assert data["end_date"] == today.isoformat()
     assert data["total_pages"] == (today - date(2020, 1, 1)).days // 30 + 1
     last = (
-        await client.get(
-            "/api/dashboard/history", params={**params, "page": data["total_pages"]}
-        )
+        await client.get("/api/dashboard/history", params={**params, "page": data["total_pages"]})
     ).json()
     assert next(row for row in last["days"] if row["date"] == "2020-01-01")["value"] == 600
 

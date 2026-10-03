@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="500" viewBox="0 0 1600 500" role="img" aria-labelledby="title desc">
+<title id="title">HealtOS — Your health, in your hands.</title>
+<desc id="desc">A dark green banner with a gold pulse line and the HealtOS wordmark.</desc>
+<defs>
+<linearGradient id="bg" x2="1" y2="1"><stop stop-color="#142a23"/><stop offset="1" stop-color="#101a17"/></linearGradient>
+<pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse"><path d="M50 0H0V50" fill="none" stroke="#d9e7dc" stroke-opacity=".045"/></pattern>
+</defs>
+<rect width="1600" height="500" rx="20" fill="url(#bg)"/>
+<rect width="1600" height="500" rx="20" fill="url(#grid)"/>
+<circle cx="1310" cy="245" r="168" fill="none" stroke="#f0c478" stroke-opacity=".15"/>
+<circle cx="1310" cy="245" r="132" fill="none" stroke="#f0c478" stroke-opacity=".09"/>
+<path d="M1080 250h102l34-55 43 109 39-161 45 107h177" fill="none" stroke="#f0c478" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="100" y="94" fill="#a7beae" font-family="Arial, sans-serif" font-size="17" letter-spacing="5">PERSONAL HEALTH · SELF-HOSTED</text>
+<text x="94" y="228" fill="#f4f0e5" font-family="Arial, sans-serif" font-size="116" font-weight="700" letter-spacing="-7">Healt<tspan fill="#f0c478" font-weight="400">OS</tspan></text>
+<text x="100" y="307" fill="#f4f0e5" font-family="Arial, sans-serif" font-size="35">Your health, in your hands.</text>
+<text x="101" y="355" fill="#a7beae" font-family="Arial, sans-serif" font-size="21">Archive your history. Understand your patterns. Keep control.</text>
+<path d="M100 412h705" stroke="#a7beae" stroke-opacity=".2"/>
+<text x="100" y="451" fill="#a7beae" font-family="Arial, sans-serif" font-size="15" letter-spacing="2">GOOGLE HEALTH API v4 / POSTGRESQL / OPTIONAL AI</text>
+</svg>
