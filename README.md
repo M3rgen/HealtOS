@@ -5,6 +5,7 @@
 <p>A personal health archive. A calm dashboard. A home for your data.</p>
 
 [![CI](https://github.com/M3rgen/HealtOS/actions/workflows/ci.yml/badge.svg)](https://github.com/M3rgen/HealtOS/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.5.0-f0c478)](https://github.com/M3rgen/HealtOS/tree/v0.5.0)
 [![MIT License](https://img.shields.io/badge/license-MIT-d0ae70)](LICENSE)
 ![Self-hosted](https://img.shields.io/badge/self--hosted-your_hardware-2d6a4f)
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776ab)
@@ -201,7 +202,7 @@ Backups are written to `BACKUP_HOST_DIR` (`./backups` by default). They contain 
 
 ## Project status and license
 
-HealtOS is an evolving personal self-hosted project. The public snapshot includes the application, migrations, deterministic dependency locks, automated tests, and CI. Google access and available records vary by project and account. The current interface is Turkish, defaults to UTC, and has English documentation.
+**Current version: 0.5.0.** HealtOS is an evolving personal self-hosted project. The public snapshot includes the application, migrations, deterministic dependency locks, automated tests, and CI. Google access and available records vary by project and account. The current interface is Turkish, defaults to UTC, and has English documentation.
 
 Project code is available under the [MIT License](LICENSE). The generic anatomical model retains its [MakeHuman provenance and CC0 license](frontend/public/models/PROVENANCE.md).
 

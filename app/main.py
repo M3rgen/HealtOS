@@ -55,7 +55,7 @@ def create_app() -> FastAPI:
 
     application = FastAPI(
         title="Personal Health Data Mirror",
-        version="0.1.0",
+        version="0.5.0",
         description="Read-only, raw-first archive of Google Health API data",
         lifespan=lifespan,
     )
