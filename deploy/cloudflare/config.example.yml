@@ -1,0 +1,9 @@
+# Secret-free template. Render placeholders into an untracked host-level config.
+tunnel: ${CLOUDFLARE_TUNNEL_ID}
+credentials-file: ${CLOUDFLARED_CREDENTIALS_FILE}
+
+ingress:
+  - hostname: ${CLOUDFLARE_WEBHOOK_HOSTNAME}
+    path: ^/webhooks/google-health$
+    service: http://127.0.0.1:${APP_PORT}
+  - service: http_status:404

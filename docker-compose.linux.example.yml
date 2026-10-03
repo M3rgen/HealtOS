@@ -1,0 +1,12 @@
+# Future Linux template only. Do not use until migration preconditions are met.
+# Set LINUX_BACKUP_HOST_DIR to a deliberately provisioned, owned, protected path.
+services:
+  backup:
+    volumes:
+      - type: bind
+        source: ${LINUX_BACKUP_HOST_DIR:?Set LINUX_BACKUP_HOST_DIR before using the Linux template}
+        target: /backups
+      - type: bind
+        source: ./scripts
+        target: /scripts
+        read_only: true

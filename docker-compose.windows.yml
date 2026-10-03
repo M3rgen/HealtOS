@@ -1,0 +1,13 @@
+# Optional current-Windows override. The base file remains the default deployment.
+# Set WINDOWS_BACKUP_HOST_DIR to an existing Docker Desktop-accessible directory
+# before including this file.
+services:
+  backup:
+    volumes:
+      - type: bind
+        source: ${WINDOWS_BACKUP_HOST_DIR:?Set WINDOWS_BACKUP_HOST_DIR before using the Windows override}
+        target: /backups
+      - type: bind
+        source: ./scripts
+        target: /scripts
+        read_only: true

@@ -1,0 +1,18 @@
+[Unit]
+Description=Cloudflare Tunnel for Google Health webhook
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/cloudflared/tunnel.env
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config ${CLOUDFLARED_CONFIG_FILE} tunnel run
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

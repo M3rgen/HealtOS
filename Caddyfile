@@ -1,0 +1,11 @@
+{$WEBHOOK_HOST} {
+	@google_health_webhook path /webhooks/google-health
+
+	handle @google_health_webhook {
+		reverse_proxy app:8000
+	}
+
+	handle {
+		respond 404
+	}
+}

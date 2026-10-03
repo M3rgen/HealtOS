@@ -1,0 +1,103 @@
+services:
+  postgres:
+    image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: health
+      POSTGRES_USER: health
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U health -d health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - database
+    # Deliberately no public port. Use the optional development override if needed.
+
+  app:
+    build: .
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file: ${APP_ENV_FILE:-.env}
+    environment:
+      APP_HOST: 0.0.0.0
+      DATABASE_URL: postgresql+asyncpg://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
+      RECONCILIATION_ENABLED: ${RECONCILIATION_ENABLED:-true}
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - database
+      - application
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 20s
+
+  backup:
+    image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    profiles: ["backup"]
+    environment:
+      DATABASE_URL_PG: postgresql://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      - ${BACKUP_HOST_DIR:-./backups}:/backups
+      - ./scripts:/scripts:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    restart: "no"
+    networks:
+      - database
+
+  caddy:
+    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    profiles: ["webhook"]
+    restart: unless-stopped
+    environment:
+      WEBHOOK_HOST: ${WEBHOOK_HOST:-webhook.invalid}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - application
+
+networks:
+  database:
+    internal: true
+  application:
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

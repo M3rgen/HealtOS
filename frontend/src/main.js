@@ -1,0 +1,169 @@
+import './style.css';
+import { createBody } from './body.js';
+import { renderIcons } from './icons.js';
+import { setupChat } from './chat.js';
+import { setupMetricHistory } from './metric-history.js';
+import { setupCalendar } from './calendar.js';
+import { setupHistoryPanel } from './history-panel.js';
+import { setupWorkouts } from './workouts.js';
+
+renderIcons();
+
+const $ = (id) => document.getElementById(id);
+const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (value, digits=0) => value == null ? '—' : Number(value).toLocaleString('tr-TR',{maximumFractionDigits:digits});
+const duration = (seconds) => seconds == null ? '—' : `${Math.floor(Math.round(seconds/60)/60)} sa ${Math.round(seconds/60)%60} dk`;
+const metrics={height:['Boy','cm'],weight:['Kilo','kg'],body_fat:['Yağ oranı','%'],muscle:['Kas oranı','%']};
+const states={empty:'Kayıt yok',partial:'Devam ediyor',complete:'Kayıt var',missing:'Eksik ölçüm'};
+function readPreference(key,fallback){try{return localStorage.getItem(key)??fallback;}catch{return fallback;}}
+function writePreference(key,value){try{localStorage.setItem(key,value);}catch{/* Restricted browser storage still allows using the app. */}}
+let zone=readPreference('healtos.timezone','UTC');
+if(!['Europe/Istanbul','UTC'].includes(zone))zone='UTC';
+let data=null,health=null,busy=false,pendingRefresh=false,activePage='overview',poll=null;
+let selectedDate=null;
+const motion=true;
+$('timezone').value=zone; $('model-motion').checked=motion;
+const body=createBody($('body-model'),motion);
+const shortDate=(value)=>new Intl.DateTimeFormat('tr-TR',{timeZone:zone,day:'numeric',month:'short'}).format(new Date(value));
+const fullDate=(value)=>new Intl.DateTimeFormat('tr-TR',{timeZone:zone,day:'numeric',month:'long',year:'numeric'}).format(new Date(value));
+const timeOf=(value)=>new Intl.DateTimeFormat('tr-TR',{timeZone:zone,hour:'2-digit',minute:'2-digit'}).format(new Date(value));
+function today(){const parts=new Intl.DateTimeFormat('en-CA',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());const get=(type)=>parts.find(x=>x.type===type).value;return `${get('year')}-${get('month')}-${get('day')}`;}
+function civilDate(value){return new Date(`${value}T12:00:00Z`);}
+function notice(message,error=false,source='general'){$('notice').hidden=false;$('notice').textContent=message;$('notice').classList.toggle('error',error);$('notice').dataset.source=source;}
+function clearSyncNotice(includeStart=false){if($('notice').dataset.source==='sync'||(includeStart&&$('notice').dataset.source==='sync-start')){$('notice').hidden=true;$('notice').textContent='';}}
+async function request(url,options={}){
+  const response=await fetch(url,{...options,cache:'no-store',signal:AbortSignal.timeout(20000)});
+  const payload=await response.json();
+  if(!response.ok){const detail=payload.detail;throw new Error(typeof detail==='string'?detail:Array.isArray(detail)?detail.map(x=>x.msg).join(' '):'İşlem tamamlanamadı.');}
+  return payload;
+}
+function query(){return new URLSearchParams({days:7,timezone:zone,...(selectedDate?{end_date:selectedDate}:{})});}
+function timeHtml(value){return value?`${escape(timeOf(value))}<small>${escape(fullDate(value))}</small>`:'—';}
+function setState(id,text,good){$(id).textContent=text;$(id).className=good?'good':'warning';}
+function paintHealth(){
+  if(!health)return;
+  const status=health.status;
+  $('service-status').textContent=status==='healthy'?'Servis çalışıyor':status==='failed'?'Servis hatası':'Kontrol gerekiyor';
+  $('service-status').className=`status-text ${status==='healthy'?'good':status==='failed'?'bad':'warning'}`;
+  $('last-sync').innerHTML=timeHtml(health.last_sync_success);
+  $('last-heart').innerHTML=timeHtml(health.data_freshness?.heart_rate);
+  $('last-steps').innerHTML=timeHtml(health.data_freshness?.steps);
+  setState('database-state',health.database==='healthy'?'Çalışıyor':'Ulaşılamıyor',health.database==='healthy');
+  setState('scheduler-state',health.scheduler==='running'?'Çalışıyor':health.scheduler==='disabled'?'Kapalı':'Durdu',health.scheduler==='running');
+  $('webhook-info').innerHTML=health.latest_health_write?`Son veri güncellemesi: ${escape(fullDate(health.latest_health_write))} · ${escape(timeOf(health.latest_health_write))}<small>Google’dan alınan verilerin veritabanına son kaydedildiği zaman.</small>`:'Henüz veri kaydedilmedi.<small>Verileri almak için Şimdi eşitle düğmesini kullan.</small>';
+  $('queue-state').textContent=`${num(health.pending_notifications??0)} bekleyen · ${num((health.failed_notifications??0)+(health.failed_syncs??0))} hata`;
+  const details=[['Servis',status==='healthy'?'Çalışıyor':status==='failed'?'Hata':'Kontrol gerekiyor'],['Google yapılandırması',health.configuration==='healthy'?'Hazır':'Eksik'],['Son kontrol',health.checked_at?`${shortDate(health.checked_at)} ${timeOf(health.checked_at)}`:'—'],['Son veri yazımı',health.latest_health_write?`${shortDate(health.latest_health_write)} ${timeOf(health.latest_health_write)}`:'—'],['Son Google bildirimi',health.last_webhook_received?`${fullDate(health.last_webhook_received)} ${timeOf(health.last_webhook_received)}`:'Henüz bildirim alınmadı'],['Bildirim hataları',num(health.failed_notifications??0)],['Eşitleme hataları',num(health.failed_syncs??0)],['Geciken veri türleri',num(health.stale_streams?.length??0)]];
+  $('system-details').innerHTML=details.map(([label,value])=>`<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('');
+}
+function bars(values,color,alternate=color){
+  if(!values.some(v=>v!=null))return '<p class="empty-chart">Bu dönemde veri yok</p>';
+  const max=Math.max(...values.filter(v=>v!=null),1),width=240/values.length;
+  return `<svg viewBox="0 0 240 42" preserveAspectRatio="none" aria-hidden="true">${values.map((v,i)=>v==null?'':`<rect x="${i*width+1}" y="${40-v/max*35}" width="${Math.max(width-3,1)}" height="${Math.max(v/max*35,1)}" rx="1" fill="${i%2?alternate:color}"><title>${i}: ${num(v,1)}</title></rect>`).join('')}</svg>`;
+}
+function line(values){
+  const present=values.filter(v=>v!=null);if(!present.length)return '<p class="empty-chart">Bu dönemde veri yok</p>';
+  const min=Math.min(...present)-3,max=Math.max(...present)+3;
+  let paths=[],points=[];
+  values.forEach((v,i)=>{if(v==null){if(points.length)paths.push(points);points=[];}else points.push([i/23*240,38-(v-min)/(max-min)*32]);});if(points.length)paths.push(points);
+  return `<svg viewBox="0 0 240 42" preserveAspectRatio="none" aria-hidden="true">${paths.map(points=>points.length===1?`<circle cx="${points[0][0]}" cy="${points[0][1]}" r="2" fill="var(--heart-chart)"/>`:`<polyline points="${points.map(p=>p.join(',')).join(' ')}" stroke="var(--heart-chart)" fill="none" stroke-width="2"/>`).join('')}</svg>`;
+}
+function paintData(){
+  const first=data.days[0];
+  $('profile-values').innerHTML=Object.entries(metrics).map(([key,[label,unit]])=>{
+    const item=data.profile[key];return `<div class="measurement"><label>${label}</label><button data-metric="${key}" aria-label="${label} için manuel ölçüm ekle">${item?`${num(item.value,1)} ${unit}`:'—'}</button><small>${item?escape(shortDate(item.measured_at)):key==='muscle'?'Manuel ölçüm':'Henüz ölçüm yok'}</small></div>`;
+  }).join('');
+  $('steps-label').textContent=first.partial?'Bugünkü adım':'Seçilen gün adım';
+  $('sleep-label').textContent=first.partial?'Son gece uyku':'Seçilen gün uyku';
+  $('steps-value').textContent=num(first.steps);
+  $('sleep-value').textContent=duration(first.sleep_seconds);
+  $('heart-value').textContent=first.resting_bpm==null?'—':`${num(first.resting_bpm)} bpm`;
+  $('steps-note').textContent=first.steps==null?'Adım kaydı yok':first.partial?'Gün devam ediyor':shortDate(civilDate(first.date));
+  $('steps-note').classList.toggle('ongoing-badge',first.partial&&first.steps!=null);
+  $('sleep-note').textContent=first.sleep_seconds==null?'Uyku kaydı yok':shortDate(civilDate(first.date));
+  $('heart-note').textContent=first.resting_bpm==null?'Günlük özet yok':shortDate(civilDate(first.date));
+  $('steps-chart').innerHTML=bars(data.charts.steps,'var(--step-chart)');
+  $('sleep-chart').innerHTML=bars([...data.days].reverse().map(r=>r.sleep_seconds),'var(--sleep-light)','var(--sleep-dark)');
+  $('sleep-axis').textContent=`${data.days.length} gün`;
+  $('heart-chart').innerHTML=line(data.charts.heart_rate);
+  $('steps-chart').setAttribute('aria-label',`Seçilen günün saatlik adımları: ${data.charts.steps.map((v,i)=>`${i}:00 ${num(v)}`).join(', ')}`);
+  $('heart-chart').setAttribute('aria-label',`Seçilen günün saatlik ortalama nabzı: ${data.charts.heart_rate.map((v,i)=>`${i}:00 ${num(v,1)}`).join(', ')}`);
+  $('sleep-chart').setAttribute('aria-label',data.days.map(r=>`${r.date}: ${duration(r.sleep_seconds)}`).join(', '));
+  historyPanel.update(data);
+}
+function paintHistory(data){
+  $('history-title').textContent='Son 7 gün';
+  $('range-caption').textContent=`${shortDate(civilDate(data.start_date))} – ${fullDate(civilDate(data.end_date))}`;
+  $('export-button').href=`/api/dashboard/export.csv?${new URLSearchParams({days:data.days.length,end_date:data.end_date,timezone:data.timezone})}`;
+  $('history-rows').innerHTML=data.days.map(row=>`<tr class="${row.partial?'today-row':''}"><td>${escape(shortDate(civilDate(row.date)))}</td><td>${num(row.steps)}</td><td>${duration(row.sleep_seconds)}</td><td>${row.resting_bpm==null?'—':`${num(row.resting_bpm)} bpm`}</td><td>${row.hrv_ms==null?'—':`${num(row.hrv_ms,1)} ms`}</td><td>${row.spo2==null?'—':`%${num(row.spo2,1)}`}</td><td><span class="dot ${row.status==='complete'||row.status==='partial'?'good':'warning'}">${states[row.status]}</span></td></tr>`).join('');
+}
+async function refresh(){
+  if(busy){pendingRefresh=true;return;}
+  busy=true;
+  try{
+    const results=await Promise.allSettled([
+      request(`/api/dashboard?${query()}`),
+      fetch('/health',{cache:'no-store',signal:AbortSignal.timeout(15000)}).then(r=>r.json()),
+    ]);
+    if(results[0].status==='fulfilled'){data=results[0].value;paintData();}else notice('Veriler alınamadı. Bağlantını kontrol edip tekrar dene.',true);
+    if(results[1].status==='fulfilled'){health=results[1].value;paintHealth();}else{health=null;$('service-status').textContent='Servise ulaşılamıyor';$('service-status').className='status-text bad';$('system-details').textContent='Servise ulaşılamıyor. Durumu yenilemeyi dene.';}
+    if(health){
+      if(health.failed_syncs>0){
+        try{
+          const rows=await request('/sync/status');
+          const failed=rows.filter(row=>row.status==='failed'||row.last_error);
+          if(failed.length)notice(`Eşitleme hatası: ${failed.map(row=>`${row.data_type}: ${row.last_error||'Eşitleme tamamlanamadı.'}`).join(' · ')}`,true,'sync');
+        }catch{notice('Eşitlemede hata oluştu. Hata ayrıntıları alınamadı; Sistem bölümünü kontrol et.',true,'sync');}
+      }else clearSyncNotice();
+    }
+    calendar.update();
+  }finally{busy=false;if(pendingRefresh){pendingRefresh=false;refresh();}}
+}
+async function loadMeasurements(){
+  try{const rows=await request('/api/dashboard/measurements');$('measurement-rows').innerHTML=rows.length?rows.map(row=>`<tr><td>${escape(fullDate(row.measured_at))} ${escape(timeOf(row.measured_at))}</td><td>${metrics[row.metric][0]}</td><td>${num(row.value,2)} ${metrics[row.metric][1]}</td><td>Manuel</td></tr>`).join(''):'<tr><td colspan="4">Henüz manuel ölçüm yok. Ölçüm ekleyerek başlayabilirsin.</td></tr>';}
+  catch{notice('Ölçüm geçmişi alınamadı. Tekrar dene.',true);}
+}
+async function loadSystem(){
+  try{const rows=await request('/sync/status');$('sync-rows').innerHTML=rows.length?rows.map(row=>`<tr><td>${escape(row.data_type)}</td><td>${row.last_successful_sync?`${escape(shortDate(row.last_successful_sync))} ${escape(timeOf(row.last_successful_sync))}`:'—'}</td><td>${escape(({completed:'Tamamlandı',running:'Çalışıyor',pending:'Bekliyor',failed:'Başarısız'})[row.status]??row.status)}</td><td>${num(row.records_downloaded)}</td></tr>`).join(''):'<tr><td colspan="4">Henüz eşitleme yapılmadı.</td></tr>';}
+  catch{notice('Eşitleme durumu alınamadı. Tekrar dene.',true);}
+}
+function setPage(page){activePage=page;document.querySelectorAll('.page').forEach(el=>el.hidden=el.id!==page);document.querySelectorAll('[data-page]').forEach(el=>{el.classList.toggle('active',el.dataset.page===page);if(el.dataset.page===page)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');});if(page==='measurements')loadMeasurements();if(page==='system')loadSystem();if(page==='sports')workouts.update();}
+document.querySelectorAll('[data-page]').forEach(el=>el.addEventListener('click',()=>setPage(el.dataset.page)));
+function setBounds(){const key=$('measurement-metric').value;const [min,max]=({height:[30,260],weight:[1,500],body_fat:[0,100],muscle:[0,100]})[key];$('measurement-value').min=min;$('measurement-value').max=max;}
+function openMeasurement(metric='weight'){
+  $('measurement-form').reset();$('form-error').textContent='';$('measurement-metric').value=metric;
+  const local=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+  $('measurement-date').value=local;$('measurement-date').max=local;
+  $('input-timezone').textContent=`Bu formun saat dilimi: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
+  if(data?.profile[metric])$('measurement-value').value=data.profile[metric].value;
+  setBounds();$('measurement-dialog').showModal();$('measurement-value').focus();
+}
+$('add-measurement').addEventListener('click',()=>openMeasurement());
+$('measurements-add').addEventListener('click',()=>openMeasurement());
+$('profile-values').addEventListener('click',event=>{const el=event.target.closest('[data-metric]');if(el)openMeasurement(el.dataset.metric);});
+['measurement-close','measurement-cancel'].forEach(id=>$(id).addEventListener('click',()=>$('measurement-dialog').close()));
+$('measurement-metric').addEventListener('change',()=>{setBounds();$('measurement-value').value=data?.profile[$('measurement-metric').value]?.value??'';});
+$('measurement-form').addEventListener('submit',async event=>{
+  event.preventDefault();$('measurement-save').disabled=true;$('form-error').textContent='';
+  try{await request('/api/dashboard/measurements',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({metric:$('measurement-metric').value,value:$('measurement-value').value,measured_at:new Date($('measurement-date').value).toISOString()})});$('measurement-dialog').close();notice('Manuel ölçüm kaydedildi.');await refresh();if(activePage==='measurements')await loadMeasurements();}
+  catch(error){$('form-error').textContent=error.message;}
+  finally{$('measurement-save').disabled=false;}
+});
+$('sync-button').addEventListener('click',async()=>{
+  $('sync-button').disabled=true;
+  try{await request('/sync/all',{method:'POST',headers:{'X-HealthOS-Request':'1'}});clearSyncNotice(true);setTimeout(refresh,3000);}
+  catch(error){notice(`Eşitleme başlatılamadı: ${error.message}`,true,'sync-start');}
+  finally{$('sync-button').disabled=false;}
+});
+$('refresh-system').addEventListener('click',async()=>{await refresh();await loadSystem();});
+$('timezone').addEventListener('change',async()=>{zone=$('timezone').value;writePreference('healtos.timezone',zone);await refresh();if(activePage==='system')await loadSystem();if(activePage==='sports')await workouts.update();});
+function updateMotion(){body.setMotion($('model-motion').checked);}
+$('model-motion').addEventListener('change',()=>{writePreference('healtos.motion',String($('model-motion').checked));updateMotion();});
+matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change',updateMotion);updateMotion();
+setupChat(() => zone);
+setupMetricHistory(() => zone);
+const calendar=setupCalendar({getToday:today,getSelected:()=>selectedDate,onSelect:(date)=>{selectedDate=date===today()?null:date;refresh();}});
+const historyPanel=setupHistoryPanel({request,getZone:()=>zone,getToday:today,paint:paintHistory});
+const workouts=setupWorkouts({request,getZone:()=>zone,getToday:today,escape,num,duration,fullDate,timeOf});
+await refresh();
+poll=setInterval(async()=>{if(!document.hidden&&!$('measurement-dialog').open){await refresh();if(activePage==='system')await loadSystem();if(activePage==='sports')await workouts.update();}},60000);
+window.addEventListener('pagehide',()=>clearInterval(poll));
