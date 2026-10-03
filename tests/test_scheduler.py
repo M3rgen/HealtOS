@@ -9,6 +9,7 @@ def test_daily_and_weekly_reconciliation_schedule_is_configurable():
 
     scheduler = build_scheduler(
         Settings(
+            reconciliation_enabled=True,
             reconciliation_daily_hour_utc=4,
             reconciliation_daily_days=8,
             reconciliation_weekly_day="mon",
@@ -37,7 +38,7 @@ def test_watchdog_schedule_is_bounded_and_non_overlapping():
             return None
 
     scheduler = build_scheduler(
-        Settings(watchdog_interval_seconds=600),
+        Settings(watchdog_enabled=True, watchdog_interval_seconds=600),
         Reconciliation(),
         Watchdog(),
     )
