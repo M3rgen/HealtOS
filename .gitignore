@@ -53,3 +53,6 @@ oauth-token*
 *.pfx
 *.token
 *.credentials.json
+
+# macOS
+.DS_Store
