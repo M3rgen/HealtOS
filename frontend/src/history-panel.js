@@ -1,3 +1,5 @@
+import { enhanceMonthInput } from './calendar.js';
+
 export function setupHistoryPanel({request, getZone, getToday, paint}) {
   const $ = id => document.getElementById(id);
   const panel = $('history-panel'), toggle = $('history-toggle'), month = $('history-month');
@@ -6,6 +8,7 @@ export function setupHistoryPanel({request, getZone, getToday, paint}) {
   panel.before(placeholder);
   let expanded = false, weekly, version = 0, pointer, dragged = false, animation, sheet;
   month.value = month.max = getToday().slice(0, 7);
+  enhanceMonthInput(month);
 
   async function update(data = weekly) {
     weekly = data;

@@ -1,17 +1,23 @@
+import { enhanceMonthInput } from './calendar.js';
+
 export function setupWorkouts({request,getZone,getToday,escape,num,duration,fullDate,timeOf}) {
   const $ = id => document.getElementById(id);
   const month = $('workout-month'), form = $('workout-form'), editor = $('workout-editor');
   let version = 0;
   month.value = month.max = getToday().slice(0,7);
+  enhanceMonthInput(month);
+  const panel = month.closest('.workouts-panel');
   async function update() {
     const token = ++version;
     month.max = getToday().slice(0,7);
     $('workout-status').textContent = 'Antrenmanlar yükleniyor…';
     $('workout-rows').replaceChildren();
+    delete panel.dataset.empty;
     try {
       if (!month.value || month.value > month.max) throw new Error('Geçerli bir ay seç.');
       const rows = await request(`/api/dashboard/workouts?${new URLSearchParams({month:`${month.value}-01`,timezone:getZone()})}`);
       if (token !== version) return;
+      panel.toggleAttribute('data-empty', !rows.length);
       $('workout-status').textContent = rows.length ? `${num(rows.length)} antrenman` : 'Bu ay antrenman kaydı yok. Fitbit’i eşitleyebilir veya antrenman ekleyebilirsin.';
       $('workout-rows').innerHTML = rows.map(row => `<tr><td>${escape(fullDate(row.start_time))}<small class="workout-time">${escape(timeOf(row.start_time))} – ${escape(timeOf(row.end_time))}</small></td><td>${escape(row.exercise_type || 'Antrenman')}</td><td>${duration(row.duration_seconds)}</td><td>${num(row.calories_kcal,1)}${row.calories_kcal == null ? '' : ' kcal'}</td><td>${num(row.distance_meters == null ? null : row.distance_meters/1000,2)}${row.distance_meters == null ? '' : ' km'}</td><td>${escape(row.source)}</td></tr>`).join('');
     } catch (error) { if (token === version) $('workout-status').textContent = `${error.message} Ayı yeniden seçerek tekrar dene.`; }

@@ -14,8 +14,9 @@ export function setupCalendar({ getToday, getSelected, onSelect }) {
   function render() {
     const restoreFocus = days.contains(document.activeElement);
     const value = selected();
-    trigger.textContent = format(civil(value), { day: 'numeric', month: 'long', year: 'numeric' });
-    trigger.setAttribute('aria-label', `${trigger.textContent}, tarih seç`);
+    const label = format(civil(value), { day: 'numeric', month: 'long', year: 'numeric' });
+    (document.getElementById('header-date-text') || trigger).textContent = label;
+    trigger.setAttribute('aria-label', `${label}, tarih seç`);
     document.getElementById('calendar-selected').textContent = format(civil(value), { weekday: 'long', day: 'numeric', month: 'long' });
     document.getElementById('calendar-month').textContent = format(month, { month: 'long', year: 'numeric' });
     const start = new Date(month);
@@ -96,4 +97,33 @@ export function setupCalendar({ getToday, getSelected, onSelect }) {
   setMonth(civil(focused));
   render();
   return { update: render };
+}
+
+// Native month inputs render their text in the browser's UI locale. Where the
+// browser supports type=month, overlay the value as a Turkish label ("Ekim
+// 2026") while the native control stays focusable, keyboard-editable and
+// opens its own picker. Browsers without a month picker keep the plain field.
+export function enhanceMonthInput(input) {
+  if (!input || input.type !== 'month' || input.closest('.month-field')) return;
+  const field = document.createElement('span');
+  field.className = 'month-field';
+  const label = document.createElement('span');
+  label.className = 'month-label';
+  label.setAttribute('aria-hidden', 'true');
+  input.before(field);
+  field.append(input, label);
+  const render = () => {
+    const value = input.value;
+    label.textContent = /^\d{4}-\d{2}$/.test(value) ? format(civil(`${value}-01`), { month: 'long', year: 'numeric' }) : '—';
+  };
+  const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+  Object.defineProperty(input, 'value', {
+    configurable: true,
+    get() { return native.get.call(this); },
+    set(value) { native.set.call(this, value); render(); },
+  });
+  input.addEventListener('input', render);
+  input.addEventListener('change', render);
+  input.addEventListener('click', () => { try { input.showPicker(); } catch { /* Focus still allows keyboard entry. */ } });
+  render();
 }

@@ -1,6 +1,6 @@
 import './style.css';
 import { createBody } from './body.js';
-import { renderIcons } from './icons.js';
+import { renderIcons, iconMarkup } from './icons.js';
 import { setupChat } from './chat.js';
 import { setupMetricHistory } from './metric-history.js';
 import { setupCalendar } from './calendar.js';
@@ -53,25 +53,36 @@ function paintHealth(){
   $('webhook-info').innerHTML=health.latest_health_write?`Son veri güncellemesi: ${escape(fullDate(health.latest_health_write))} · ${escape(timeOf(health.latest_health_write))}<small>Google’dan alınan verilerin veritabanına son kaydedildiği zaman.</small>`:'Henüz veri kaydedilmedi.<small>Verileri almak için Şimdi eşitle düğmesini kullan.</small>';
   $('queue-state').textContent=`${num(health.pending_notifications??0)} bekleyen · ${num((health.failed_notifications??0)+(health.failed_syncs??0))} hata`;
   const details=[['Servis',status==='healthy'?'Çalışıyor':status==='failed'?'Hata':'Kontrol gerekiyor'],['Google yapılandırması',health.configuration==='healthy'?'Hazır':'Eksik'],['Son kontrol',health.checked_at?`${shortDate(health.checked_at)} ${timeOf(health.checked_at)}`:'—'],['Son veri yazımı',health.latest_health_write?`${shortDate(health.latest_health_write)} ${timeOf(health.latest_health_write)}`:'—'],['Son Google bildirimi',health.last_webhook_received?`${fullDate(health.last_webhook_received)} ${timeOf(health.last_webhook_received)}`:'Henüz bildirim alınmadı'],['Bildirim hataları',num(health.failed_notifications??0)],['Eşitleme hataları',num(health.failed_syncs??0)],['Geciken veri türleri',num(health.stale_streams?.length??0)]];
+  $('google-empty').hidden=health.configuration==='healthy';
   $('system-details').innerHTML=details.map(([label,value])=>`<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('');
 }
+// Card sparklines: gradient bars with rounded tops and a smooth line with a soft area.
+// preserveAspectRatio="none" stretches x, so strokes and dots use non-scaling-stroke.
+const smooth=(p)=>p.map((pt,i)=>{if(!i)return `M${pt[0]},${pt[1]}`;const a=p[i-2]||p[i-1],b=p[i-1],d=p[i+1]||pt;return `C${b[0]+(pt[0]-a[0])/6},${b[1]+(pt[1]-a[1])/6} ${pt[0]-(d[0]-b[0])/6},${pt[1]-(d[1]-b[1])/6} ${pt[0]},${pt[1]}`;}).join('');
 function bars(values,color,alternate=color){
   if(!values.some(v=>v!=null))return '<p class="empty-chart">Bu dönemde veri yok</p>';
-  const max=Math.max(...values.filter(v=>v!=null),1),width=240/values.length;
-  return `<svg viewBox="0 0 240 42" preserveAspectRatio="none" aria-hidden="true">${values.map((v,i)=>v==null?'':`<rect x="${i*width+1}" y="${40-v/max*35}" width="${Math.max(width-3,1)}" height="${Math.max(v/max*35,1)}" rx="1" fill="${i%2?alternate:color}"><title>${i}: ${num(v,1)}</title></rect>`).join('')}</svg>`;
+  const max=Math.max(...values.filter(v=>v!=null),1),width=240/values.length,id=`bar-${color.replace(/\W/g,'')}`;
+  const fill=(c,key)=>`<linearGradient id="${id}-${key}" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="41"><stop offset="0" style="stop-color:${c}"/><stop offset="1" style="stop-color:${c};stop-opacity:.38"/></linearGradient>`;
+  const bar=(v,i)=>{const w=Math.max(width*(values.length>12?.62:.7),1),x=i*width+(width-w)/2,h=Math.max(v/max*35,0),y=41-h,r=Math.min(1.6,w/2,h);
+    if(h<1)return `<rect x="${x}" y="40" width="${w}" height="1" fill="${i%2?alternate:color}" opacity=".35"><title>${i}: ${num(v,1)}</title></rect>`;
+    return `<path d="M${x},41V${y+r}Q${x},${y} ${x+r},${y}H${x+w-r}Q${x+w},${y} ${x+w},${y+r}V41Z" fill="url(#${id}-${i%2?'b':'a'})"><title>${i}: ${num(v,1)}</title></path>`;};
+  return `<svg viewBox="0 0 240 42" preserveAspectRatio="none" aria-hidden="true"><defs>${fill(color,'a')}${fill(alternate,'b')}</defs><path d="M0,41.5H240" stroke="var(--line)" vector-effect="non-scaling-stroke"/>${values.map((v,i)=>v==null?'':bar(v,i)).join('')}</svg>`;
 }
 function line(values){
   const present=values.filter(v=>v!=null);if(!present.length)return '<p class="empty-chart">Bu dönemde veri yok</p>';
   const min=Math.min(...present)-3,max=Math.max(...present)+3;
   let paths=[],points=[];
   values.forEach((v,i)=>{if(v==null){if(points.length)paths.push(points);points=[];}else points.push([i/23*240,38-(v-min)/(max-min)*32]);});if(points.length)paths.push(points);
-  return `<svg viewBox="0 0 240 42" preserveAspectRatio="none" aria-hidden="true">${paths.map(points=>points.length===1?`<circle cx="${points[0][0]}" cy="${points[0][1]}" r="2" fill="var(--heart-chart)"/>`:`<polyline points="${points.map(p=>p.join(',')).join(' ')}" stroke="var(--heart-chart)" fill="none" stroke-width="2"/>`).join('')}</svg>`;
+  const last=paths.at(-1).at(-1),stroke='stroke="var(--heart-chart)" vector-effect="non-scaling-stroke" stroke-linecap="round"';
+  return `<svg viewBox="0 0 240 42" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="line-heart-area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--heart-chart);stop-opacity:.26"/><stop offset="1" style="stop-color:var(--heart-chart);stop-opacity:0"/></linearGradient></defs><path d="M0,41.5H240" stroke="var(--line)" vector-effect="non-scaling-stroke"/>${paths.map(p=>p.length===1?'':`<path d="${smooth(p)}V42H${p[0][0]}Z" fill="url(#line-heart-area)"/><path d="${smooth(p)}" fill="none" ${stroke} stroke-linejoin="round" stroke-width="2"/>`).join('')}${paths.filter(p=>p.length===1).map(p=>`<path d="M${p[0][0]},${p[0][1]}h0" ${stroke} stroke-width="4"/>`).join('')}<path d="M${last[0]},${last[1]}h0" ${stroke} stroke-width="11" opacity=".22"/><path d="M${last[0]},${last[1]}h0" ${stroke} stroke-width="5.5"/></svg>`;
 }
 function paintData(){
   const first=data.days[0];
   $('profile-values').innerHTML=Object.entries(metrics).map(([key,[label,unit]])=>{
-    const item=data.profile[key];return `<div class="measurement"><label>${label}</label><button data-metric="${key}" aria-label="${label} için manuel ölçüm ekle">${item?`${num(item.value,1)} ${unit}`:'—'}</button><small>${item?escape(shortDate(item.measured_at)):key==='muscle'?'Manuel ölçüm':'Henüz ölçüm yok'}</small></div>`;
+    const item=data.profile[key];return `<div class="measurement"><label><span class="measure-icon">${iconMarkup(key)}</span>${label}</label><button data-metric="${key}" aria-label="${label} için manuel ölçüm ekle">${item?`${num(item.value,1)} ${unit}`:'—'}</button><small>${item?escape(shortDate(item.measured_at)):key==='muscle'?'Manuel ölçüm':'Henüz ölçüm yok'}</small></div>`;
   }).join('');
+  // Drive the 3D body's morphs from the latest profile measurements (missing values keep the basis).
+  body.setBodyMetrics({heightCm:data.profile.height?.value,weightKg:data.profile.weight?.value,bodyFatPct:data.profile.body_fat?.value,musclePct:data.profile.muscle?.value});
   $('steps-label').textContent=first.partial?'Bugünkü adım':'Seçilen gün adım';
   $('sleep-label').textContent=first.partial?'Son gece uyku':'Seçilen gün uyku';
   $('steps-value').textContent=num(first.steps);
@@ -119,7 +130,7 @@ async function refresh(){
   }finally{busy=false;if(pendingRefresh){pendingRefresh=false;refresh();}}
 }
 async function loadMeasurements(){
-  try{const rows=await request('/api/dashboard/measurements');$('measurement-rows').innerHTML=rows.length?rows.map(row=>`<tr><td>${escape(fullDate(row.measured_at))} ${escape(timeOf(row.measured_at))}</td><td>${metrics[row.metric][0]}</td><td>${num(row.value,2)} ${metrics[row.metric][1]}</td><td>Manuel</td></tr>`).join(''):'<tr><td colspan="4">Henüz manuel ölçüm yok. Ölçüm ekleyerek başlayabilirsin.</td></tr>';}
+  try{const rows=await request('/api/dashboard/measurements');$('measurement-rows').innerHTML=rows.length?rows.map(row=>`<tr><td>${escape(fullDate(row.measured_at))} ${escape(timeOf(row.measured_at))}</td><td><span class="cell-icon">${iconMarkup(row.metric)}</span>${metrics[row.metric][0]}</td><td>${num(row.value,2)} ${metrics[row.metric][1]}</td><td>Manuel</td></tr>`).join(''):'<tr><td colspan="4">Henüz manuel ölçüm yok. Ölçüm ekleyerek başlayabilirsin.</td></tr>';}
   catch{notice('Ölçüm geçmişi alınamadı. Tekrar dene.',true);}
 }
 async function loadSystem(){

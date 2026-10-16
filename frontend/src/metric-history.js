@@ -16,43 +16,64 @@ function valueLabel(metric, value) {
   return `${number(value, metric === 'heart' ? 1 : 0)} ${metric === 'heart' ? 'bpm' : 'adım'}`;
 }
 
-function chart(metric, days) {
+// Drawn at the plot's real pixel size so text and strokes are never stretched.
+function chart(metric, days, width = 1020, height = 236) {
   const values = days.filter(day => day.value != null).map(day => day.value);
   if (!values.length) return '<p class="history-empty">Bu dönemde kayıt yok.</p>';
+  const W = Math.max(280, Math.round(width)), H = Math.max(140, Math.round(height));
+  const compact = W < 560;
   const high = Math.max(...values, 1) * 1.12;
   const low = metric === 'heart' ? Math.max(0, Math.min(...values) - 8) : 0;
   const max = metric === 'heart' ? Math.max(...values) + 8 : high;
-  const x = (i) => 58 + i * 918 / (days.length - 1 || 1);
-  const y = (v) => 188 - (v - low) / (max - low) * 160;
+  const tick = (v) => metric === 'sleep' ? `${number(v / 3600, 1)} sa` : number(v);
+  const left = Math.max(36, Math.max(...[low, max].map(v => tick(v).length)) * 6.6 + 16), right = W - 8, top = 12, bottom = H - 28;
+  const step = (right - left - 16) / (days.length - 1 || 1);
+  const x = (i) => left + 8 + i * step;
+  const y = (v) => bottom - (v - low) / (max - low) * (bottom - top);
+  const color = metrics[metric].color;
   const title = (day) => `${date(day.date, true)}: ${valueLabel(metric, day.value)}${day.partial ? ' · Gün devam ediyor' : ''}`;
+  const defs = `<defs><linearGradient id="history-fill" gradientUnits="userSpaceOnUse" x1="0" y1="${top}" x2="0" y2="${bottom}"><stop offset="0" style="stop-color:${color}"/><stop offset="1" style="stop-color:${color};stop-opacity:${metric === 'heart' ? 0 : .42}"/></linearGradient></defs>`;
   let marks = '';
   if (metric === 'heart') {
     let points = [];
+    const smooth = (p) => p.map((pt, i) => {
+      if (!i) return `M${pt[0]},${pt[1]}`;
+      const a = p[i - 2] || p[i - 1], b = p[i - 1], d = p[i + 1] || pt;
+      return `C${b[0] + (pt[0] - a[0]) / 6},${b[1] + (pt[1] - a[1]) / 6} ${pt[0] - (d[0] - b[0]) / 6},${pt[1] - (d[1] - b[1]) / 6} ${pt[0]},${pt[1]}`;
+    }).join('');
     const flush = () => {
-      if (points.length > 1) marks += `<polyline points="${points.join(' ')}" fill="none" stroke="${metrics[metric].color}" stroke-width="3"/>`;
+      if (points.length > 1) marks = `<path d="${smooth(points)}V${bottom}H${points[0][0]}Z" fill="url(#history-fill)" opacity=".5"/><path d="${smooth(points)}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>` + marks;
       points = [];
     };
     days.forEach((day, i) => {
       if (day.value == null) { flush(); return; }
-      points.push(`${x(i)},${y(day.value)}`);
-      marks += `<circle cx="${x(i)}" cy="${y(day.value)}" r="4" fill="${metrics[metric].color}"><title>${title(day)}</title></circle>`;
+      points.push([x(i), y(day.value)]);
+      marks += `<circle cx="${x(i)}" cy="${y(day.value)}" r="${compact ? 3 : 3.5}" fill="var(--surface-2)" stroke="${color}" stroke-width="2"${day.partial ? ' stroke-dasharray="2 2"' : ''}><title>${title(day)}</title></circle>`;
     });
     flush();
   } else {
+    const w = Math.max(3, Math.min(22, step * .62)), r = Math.min(4, w / 2);
     days.forEach((day, i) => {
       if (day.value == null) return;
-      marks += `<rect x="${x(i) - 10}" y="${y(day.value)}" width="20" height="${Math.max(1, 188 - y(day.value))}" rx="3" fill="${metrics[metric].color}" opacity="${day.partial ? '.55' : '1'}"><title>${title(day)}</title></rect>`;
+      const top = y(day.value), h = Math.max(1, bottom - top), bx = x(i) - w / 2, rr = Math.min(r, h);
+      marks += `<path d="M${bx},${bottom}V${top + rr}Q${bx},${top} ${bx + rr},${top}H${bx + w - rr}Q${bx + w},${top} ${bx + w},${top + rr}V${bottom}Z" fill="url(#history-fill)" opacity="${day.partial ? '.5' : '1'}"><title>${title(day)}</title></path>`;
     });
   }
-  const axis = [low, (max + low) / 2, max].map(v => `<path d="M48 ${y(v)}H990" stroke="var(--line)"/><text x="38" y="${y(v) + 4}" text-anchor="end">${metric === 'sleep' ? `${number(v / 3600, 1)} sa` : number(v)}</text>`).join('');
-  const labels = [0, 6, 12, 18, 24, days.length - 1].filter((i, at, all) => i < days.length && all.indexOf(i) === at).map(i => `<text x="${x(i)}" y="218" text-anchor="middle">${date(days[i].date)}</text>`).join('');
-  return `<svg viewBox="0 0 1020 236" preserveAspectRatio="none" aria-hidden="true">${axis}${marks}${labels}</svg>`;
+  const axis = [low, (max + low) / 2, max].map((v, i) => `<path d="M${left} ${y(v)}H${right}" stroke="var(--line)" ${i ? 'stroke-dasharray="2 4" opacity=".8"' : ''}/><text x="${left - 10}" y="${y(v) + 4}" text-anchor="end">${tick(v)}</text>`).join('');
+  const ticks = compact ? [0, 10, 20, days.length - 1] : [0, 6, 12, 18, 24, days.length - 1];
+  const labels = ticks.filter((i, at, all) => i < days.length && all.indexOf(i) === at).map(i => `<text x="${x(i)}" y="${H - 6}" text-anchor="middle">${date(days[i].date)}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true">${defs}${axis}${marks}${labels}</svg>`;
 }
 
 export function setupMetricHistory(getTimezone) {
   const $ = id => document.getElementById(id);
   const dialog = $('metric-history-dialog');
-  let currentMetric = 'steps', currentPage = 1, totalPages = 1, controller = null, opener = null;
+  let currentMetric = 'steps', currentPage = 1, totalPages = 1, controller = null, opener = null, plotted = null;
+  // Redraw at the new pixel size when the dialog or viewport resizes.
+  new ResizeObserver(() => {
+    const plot = $('metric-history-chart');
+    if (plotted && dialog.open && plot.clientWidth) plot.innerHTML = chart(plotted.metric, plotted.days, plot.clientWidth, plot.clientHeight);
+  }).observe($('metric-history-chart'));
 
   function pagination() {
     const nav = $('metric-history-pages');
@@ -104,7 +125,9 @@ export function setupMetricHistory(getTimezone) {
       $('metric-history-coverage').textContent = `${present.length} / ${days.length} gün kayıtlı`;
       $('metric-history-archive').textContent = result.earliest_date ? `Arşiv başlangıcı: ${date(result.earliest_date, true)}` : 'Arşivde henüz kayıt yok';
       const plot = $('metric-history-chart');
-      plot.innerHTML = chart(metric, days);
+      plotted = {metric, days};
+      $('metric-history-content').hidden = false;
+      plot.innerHTML = chart(metric, days, plot.clientWidth, plot.clientHeight);
       plot.setAttribute('aria-label', `${metrics[metric].title}, ${$('metric-history-range').textContent}`);
       const grid = $('metric-history-days'); grid.replaceChildren();
       days.forEach(day => {
