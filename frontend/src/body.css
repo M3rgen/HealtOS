@@ -1,0 +1,4 @@
+/* Canvas-internal presentation for the 3D body viewer (layout lives in style.css). */
+#body-model canvas{display:block;touch-action:pan-y;opacity:0;transition:opacity .45s ease}
+#body-model[data-model-loaded] canvas{opacity:1}
+@media (prefers-reduced-motion:reduce){#body-model canvas{transition:none}}

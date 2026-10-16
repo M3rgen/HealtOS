@@ -1,21 +1,57 @@
-# Anatomical reference model
+# Anatomical figure model (`body.glb`)
 
-`athletic-male.glb` is a locally bundled derivative of the official MakeHuman data assets, licensed **CC0 1.0 Universal**. No remote runtime request is made.
+`body.glb` is a morphable male figure with realistic but non-photographic skin, bundled locally. No remote runtime request is made. It derives from the official MakeHuman data assets, licensed **CC0 1.0 Universal**, plus original procedural work made for HealthOS. Nothing comes from a scan, an AI generator, a photo texture or any non-CC0 source. It is a generic figure, not a reconstruction of any person.
 
-Source project: https://github.com/makehumancommunity/makehuman
-Immutable source revision: `a8bc2d54ff0ac92e78ff71431b1023eda42bf482`
+## Sources (all CC0 1.0)
 
-Source asset paths at that revision:
-- `makehuman/data/3dobjs/base.obj`
-- `makehuman/data/targets/macrodetails/caucasian-male-young.target` (weight 1)
-- `makehuman/data/targets/macrodetails/universal-male-young-maxmuscle-averageweight.target` (weight 1)
-- `makehuman/data/targets/macrodetails/proportions/male-young-maxmuscle-averageweight-idealproportions.target` (weight 0.6)
+- Project: https://github.com/makehumancommunity/makehuman
+- Immutable revision: `a8bc2d54ff0ac92e78ff71431b1023eda42bf482`
+- Licence: https://github.com/makehumancommunity/makehuman/blob/a8bc2d54ff0ac92e78ff71431b1023eda42bf482/LICENSE.md. The asset licence explicitly covers base meshes, targets and rigs under CC0; the full legal text is bundled as `LICENSE-CC0.txt`.
+- Credit (voluntary under CC0): MakeHuman team / Data Collection AB / Joel Palmius / Jonas Hauquier.
 
-Official license: https://github.com/makehumancommunity/makehuman/blob/a8bc2d54ff0ac92e78ff71431b1023eda42bf482/LICENSE.md
-The project's asset license explicitly covers base meshes and morph targets under CC0. Full legal text is bundled as `LICENSE-CC0.txt`.
+Files used from `makehuman/data/` at that revision:
 
-Changes: applied male, athletic and ideal-proportion targets; removed helper meshes; lowered arms from the A pose with a smooth shoulder blend; performed one Catmull-Clark subdivision; computed smooth vertex normals; normalized height; exported a static untextured GLB. 53,514 vertices / 107,024 triangles, approximately 2.5 MB.
+- `3dobjs/base.obj`: groups `body`, `helper-l-eye`, `helper-r-eye` (UVs as shipped; the eye islands are enlarged into free atlas space).
+- `targets/macrodetails/universal-male-young-{min,average,max}muscle-{min,average,max}weight.target`, `{african,asian,caucasian}-male-young.target` (1/3 each), `proportions/male-young-*-idealproportions.target`.
+- Head (every shape): `head/head-age-decr`, `head/head-fat-decr`, `head/head-square`, `chin/chin-prominent-incr`, `eyes/{l,r}-eye-bag-decr`, `mouth/mouth-angles-up`.
+- Morph extremes only: `stomach/stomach-pregnant-incr`, `neck/neck-double-incr`, `buttocks/buttocks-volume-incr`, `torso/torso-muscle-{pectoral,dorsi}-incr`, `torso/torso-vshape-incr`, `armslegs/{l,r}-{upperarm,lowerarm,upperleg,lowerleg}-{fat,muscle}-{incr,decr}`, `armslegs/{l,r}-upperarm-shoulder-muscle-incr`.
+- Build-time posing only (no skeleton is shipped): `rigs/default.mhskel`, `rigs/default_weights.mhw`.
 
-This is a generic anatomical reference, not a scan or reconstruction of the account owner. Its face and muscle definition are artist-authored by MakeHuman and do not reproduce the generated design reference exactly. Source assets credited to the MakeHuman team / Data Collection AB / Joel Palmius / Jonas Hauquier; attribution is voluntarily preserved despite CC0 not requiring it.
+## Contents of `body.glb`
 
-Presentation refinement: `src/body.js` sculpts the continuous source geometry with pectoral borders, paired abdominal volumes, serratus and oblique relief, deltoids, upper arms, quadriceps, calves, scapular volumes, lats and spinal erectors. The waist tapers, the feet move closer under the hips, the forearms relax from their forward sweep, and the slightly enlarged head turns toward screen-right. Normals are recomputed after deformation. A warm silver material, directional studio lighting, self-shadowing and a soft ground shadow emphasize the sculpture. The model starts in a front three-quarter view and automatically oscillates over exactly 180 degrees, taking 30 seconds in each direction; the System motion control pauses it. These are original procedural presentation changes; the source GLB remains unchanged.
+- **Mesh:** one mesh `Body` with a single material. glTF Y-up, feet at y = 0, basis exactly 1.75 m tall, facing +Z, horizontal centre of mass over the origin. 23,271 vertices and 43,970 triangles, with POSITION, NORMAL, TANGENT (MikkTSpace, matching the bake) and TEXCOORD_0. No Draco or meshopt compression; 4.8 MiB.
+- **Pose:** natural contrapposto, readable from the front, made with linear-blend skinning on the MakeHuman weights:
+  - weight on the right leg, which stands straight under the body; the ribcage is shifted over it;
+  - left knee clearly bent (about 36°) and turned slightly out, heel lifted;
+  - pelvis dropped about 9° toward the relaxed side, shoulders counter-tilted about 5°;
+  - head turned and tilted a few degrees toward the standing side, mouth closed with relaxed lips;
+  - arms hanging naturally about 9.5° from vertical, soft elbows, hands beside the outer thigh.
+
+  The relaxed foot's toes touch the floor; the standing foot is at y = 0.
+- **Basis:** young adult male of a ~70 kg class build at ~20 % body fat (MakeHuman muscle 0.65, weight 0.5, ideal proportions 0.7).
+- **Geometry:** large torso, limb and cranium faces are subdivided once (cranium twice). Every vertex lies on the Catmull-Clark limit surface of the cage, as a fixed linear function of it, so the morphs stay fold-free. Muscle masses are sculpted into the geometry so that they shape the silhouette: deltoid cap, biceps, triceps, forearm masses, lats and V-taper, serratus, obliques over the iliac crest, pectorals, trapezius, erectors, glutes, quadriceps with the vastus medialis teardrop, the sartorius line and the gastrocnemius heads.
+- **Morph targets:** `fat_high`, `fat_low`, `muscle_high`, `muscle_low`, with POSITION and NORMAL deltas as sparse accessors.
+  - They are the same pipeline at other MakeHuman macro values: about 103 kg, 56 kg, 76 kg and 60 kg at the same height.
+  - Each target also scales the sculpted muscle masses: `fat_high` keeps 25 % of them, `fat_low` 135 %, `muscle_high` 145 %, `muscle_low` 60 %.
+  - `fat_high` and `muscle_high` open the arms (and stance) only as far as their volume needs.
+  - Every single target and every pair at weight 1 was checked: there is no interpenetration. Upper arm to torso is at least 8.2 mm, forearms and hands to the body at least 45 mm, thigh to thigh at least 6.5 mm.
+- **Normal map (PNG 2048):** procedural relief at muscle, vein and wrinkle scale. Rounded muscle bellies with soft, wide transitions: shallow wide abdominal intersections, a soft lower-pectoral fold, serratus bellies. Also superficial veins on the forearms, biceps and lower abdomen, hand and foot tendons and knuckles, fabric thickness at the hem, the hem stitch and waistband ribbing. There is no pore detail; a tiling micro-detail layer is applied separately.
+- **Base colour (sRGB JPEG 2048), procedurally painted:**
+  - skin on a single tunable base tone, `skinToneHex` **#ad8f7e** (medium, warm, mildly desaturated), with subtle low-frequency mottling;
+  - cooler tones under the jaw and on the inner arms; warmer knees, elbows, knuckles, cheeks, ears and nose tip; lighter palms and soles; nails;
+  - very short buzz-cut hair, light stubble with soft edges, and soft hair-like eyebrows, all as shading only;
+  - lips with a hint of colour;
+  - non-photoreal eyes: slightly off-white sclera, soft hazel-brown iris and pupil, with an upper-lid shadow and a lash line;
+  - dark fitted training shorts (#2a2824) with a waistband, a hem angled along the thigh and a dashed hem stitch, as a texture region of the same mesh.
+- **ORM (JPEG 1024):**
+  - R: body-scale ambient occlusion baked from the smooth surface without the fine relief, so fat still softens definition;
+  - G: roughness, oilier on the T-zone and lips, rougher on the scalp, soles and fabric;
+  - B: metallic 0.
+- **Material:** single-sided PBR (`baseColorTexture`, `metallicRoughnessTexture` + `occlusionTexture` sharing the ORM image, `normalTexture`).
+- **Extras:** `extras.healthos` carries `skinToneHex` and `suggestedNormalScale`, the formula `normalScale = min(1.25, max(0.05, pow(1 - fat_high, 1.8)) * (1 + 0.25 * fat_low))` with the numeric fields `max` 1.25, `min` 0.05, `exponent` 1.8 and `fatLowGain` 0.25.
+
+The build scripts and editable `.blend` are kept outside the repository; they are not needed at runtime.
+
+## Historical note
+
+The earlier `athletic-male.glb` (same MakeHuman CC0 sources, static and sculpted at runtime by `src/body.js`) is superseded by `body.glb` and is scheduled for removal.
