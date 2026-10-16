@@ -54,4 +54,4 @@ The build scripts and editable `.blend` are kept outside the repository; they ar
 
 ## Historical note
 
-The earlier `athletic-male.glb` (same MakeHuman CC0 sources, static and sculpted at runtime by `src/body.js`) is superseded by `body.glb` and is scheduled for removal.
+The earlier `athletic-male.glb` (same MakeHuman CC0 sources, static and sculpted at runtime by `src/body.js`) was superseded by `body.glb` and has been removed from the repository.

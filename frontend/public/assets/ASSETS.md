@@ -39,7 +39,7 @@ Provenance key:
 
 | Path | UI slot | Size | Made with | Provenance |
 |---|---|---|---|---|
-| umay/umay.webp | 512×512 full emblem (face plus protective wings and a bird diadem). Use for the chat header or any large image | 39 KB | gpt-image-2. The prompt used the existing local `src/assets/umay.png` as a character reference, so identity stays the same | AI-generated for HealthOS |
+| umay/umay.webp | 512×512 full emblem (face plus protective wings and a bird diadem). Use for the chat header or any large image | 39 KB | gpt-image-2. The prompt used the earlier `src/assets/umay.png` avatar (since removed) as a character reference, so identity stays the same | AI-generated for HealthOS |
 | umay/umay-256.webp | 256×256 version of the above | 14 KB | same | same |
 | umay/umay-64.webp | `.assistant-avatar` (44px circle, replaces `/src/assets/umay.png`). Face-centred crop so it reads at small size | 2 KB | same, cropped | same |
 | umay/umay-64@2x.webp | 128px retina version of the 44px avatar (`srcset`) | 4.8 KB | same, cropped | same |
