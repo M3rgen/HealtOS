@@ -69,6 +69,32 @@ const VIEWS = {
     await page.locator('#workout-rows tr').first().waitFor();
     await page.locator('#workout-add').click();
   },
+  appearance: async (page) => {
+    await page.locator('[data-page="system"]').click();
+    await page.waitForFunction(() => 'appearanceReady' in document.documentElement.dataset);
+    await page.locator('#appearance-open').click();
+    await page.locator('#appearance-dialog[open] .preset-tile').first().waitFor();
+  },
+  // Lane C presets applied, dialog closed: shows them on the real dashboard.
+  'appearance-preset': async (page) => {
+    await VIEWS.appearance(page);
+    for (const [kind, id] of [['logo', 'dial'], ['umay', 'engraved'], ['background', 'kilim']]) {
+      await page.locator(`input[name="appearance-${kind}"][value="${id}"]`).check();
+    }
+    await page.locator('#appearance-done').click();
+    await page.locator('[data-page="overview"]').click();
+    await page.waitForFunction(() => [...document.images].every(image => image.complete));
+  },
+  'appearance-uploaded': async (page) => {
+    await VIEWS.appearance(page);
+    const files = [['logo', 'logo.svg', 'image/svg+xml', fx.uploadLogoSvg()], ['umay', 'umay.png', 'image/png', fx.uploadAvatarPng()],
+      ['background', 'zemin.png', 'image/png', fx.uploadBackgroundPng()]];
+    for (const [kind, name, mimeType, buffer] of files) {
+      await page.locator(`input[data-upload="${kind}"]`).setInputFiles({ name, mimeType, buffer });
+      await page.locator(`input[name="appearance-${kind}"][value="upload"]:checked`).waitFor();
+    }
+    if (await page.evaluate(() => window.uploadedSvgRan || document.getElementById('uploaded-svg-marker'))) throw new Error('uploaded SVG reached the DOM');
+  },
   // Edge cases with alternate fixtures (see scenario() in fixtures.cjs).
   notice: { scenario: 'sync-error', run: async (page) => { await page.locator('#notice:not([hidden])').waitFor(); } },
   'empty-overview': { scenario: 'empty', run: async () => {} },
@@ -164,10 +190,12 @@ async function measure(page) {
   try {
     await Promise.all(opt.viewports.map(async (viewport) => {
       const [width, height] = viewport.split('x').map(Number);
-      const context = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 1,
+      const contextOptions = { viewport: { width, height }, deviceScaleFactor: 1,
         locale: 'tr-TR', timezoneId: 'UTC', reducedMotion: opt.reducedMotion ? 'reduce' : 'no-preference',
-        hasTouch: width < 600, isMobile: false });
+        hasTouch: width < 600, isMobile: false };
       for (const view of opt.views) {
+        // A fresh context per view: stored appearance/uploads never leak between views.
+        const context = await browser.newContext(contextOptions);
         const page = await context.newPage();
         const problems = [];
         page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
@@ -182,7 +210,7 @@ async function measure(page) {
         let result;
         try { result = await spec.run(page); } catch (e) { problems.push(`view step failed: ${e.message.split('\n')[0]}`); }
         const order = opt.viewports.indexOf(viewport) * 100 + opt.views.indexOf(view);
-        if (result === 'skip') { rows.push({ order, viewport, view, skipped: true }); await page.close(); continue; }
+        if (result === 'skip') { rows.push({ order, viewport, view, skipped: true }); await context.close(); continue; }
         await page.waitForFunction(() => document.getAnimations().every(a => a.playState !== 'running' || a.effect?.getComputedTiming().iterations === Infinity), null, { timeout: 2000 }).catch(() => {});
         await page.waitForTimeout(150);
         const m = await measure(page);
@@ -190,9 +218,8 @@ async function measure(page) {
         await page.screenshot({ path: path.join(opt.out, `${viewport}-${view}.png`) });
         if (overflow || problems.length) failed = true;
         rows.push({ order, viewport, view, ...m, overflow, problems });
-        await page.close();
+        await context.close();
       }
-      await context.close();
     }));
   } finally { await browser.close(); }
 

@@ -6,8 +6,10 @@ import { setupMetricHistory } from './metric-history.js';
 import { setupCalendar } from './calendar.js';
 import { setupHistoryPanel } from './history-panel.js';
 import { setupWorkouts } from './workouts.js';
+import { setupAppearance } from './appearance.js';
 
 renderIcons();
+setupAppearance();
 
 const $ = (id) => document.getElementById(id);
 const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

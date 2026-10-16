@@ -133,4 +133,36 @@ function scenario(name) {
   return {};
 }
 
-module.exports = { NOW, TODAY, health, dashboard, history, measurements, syncStatus, workouts, chatAnswer, scenario };
+// Synthetic upload files for the appearance views/tests (generated, no assets).
+const zlib = require('node:zlib');
+function crc32(buffer) {
+  let crc = ~0;
+  for (const byte of buffer) { crc ^= byte; for (let k = 0; k < 8; k++) crc = (crc >>> 1) ^ (0xEDB88320 & -(crc & 1)); }
+  return ~crc >>> 0;
+}
+function syntheticPng(width, height, paint) {
+  const chunk = (type, data) => {
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const out = Buffer.alloc(12 + data.length);
+    out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(crc32(body), 8 + data.length);
+    return out;
+  };
+  const rows = Buffer.alloc((width * 3 + 1) * height);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const [r, g, b] = paint(x / width, y / height);
+    rows.set([r, g, b], y * (width * 3 + 1) + 1 + x * 3);
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header.set([8, 2, 0, 0, 0], 8);
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', header), chunk('IDAT', zlib.deflateSync(rows)), chunk('IEND', Buffer.alloc(0))]);
+}
+// A teal disc on a dusk gradient: reads as a portrait-like avatar when cropped.
+const uploadAvatarPng = () => syntheticPng(320, 240, (u, v) => {
+  const d = Math.hypot(u - .5, (v - .45) * .75);
+  return d < .2 ? [72, 216, 176] : [Math.round(40 + 60 * v), Math.round(30 + 30 * u), Math.round(70 + 80 * (1 - v))];
+});
+const uploadBackgroundPng = () => syntheticPng(640, 400, (u, v) => [Math.round(30 + 90 * u), Math.round(50 + 40 * v), Math.round(90 + 60 * (1 - u))]);
+// Includes a script and an id marker: tests assert neither ever reaches the DOM.
+const uploadLogoSvg = () => Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" id="uploaded-svg-marker"><script>window.uploadedSvgRan=true</script><circle cx="24" cy="24" r="18" fill="none" stroke="#48d88c" stroke-width="5"/><path d="M15 24h18" stroke="#48d88c" stroke-width="5" stroke-linecap="round"/></svg>');
+
+module.exports = { NOW, TODAY, health, dashboard, history, measurements, syncStatus, workouts, chatAnswer, scenario, syntheticPng, uploadAvatarPng, uploadBackgroundPng, uploadLogoSvg };

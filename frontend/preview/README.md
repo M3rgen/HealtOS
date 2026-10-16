@@ -22,7 +22,7 @@ Options:
 | `--out <dir>` | required | PNGs are written as `<W>x<H>-<view>.png` |
 | `--base <url>` | `http://127.0.0.1:5174` | dev server to target |
 | `--viewports a,b` | `1920x976,1440x900,1280x720,1024x650,390x844,320x700` | |
-| `--views a,b` | all | `overview, history-drag, history-open, metric-history, calendar, umay-intro, umay, measurements, measurement-dialog, system, sports, sports-editor`, plus edge cases `notice` (sync error banner), `empty-overview`, `empty-history`, `empty-system`, `empty-sports` |
+| `--views a,b` | all | `overview, history-drag, history-open, metric-history, calendar, umay-intro, umay, measurements, measurement-dialog, system, sports, sports-editor`, plus edge cases `appearance`, `appearance-preset` (lane C presets on the dashboard), `appearance-uploaded` (synthetic SVG logo + PNG avatar/background uploads), `notice` (sync error banner), `empty-overview`, `empty-history`, `empty-system`, `empty-sports` |
 | `--reduced-motion` | off | emulates `prefers-reduced-motion: reduce` |
 
 ## Output
