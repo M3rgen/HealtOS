@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "logo": [
+    {
+      "id": "yurt",
+      "label": "Otağ",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/presets/logo/yurt/mark.svg",
+        "markMono": "/assets/presets/logo/yurt/mark-mono.svg",
+        "lockup": "/assets/presets/logo/yurt/lockup.svg",
+        "lockupMono": "/assets/presets/logo/yurt/lockup-mono.svg",
+        "favicon16": "/assets/presets/logo/yurt/favicon-16.png",
+        "favicon32": "/assets/presets/logo/yurt/favicon-32.png",
+        "faviconIco": "/assets/presets/logo/yurt/favicon.ico",
+        "appleTouch": "/assets/presets/logo/yurt/apple-touch-icon.png"
+      }
+    },
+    {
+      "id": "healthos",
+      "label": "HealthOS (klasik)",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/brand/healthos-mark-amber.svg",
+        "markMono": "/assets/brand/healthos-mark.svg",
+        "favicon": "/assets/brand/favicon.svg",
+        "faviconIco": "/assets/brand/favicon.ico",
+        "appleTouch": "/assets/brand/apple-touch-icon.png"
+      }
+    },
+    {
+      "id": "dial",
+      "label": "Kadran",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/presets/logo/dial/mark.svg",
+        "markMono": "/assets/presets/logo/dial/mark-mono.svg",
+        "lockup": "/assets/presets/logo/dial/lockup.svg",
+        "lockupMono": "/assets/presets/logo/dial/lockup-mono.svg",
+        "favicon": "/assets/presets/logo/dial/favicon.svg",
+        "favicon16": "/assets/presets/logo/dial/favicon-16.png",
+        "favicon32": "/assets/presets/logo/dial/favicon-32.png"
+      }
+    },
+    {
+      "id": "monogram-h",
+      "label": "Monogram",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/presets/logo/monogram-h/mark.svg",
+        "markMono": "/assets/presets/logo/monogram-h/mark-mono.svg",
+        "lockup": "/assets/presets/logo/monogram-h/lockup.svg",
+        "lockupMono": "/assets/presets/logo/monogram-h/lockup-mono.svg",
+        "favicon": "/assets/presets/logo/monogram-h/favicon.svg",
+        "favicon16": "/assets/presets/logo/monogram-h/favicon-16.png",
+        "favicon32": "/assets/presets/logo/monogram-h/favicon-32.png"
+      }
+    },
+    {
+      "id": "umay-wings",
+      "label": "Umay kanatları",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/presets/logo/umay-wings/mark.svg",
+        "markMono": "/assets/presets/logo/umay-wings/mark-mono.svg",
+        "lockup": "/assets/presets/logo/umay-wings/lockup.svg",
+        "lockupMono": "/assets/presets/logo/umay-wings/lockup-mono.svg",
+        "favicon": "/assets/presets/logo/umay-wings/favicon.svg",
+        "favicon16": "/assets/presets/logo/umay-wings/favicon-16.png",
+        "favicon32": "/assets/presets/logo/umay-wings/favicon-32.png"
+      }
+    },
+    {
+      "id": "pulse-h",
+      "label": "Canlı H",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/presets/logo/pulse-h/mark.svg",
+        "markMono": "/assets/presets/logo/pulse-h/mark-mono.svg",
+        "lockup": "/assets/presets/logo/pulse-h/lockup.svg",
+        "lockupMono": "/assets/presets/logo/pulse-h/lockup-mono.svg",
+        "favicon": "/assets/presets/logo/pulse-h/favicon.svg",
+        "favicon16": "/assets/presets/logo/pulse-h/favicon-16.png",
+        "favicon32": "/assets/presets/logo/pulse-h/favicon-32.png"
+      }
+    },
+    {
+      "id": "balance",
+      "label": "Denge",
+      "builtin": true,
+      "files": {
+        "mark": "/assets/presets/logo/balance/mark.svg",
+        "markMono": "/assets/presets/logo/balance/mark-mono.svg",
+        "lockup": "/assets/presets/logo/balance/lockup.svg",
+        "lockupMono": "/assets/presets/logo/balance/lockup-mono.svg",
+        "favicon": "/assets/presets/logo/balance/favicon.svg",
+        "favicon16": "/assets/presets/logo/balance/favicon-16.png",
+        "favicon32": "/assets/presets/logo/balance/favicon-32.png"
+      }
+    }
+  ],
+  "umay": [
+    {
+      "id": "umay",
+      "label": "Umay",
+      "builtin": true,
+      "files": {
+        "src512": "/assets/umay/umay.webp",
+        "src256": "/assets/umay/umay-256.webp",
+        "src64": "/assets/umay/umay-64.webp",
+        "src64x2": "/assets/umay/umay-64@2x.webp",
+        "glyph": "/assets/umay/umay-glyph.svg"
+      }
+    },
+    {
+      "id": "umay-alt",
+      "label": "Umay · afiş",
+      "builtin": true,
+      "files": {
+        "src512": "/assets/umay/umay-alt.webp",
+        "glyph": "/assets/umay/umay-glyph.svg"
+      }
+    },
+    {
+      "id": "flat",
+      "label": "Umay · sade amblem",
+      "builtin": true,
+      "files": {
+        "src512": "/assets/presets/umay/flat/umay.webp",
+        "src256": "/assets/presets/umay/flat/umay-256.webp",
+        "src64": "/assets/presets/umay/flat/umay-64.webp",
+        "src64x2": "/assets/presets/umay/flat/umay-64@2x.webp",
+        "glyph": "/assets/umay/umay-glyph.svg"
+      }
+    },
+    {
+      "id": "engraved",
+      "label": "Umay · gravür madalyon",
+      "builtin": true,
+      "files": {
+        "src512": "/assets/presets/umay/engraved/umay.webp",
+        "src256": "/assets/presets/umay/engraved/umay-256.webp",
+        "src64": "/assets/presets/umay/engraved/umay-64.webp",
+        "src64x2": "/assets/presets/umay/engraved/umay-64@2x.webp",
+        "glyph": "/assets/umay/umay-glyph.svg"
+      }
+    }
+  ],
+  "background": [
+    {
+      "id": "warm-grain",
+      "label": "Sıcak doku",
+      "builtin": true,
+      "files": {
+        "tile": "/assets/bg/grain-tile.webp",
+        "vignette": "/assets/bg/vignette.webp"
+      }
+    },
+    {
+      "id": "fine-grain",
+      "label": "İnce doku",
+      "builtin": true,
+      "files": {
+        "tile": "/assets/bg/grain-overlay.webp"
+      }
+    },
+    {
+      "id": "topo",
+      "label": "Topografik çizgiler",
+      "builtin": true,
+      "files": {
+        "tile": "/assets/presets/background/topo/tile.webp",
+        "vignette": "/assets/bg/vignette.webp"
+      },
+      "tileSize": 512
+    },
+    {
+      "id": "warm-mesh",
+      "label": "Sıcak degrade",
+      "builtin": true,
+      "files": {
+        "tile": "/assets/presets/background/warm-mesh/tile.webp",
+        "vignette": "/assets/bg/vignette.webp"
+      },
+      "tileSize": 768
+    },
+    {
+      "id": "kilim",
+      "label": "Kilim deseni",
+      "builtin": true,
+      "files": {
+        "tile": "/assets/presets/background/kilim/tile.webp",
+        "vignette": "/assets/bg/vignette.webp"
+      },
+      "tileSize": 240
+    }
+  ]
+}
