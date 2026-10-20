@@ -6,6 +6,8 @@ import argparse
 import re
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 PLACEHOLDERS = {"change_me", "changeme", "todo", "replace_me", "example-secret"}
 REQUIRED_PRODUCTION = {
@@ -62,9 +64,37 @@ def source_head() -> str:
     return heads[0]
 
 
+def compose_service(document: object, name: str) -> dict:
+    services = document.get("services") if isinstance(document, dict) else None
+    service = services.get(name) if isinstance(services, dict) else None
+    return service if isinstance(service, dict) else {}
+
+
+def service_environment(service: dict) -> dict[str, str]:
+    environment = service.get("environment") or {}
+    if isinstance(environment, list):
+        pairs = (item.split("=", 1) for item in environment if "=" in item)
+        return {name: value for name, value in pairs}
+    return {str(name): str(value) for name, value in environment.items()}
+
+
+def check_compose_runtime(compose_doc: object, dev_doc: object) -> list[str]:
+    errors: list[str] = []
+    app = compose_service(compose_doc, "app")
+    if service_environment(app).get("APP_ENV") != "production":
+        errors.append("docker-compose.yml app service must set APP_ENV: production")
+    dev_app = compose_service(dev_doc, "app")
+    if service_environment(dev_app).get("APP_ENV") != "development":
+        errors.append("docker-compose.dev.yml must override APP_ENV with development")
+    return errors
+
+
 def check_repository() -> list[str]:
     errors: list[str] = []
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    compose_doc = yaml.safe_load(compose)
+    dev_doc = yaml.safe_load((ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8"))
+    errors.extend(check_compose_runtime(compose_doc, dev_doc))
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     forbidden = ("POSTGRES_PASSWORD:-health", "postgresql://health:health@postgres")
     for value in forbidden:

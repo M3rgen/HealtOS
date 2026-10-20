@@ -29,6 +29,9 @@ services:
       - no-new-privileges:true
     env_file: ${APP_ENV_FILE:-.env}
     environment:
+      # The Compose stack is the deployment path, so the startup guard in
+      # app/core/config.py always runs here. docker-compose.dev.yml relaxes it.
+      APP_ENV: production
       APP_HOST: 0.0.0.0
       DATABASE_URL: postgresql+asyncpg://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
       RECONCILIATION_ENABLED: ${RECONCILIATION_ENABLED:-true}

@@ -213,7 +213,7 @@ docker compose ps
 curl.exe --fail http://127.0.0.1:8000/health
 ```
 
-The app runs `alembic upgrade head` before startup. Compose marks the app healthy only after `/health` can query PostgreSQL successfully. Compose refuses to start without `POSTGRES_PASSWORD`; production-mode application settings also reject missing or placeholder credentials.
+The app runs `alembic upgrade head` before startup. Compose marks the app healthy only after `/health` can query PostgreSQL successfully. Compose refuses to start without `POSTGRES_PASSWORD`. The base Compose file sets `APP_ENV=production` for the app service (overriding `.env`), so the application refuses to start with missing or placeholder credentials; `docker-compose.dev.yml` sets `APP_ENV=development` for local experiments.
 
 For local database access during development only:
 

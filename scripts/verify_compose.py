@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,26 @@ EXPECTED_REVISION = "20261017_0007"
 HOST_PORT = "18080"
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP_DIR = ROOT / f".compose-smoke-backups-{os.getpid()}"
+# Matches the `.env*` ignore rules, so it never enters Git or the image build context.
+SMOKE_ENV_FILE = ROOT / f".env.compose-smoke-{os.getpid()}"
+
+
+def write_smoke_env_file() -> None:
+    """Synthetic, non-placeholder values so the production guard (APP_ENV) passes."""
+    overrides = {
+        "GOOGLE_CLIENT_ID": "smoke-test-client-id",
+        "GOOGLE_CLIENT_SECRET": secrets.token_urlsafe(24),
+        "GOOGLE_TOKEN_ENCRYPTION_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+        "GOOGLE_HEALTH_WEBHOOK_ENDPOINT_URI": "https://webhook.example.com/webhooks/google-health",
+        "GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION": f"Bearer {secrets.token_urlsafe(24)}",
+    }
+    lines = [
+        line
+        for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if line.partition("=")[0].strip() not in overrides
+    ]
+    lines += [f"{name}={value}" for name, value in overrides.items()]
+    SMOKE_ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def find_docker() -> str | None:
@@ -95,7 +117,7 @@ def main() -> int:
     docker_bin = str(Path(DOCKER_COMMAND).parent)
     env.update(
         {
-            "APP_ENV_FILE": ".env.example",
+            "APP_ENV_FILE": SMOKE_ENV_FILE.name,
             "APP_PORT": HOST_PORT,
             "BACKUP_HOST_DIR": BACKUP_DIR.name,
             "PATH": docker_bin + os.pathsep + env.get("PATH", ""),
@@ -106,6 +128,7 @@ def main() -> int:
     )
     cleanup_needed = False
     try:
+        write_smoke_env_file()
         compose("config", "--quiet", env=env)
         cleanup_needed = True
         compose(
@@ -268,6 +291,7 @@ def main() -> int:
                 env=env,
                 check=False,
             )
+        SMOKE_ENV_FILE.unlink(missing_ok=True)
         if BACKUP_DIR.is_dir():
             resolved_root = ROOT.resolve()
             resolved_backup = BACKUP_DIR.resolve()
