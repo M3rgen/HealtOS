@@ -1,92 +1,97 @@
-# Cloudflare Tunnel deployment
+# Cloudflare Tunnel for the webhook
 
-The current deployment is a host-level Windows service. This document does not authorize replacing
-the tunnel, changing its public hostname, or printing credentials. The tracked example allows only
-`/webhooks/google-health`; the final ingress rule returns 404 for everything else.
+Detailed reference for step 7 of [DEPLOYMENT.md](DEPLOYMENT.md). The tunnel exists only so Google
+can deliver `POST /webhooks/google-health`. `cloudflared` opens outbound connections to Cloudflare,
+so the VM needs no inbound port. The dashboard and every other API route stay private.
 
-## Current Windows deployment
+Three layers keep it that way:
 
-**Current Windows command — install a pinned binary on a new host only:** download the selected
-`cloudflared-windows-amd64.exe` from the official Cloudflare release, verify its published checksum,
-rename it to `cloudflared.exe`, and record the version. Do not reinstall over the active service as
-part of routine verification. The version observed on 2026-08-25 was `2026.8.1`.
+1. **Tunnel ingress** ([`config.example.yml`](../deploy/cloudflare/config.example.yml)): one rule for
+   `${CLOUDFLARE_WEBHOOK_HOSTNAME}` with path `^/webhooks/google-health$` to
+   `http://127.0.0.1:${APP_PORT}`; the final rule is `http_status:404`.
+2. **Host validation in the app**: the hostname of `GOOGLE_HEALTH_WEBHOOK_ENDPOINT_URI` is accepted
+   only for `POST /webhooks/google-health`; any other method or path on it returns 400. Do not
+   override the Host header in the tunnel (`httpHostHeader`), or the app rejects the request.
+3. **Webhook authentication**: the exact `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` header (else 401),
+   a body limit (`GOOGLE_HEALTH_WEBHOOK_MAX_BODY_BYTES`, else 413), and Google's ECDSA signature on
+   every notification.
 
-**Verification-only command:**
+## Install cloudflared
 
-```powershell
-cloudflared --version
-Get-Service -Name cloudflared | Select-Object Name, Status, StartType
-```
+Download the `cloudflared-linux-<arch>` binary for the VM's architecture (`uname -m`) from the
+official [Cloudflare releases](https://github.com/cloudflare/cloudflared/releases), verify the
+published checksum, and install it as `/usr/local/bin/cloudflared`. Record the version. The systemd
+unit runs it with `--no-autoupdate`, so updates are deliberate (see the [runbook](RUNBOOK.md#update-images-and-cloudflared)).
 
-**Current Windows command — service control (causes a webhook interruption):**
+## Create the tunnel
 
-```powershell
-Start-Service cloudflared
-Stop-Service cloudflared
-Restart-Service cloudflared
-```
-
-Use those commands only in an approved maintenance window. `Restart-Service` is not a health check.
-
-**Verification-only command — Windows service events:**
-
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddHours(-1)} |
-  Where-Object ProviderName -Match 'cloudflared' |
-  Select-Object TimeCreated, LevelDisplayName, Message
-```
-
-Review locally. Do not paste log lines containing hostnames, tunnel IDs, tokens, or account data.
-Do not print the service command line: token-based installations may contain a token there.
-
-To confirm the origin target, locate the service's existing config path locally, then run
-`cloudflared tunnel ingress validate` against that config and compare its webhook rule with
-`http://127.0.0.1:<APP_PORT>`. Never print the config or credentials. Also confirm the app listener:
-
-```powershell
-# Verification-only command
-Get-NetTCPConnection -State Listen -LocalPort 8000 |
-  Select-Object LocalAddress, LocalPort, OwningProcess
-curl.exe --fail http://127.0.0.1:8000/health
-```
-
-The listener must be loopback-only on the host. PostgreSQL must have no published host port.
-
-For public route checks, enter the existing hostname interactively so it is not stored in shell
-history or tracked files. A request to `/health`, `/docs`, or any other non-webhook route must return
-Cloudflare/origin 404. The webhook verification POST should be performed only with the existing
-authorization header in a controlled end-to-end test; do not print that header and do not send a
-data notification. These checks do not modify Cloudflare configuration or the webhook URL.
-
-## Future Linux host template
-
-Use [config.example.yml](../deploy/cloudflare/config.example.yml) as a rendering source and keep the
-rendered file plus tunnel credentials outside the repository with owner-only permissions. Install
-the same explicitly selected cloudflared release for the server's confirmed CPU architecture,
-verify the vendor checksum, and disable in-process auto-update. Record the version and checksum.
-
-The [systemd example](../deploy/cloudflare/cloudflared.service.example) expects a protected
-`EnvironmentFile` containing only `CLOUDFLARED_CONFIG_FILE`. Render placeholder values before
-installation; cloudflared does not promise shell-style expansion inside YAML. Protect both config
-and credential JSON with root ownership and mode 0600.
-
-**Future Linux command:**
+Create a locally managed tunnel on an admin machine, not the VM, so the account-wide `cert.pem`
+never lands on the server:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable cloudflared
-sudo systemctl start cloudflared
-sudo systemctl status cloudflared
-sudo journalctl -u cloudflared --since '1 hour ago'
+cloudflared tunnel login
+cloudflared tunnel create healthos-webhook          # writes <tunnel-id>.json
+cloudflared tunnel route dns healthos-webhook webhook.example.com
 ```
 
-Do not start the Linux service until the Windows scheduler is disabled and the cutover checkpoint in
-the migration runbook is approved. Transfer the existing tunnel credential securely; do not create
-a second active tunnel or change DNS. Validate the rendered ingress with `cloudflared tunnel ingress
-validate` before starting it.
+Copy only `<tunnel-id>.json` to the VM, for example as `/etc/cloudflared/<tunnel-id>.json`, owned by
+root with mode 0600. Never commit it; `.gitignore` already excludes `deploy/cloudflare/*.json`.
 
-Host-level cloudflared is recommended for a future single-server Linux deployment: systemd can order
-it after networking, logs remain available even if Compose is unhealthy, and the tunnel lifecycle is
-separate from application rebuilds. A Compose-managed tunnel is more portable and has one control
-plane, but it couples ingress restarts to stack operations and adds credential mounts to Compose.
-Either model can be secure; retaining host-level operation minimizes cutover change.
+## Configure the service
+
+Render the template by replacing its four `${...}` placeholders (cloudflared does not expand
+variables inside YAML) and store the result outside the repository:
+
+```sh
+sudo install -d -m 700 /etc/cloudflared
+sudo cp deploy/cloudflare/config.example.yml /etc/cloudflared/config.yml
+sudoedit /etc/cloudflared/config.yml     # tunnel id, credentials path, hostname, app port (8000)
+sudo chmod 600 /etc/cloudflared/config.yml
+echo 'CLOUDFLARED_CONFIG_FILE=/etc/cloudflared/config.yml' | sudo tee /etc/cloudflared/tunnel.env >/dev/null
+sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate
+sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule \
+  https://webhook.example.com/health     # must match the 404 rule
+```
+
+Install the [systemd unit](../deploy/cloudflare/cloudflared.service.example), which reads
+`/etc/cloudflared/tunnel.env`, waits for the network and Docker, and restarts on failure:
+
+```sh
+sudo install -m 644 deploy/cloudflare/cloudflared.service.example /etc/systemd/system/cloudflared.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflared
+systemctl status cloudflared
+journalctl -u cloudflared --since '1 hour ago'
+```
+
+Running `cloudflared` on the host rather than in Compose keeps the tunnel's lifecycle and logs
+independent of application rebuilds, and keeps tunnel credentials out of the Compose project.
+
+## Verify the public surface
+
+From any machine outside the VM:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' https://webhook.example.com/              # 404
+curl -s -o /dev/null -w '%{http_code}\n' https://webhook.example.com/health        # 404
+curl -s -o /dev/null -w '%{http_code}\n' https://webhook.example.com/docs          # 404
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://webhook.example.com/webhooks/google-health  # 401
+```
+
+The 401 proves that Cloudflare, the tunnel and the app are connected and that authorization is
+enforced. A 502 or 530 means the tunnel is up but cannot reach `127.0.0.1:8000`, or the connector
+is down; a 400 `Invalid host` means `GOOGLE_HEALTH_WEBHOOK_ENDPOINT_URI` names a different hostname.
+Do not send a test request with the real authorization header from a shell; it would end up in
+shell history. Google's subscriber handshake (an authenticated verification body that must succeed
+and an unauthenticated one that must fail) is the end-to-end test.
+
+On the VM, confirm the private side:
+
+```sh
+ss -ltn | grep -E ':8000|:5432'          # only 127.0.0.1:8000, no 5432
+docker compose exec -T app health-mirror webhook-readiness
+docker compose exec -T app health-mirror webhook-status
+```
+
+Never paste `cloudflared` logs, the rendered config or the credentials file into an issue: they
+contain the tunnel ID and hostname. Running on Windows: see [legacy/WINDOWS.md](legacy/WINDOWS.md).

@@ -14,8 +14,8 @@ Resolved multi-architecture manifest-list digests recorded on 2026-08-25:
 | Caddy | `caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648` |
 
 Digests pin bytes while patch tags explain update intent and make reviews understandable. The listed
-digests are manifest lists, preserving architecture selection on Windows Docker Desktop and a future
-Linux Engine.
+digests are manifest lists, so Docker still selects the right architecture (for example amd64 or
+arm64) on any host.
 
 1. **Verification-only command:** inspect the candidate with `docker buildx imagetools inspect
    <patch-tag>`; confirm supported architectures and record the new digest. This does not pull it.
@@ -23,9 +23,10 @@ Linux Engine.
    metadata requires it.
 3. **Verification-only command:** run the lock, lint, unit, PostgreSQL migration, image build, and
    isolated Compose smoke gates.
-4. Create a fresh verified backup before approving deployment.
-5. **Current Windows command:** deploy in a maintenance window with `docker compose up --build -d`.
-   This may recreate containers; it is not a verification-only command.
+4. Create a fresh verified backup before approving deployment (`make backup`, then the restore
+   drill in the [runbook](RUNBOOK.md#backup-verify-and-restore-drill)).
+5. Deploy in a maintenance window with `docker compose up --build -d` on the VM. This recreates
+   containers; it is not a verification-only command.
 6. Verify health, Alembic head, scheduler ownership, webhook path, and data freshness.
 7. Roll back by restoring the previous tag+digest references and rebuilding. A database restore is
    not normally needed for patch-image rollback; if schema/data changed, use the separately verified

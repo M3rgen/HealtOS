@@ -2,7 +2,7 @@
 
 A fully self-hosted, subscription-free, read-only archive of health and fitness data exposed by the **Google Health API v4**. It preserves every source payload before normalization and maintains analytics-friendly PostgreSQL tables for heart rate, HRV, oxygen saturation, sleep, steps, exercise, and long-tail scalar metrics.
 
-> This project uses `https://health.googleapis.com/v4`, the current Google Health API. It does not use or add functionality against the deprecated Fitbit Web API.
+> This project uses `https://health.googleapis.com/v4`, the current Google Health API. It does not use or add functionality against the deprecated Fitbit Web API. Support for the legacy Fitbit Web API ended on September 30, 2026, and it shuts down completely on October 30, 2026; because HealtOS uses only Google Health API v4, Google OAuth, and `googlehealth.*` scopes, that shutdown does not affect it.
 
 ## Design principles
 
@@ -60,43 +60,39 @@ Future refinements can specify preferred form of address, response length,
 mythological intensity, and coaching style. Persistent memory would require a
 separate, user-scoped storage design.
 
-### Local Codex chat on Windows
+### Local Codex chat (Umay bridge)
 
 The local website must remain private (the default Compose port binds to
-`127.0.0.1`; the webhook proxy exposes only the Google webhook route).
+`127.0.0.1`; the public webhook ingress exposes only the Google webhook route).
 
-1. Sign in to the installed CLI with `codex login` using your ChatGPT account.
-2. Install the site's isolated Codex CLI (the desktop's older CLI may reject
-   GPT-6.1 Sol). This leaves the globally installed CLI unchanged:
+1. Install the Codex CLI so `codex` is on `PATH` and sign in with `codex login`
+   using your ChatGPT account.
+2. From this project directory, start the bridge with the project's dependencies:
 
-   ```powershell
-   npm install --prefix "$env:USERPROFILE\.codex\healthos-bridge\cli" @openai/codex@0.159.2 --no-audit --no-fund
+   ```sh
+   uv run --frozen --no-dev python scripts/start_codex_bridge.py
    ```
 
-3. From this project directory, start the bridge:
+3. Apply the private `.env` values the launcher wrote and rebuild the site if needed:
 
-   ```powershell
-   .\.venv\Scripts\python.exe .\scripts\start_codex_bridge.py
-   ```
-
-4. Apply the private `.env` configuration and build the updated site:
-
-   ```powershell
+   ```sh
    docker compose up -d --build app
    ```
 
-5. Open the Codex button below the history table at `http://localhost:8000/`.
+4. Open the round Umay button on the dashboard at `http://localhost:8000/`.
    Questions and streamed responses stay on this page. Closing the panel keeps
    the current conversation; **Yeni sohbet**, reconnecting, or reloading starts
    a separate conversation. Site conversations are ephemeral, not sidebar chats.
 
-Run the bridge command again after restarting Windows. It runs in the background
-and reuses a running instance. The launcher copies the current ChatGPT login into
-an isolated `%USERPROFILE%\.codex\healthos-bridge` home (or under `CODEX_HOME`),
+Run the launcher again after the host restarts; no service unit is shipped. It runs the
+bridge in the background and reuses a healthy instance. The launcher copies the current
+ChatGPT login into an isolated `~/.codex/healthos-bridge` home (or under `CODEX_HOME`),
 with desktop plugins, shell, browser, computer-use and multi-agent tools disabled.
 The bridge requires a random bearer token; only the backend receives that token.
 Token and credentials are never included in frontend bundles or tool responses.
-The bridge log is `healthos-bridge\bridge.log`. Keep that local home private.
+The bridge log is `healthos-bridge/bridge.log`. Keep that local home private.
+Windows-specific steps (an isolated npm-installed CLI run through Node) are in
+[legacy/WINDOWS.md](legacy/WINDOWS.md#umay-bridge-on-windows).
 
 The bridge listens on `CODEX_BRIDGE_BIND_HOST` (process environment or `.env`), never on
 `0.0.0.0`. Left empty, it uses the `docker0` address on Linux Docker Engine — the address
@@ -105,7 +101,7 @@ The bridge listens on `CODEX_BRIDGE_BIND_HOST` (process environment or `.env`), 
 host, also apply [`deploy/firewall/codex-bridge.nft`](../deploy/firewall/codex-bridge.nft) (or
 `deploy/firewall/codex-bridge.ufw.sh`) so port 8766 accepts only loopback and Docker bridge traffic.
 A bridge started by an older launcher listened on all interfaces: stop the PID in
-`healthos-bridge/bridge.pid` and run the launcher again.
+`healthos-bridge/bridge.pid` and run the launcher again (see the [runbook](RUNBOOK.md#restart-the-umay-bridge)).
 
 Usage counts against the signed-in ChatGPT account's limits. Codex must be running
 and able to reach OpenAI. If the connection closes, use **Yeniden bağlan**. For a
@@ -126,10 +122,9 @@ The frontend is built with Vite and Three.js during the Docker image build and
 served by FastAPI in the existing `app` container. There is no separate Node
 runtime, frontend port, or additional production service.
 
-**Current Windows command:** run from this project directory, with the existing
-`.env` file intact:
+Run from this project directory, with the existing `.env` file intact:
 
-```powershell
+```sh
 docker compose up --build -d
 docker compose ps
 ```
@@ -157,7 +152,7 @@ hourly heart-rate charts show measured sample averages and preserve gaps.
 
 For native development, build the UI before starting FastAPI:
 
-```powershell
+```sh
 cd frontend
 npm ci
 npm run build
@@ -210,27 +205,29 @@ PostgreSQL has no published host port in the production Compose file. FastAPI is
 - A Google Cloud project with Google Health API access for real integration (not needed for development/tests)
 - For webhooks: a domain/public HTTPS URL that routes to `/webhooks/google-health`
 
-## Docker setup (no credentials yet)
+## Docker setup
 
-**Current Windows command:** copy `.env.example` to the ignored `.env`, generate a strong
-`POSTGRES_PASSWORD`, and set it before starting:
+Copy `.env.example` to the ignored `.env` and set a strong `POSTGRES_PASSWORD` and an
+`APP_UI_TOKEN` (32+ characters); Compose refuses to start without either.
 
-```powershell
-Copy-Item .env.example .env
-docker compose up --build -d
+The base Compose file sets `APP_ENV=production` for the app service (overriding `.env`), so the
+application refuses to start with missing or placeholder production values: `APP_UI_TOKEN`, Google
+OAuth client, `GOOGLE_TOKEN_ENCRYPTION_KEY`, an HTTPS `GOOGLE_HEALTH_WEBHOOK_ENDPOINT_URI` and
+`GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION`. The full production setup is in [DEPLOYMENT.md](DEPLOYMENT.md).
+
+To try the stack before you have Google credentials, add the development override, which sets
+`APP_ENV=development` and also publishes PostgreSQL on `127.0.0.1:5432`:
+
+```sh
+cp .env.example .env
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
 docker compose ps
-curl.exe --fail http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/health/live
 ```
 
-The app runs `alembic upgrade head` before startup. Compose marks the app healthy only after `/health` can query PostgreSQL successfully. Compose refuses to start without `POSTGRES_PASSWORD`. The base Compose file sets `APP_ENV=production` for the app service (overriding `.env`), so the application refuses to start with missing or placeholder credentials; `docker-compose.dev.yml` sets `APP_ENV=development` for local experiments.
-
-For local database access during development only:
-
-**Current Windows command — development-only database binding:**
-
-```powershell
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
-```
+The app runs `alembic upgrade head` before startup. Compose marks the app healthy once
+`/health/live` answers; `/health` additionally queries PostgreSQL and needs the UI token
+(`curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/health`).
 
 ## Native development
 
@@ -274,11 +271,10 @@ lifecycle, checks the hardened container and private bindings, then removes only
 resources. It does not read or modify `.env`, the normal `postgres_data` volume, or Google
 credentials. Keep live-account verification evidence private; it can contain personal health data.
 
-Reproducible deployment, image maintenance, Cloudflare operations, and the future migration are
-split into [deployment](DEPLOYMENT.md), [image update](IMAGE_UPDATES.md),
-[Cloudflare Tunnel](CLOUDFLARE_TUNNEL.md), and
-[Windows-to-Linux migration](WINDOWS_TO_LINUX_MIGRATION.md) guides. The current Windows command
-remains `docker compose up --build -d`; the Linux guide is a template and has not been executed.
+Deployment, routine operations, image maintenance, and Cloudflare setup are split into the
+[deployment](DEPLOYMENT.md), [runbook](RUNBOOK.md), [image update](IMAGE_UPDATES.md), and
+[Cloudflare Tunnel](CLOUDFLARE_TUNNEL.md) guides. Notes for Windows hosts and the earlier
+Windows-to-Linux move are in [legacy/](legacy/WINDOWS.md).
 
 ## Configuration
 
@@ -286,6 +282,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 
 | Variable | Purpose |
 |---|---|
+| `APP_UI_TOKEN` | Single-user access key for the UI and API (32–512 printable characters). Required in production; empty disables the login outside production. Sent as `Authorization: Bearer …` or exchanged for a cookie at `/login` |
 | `DATABASE_URL` | Async SQLAlchemy PostgreSQL URL |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth web client; leave blank until integration |
 | `GOOGLE_REDIRECT_URI` | Must exactly match the authorized redirect URI |
@@ -309,6 +306,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 | `STARTUP_GAP_THRESHOLD_MINUTES` | Minimum persisted sync/write gap that permits startup recovery; defaults to 120 minutes |
 | `AUTOMATIC_RECOVERY_ENABLED`, `AUTOMATIC_RECOVERY_MAX_DAYS` | Enable bounded reconciliation recovery and cap its lookback; defaults to 7 days |
 | `RECOVERY_COOLDOWN_MINUTES` | Minimum time between automatic recovery attempts; defaults to 360 minutes |
+| `CODEX_BRIDGE_BIND_HOST`, `CODEX_BRIDGE_URL`, `CODEX_BRIDGE_TOKEN` | Optional Umay bridge address and token; the launcher writes the URL and token |
 
 Generate an encryption key locally and put it only in `.env`.
 
@@ -339,13 +337,18 @@ Before writing any health records, run the metadata-only capability probe. It re
 
 ```bash
 health-mirror probe --days 30
-curl 'http://127.0.0.1:8000/google-health/capabilities?days=30'
-curl http://127.0.0.1:8000/google-health/devices
+curl -H "Authorization: Bearer $APP_UI_TOKEN" 'http://127.0.0.1:8000/google-health/capabilities?days=30'
+curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/google-health/devices
 ```
+
+Run `health-mirror` inside the container (`docker compose exec app health-mirror …`) or in the
+native environment. Every HTTP route except `/health/live`, `/login`, the OAuth callback and the
+webhook needs the UI token: `Authorization: Bearer <APP_UI_TOKEN>`, or the login cookie in a
+browser.
 
 Use this to confirm the account is linked, Fitbit data is visible, and the configured scopes cover the intended types. Then verify a small persisted sync before starting the full backup.
 
-**Current Windows or cross-platform command — writes retrieved records to the configured database:**
+**Writes retrieved records to the configured database:**
 
 ```bash
 health-mirror sync steps
@@ -354,34 +357,35 @@ health-mirror status
 
 ## Historical backfill
 
-**Current Windows or cross-platform command — starts a persisted backfill through the local API:**
+**Starts a persisted backfill through the local API:**
 
 ```bash
-curl -X POST -H 'X-HealthOS-Request: 1' 'http://127.0.0.1:8000/backfill/start?data_type=steps'
-curl http://127.0.0.1:8000/backfill/status
+curl -X POST -H "Authorization: Bearer $APP_UI_TOKEN" -H 'X-HealthOS-Request: 1' \
+  'http://127.0.0.1:8000/backfill/start?data_type=steps'
+curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/backfill/status
 ```
 
-**Current Windows or cross-platform command — starts a persisted backfill and waits:**
+**Starts a persisted backfill and waits:**
 
 ```bash
 health-mirror backfill --data-type steps
 health-mirror backfill
 ```
 
-The default attempts history from 2010 in 31-day windows. Empty windows are valid and become completed checkpoints. Recent windows run first. On interruption, rerunning resumes the saved window and `pageToken`; completed windows are skipped. Use a conservative start date to maximize completeness—the official API permits queries back to the earliest recorded data.
+The default attempts history from 2010 in 31-day windows. Empty windows are valid and become completed checkpoints. Recent windows run first. On interruption, rerunning resumes the saved window and `pageToken`; completed windows are skipped. A window that keeps failing is moved behind the others after five failures and marked `abandoned` after ten, so it cannot stall its data type; see the [runbook](RUNBOOK.md#abandoned-backfill-windows). Use a conservative start date to maximize completeness—the official API permits queries back to the earliest recorded data.
 
 The `food` and `food-measurement-unit` resource catalogs remain discoverable but are not included in automatic mirror jobs. Google returns the global public food reference catalog through these unfiltered types; it is not personal health history. Personal `nutrition-log` records remain fully mirrored. Any reference rows already fetched remain preserved in the raw archive.
 
 ## Incremental sync
 
-**Current Windows or cross-platform command — writes retrieved records to the configured database:**
+**Writes retrieved records to the configured database:**
 
 ```bash
 health-mirror sync sleep
 health-mirror sync
-curl -X POST -H 'X-HealthOS-Request: 1' http://127.0.0.1:8000/sync/sleep
-curl -X POST -H 'X-HealthOS-Request: 1' http://127.0.0.1:8000/sync/all
-curl http://127.0.0.1:8000/sync/status
+curl -X POST -H "Authorization: Bearer $APP_UI_TOKEN" -H 'X-HealthOS-Request: 1' http://127.0.0.1:8000/sync/sleep
+curl -X POST -H "Authorization: Bearer $APP_UI_TOKEN" -H 'X-HealthOS-Request: 1' http://127.0.0.1:8000/sync/all
+curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/sync/status
 ```
 
 Default overlaps are 60 minutes for heart rate, 12 hours for steps/activity streams, 72 hours for sleep/temperature derivations, seven days for daily metrics, and 24 hours otherwise. UPSERT makes every replay safe.
@@ -412,26 +416,25 @@ never prints the endpoint authorization value. Registration is ready only when t
 is numeric, the endpoint uses HTTPS, the authorization value includes a `Bearer` or `Basic` scheme,
 and the subscriber ID matches Google's naming rules.
 
-### Free outbound Cloudflare Tunnel receiver (current deployment)
+### Cloudflare Tunnel receiver (deployed)
 
-The Windows deployment uses a remotely managed Cloudflare Tunnel for the existing untracked webhook
-hostname. `cloudflared` makes outbound-only connections, so the router has no inbound port
-forwarding. The tunnel route must match `${CLOUDFLARE_WEBHOOK_HOSTNAME}` and path
-`^/webhooks/google-health$`, forward to `http://127.0.0.1:8000`, and use a final catch-all 404 rule.
-The existing proxied DNS record remains untouched. The tunnel connector is installed as an automatic Windows service with its
-tunnel-scoped credential; no account-wide `cert.pem` or router fallback is used.
+The deployment uses a host-level `cloudflared` service on the VM. It makes outbound-only
+connections, so the router has no inbound port forwarding. The tunnel route must match
+`${CLOUDFLARE_WEBHOOK_HOSTNAME}` and path `^/webhooks/google-health$`, forward to
+`http://127.0.0.1:8000`, and use a final catch-all 404 rule. Only the tunnel-scoped credential
+file lives on the VM; no account-wide `cert.pem` or router fallback is used.
 
 The app remains bound to loopback, PostgreSQL has no published port, and the path rule prevents
-public access to `/health`, `/docs`, OAuth, sync, backfill, or Google Health metadata routes. Check
-the local production path with the verification-only commands in
-[docs/CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md). Summary:
+public access to `/health`, `/docs`, OAuth, sync, backfill, or Google Health metadata routes.
+Setup and the public-surface checks are in [CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md). Local
+status:
 
 **Verification-only command:**
 
-```powershell
-Get-Service cloudflared
+```sh
+systemctl status cloudflared
 docker compose ps
-Invoke-WebRequest http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/health/live
 docker compose exec -T app health-mirror status
 docker compose exec -T app health-mirror webhook-readiness
 docker compose exec -T app health-mirror webhook-status
@@ -439,32 +442,22 @@ docker compose exec -T app health-mirror webhook-status
 
 If durable elements remain failed after a transient outage, retry only pending webhook work with:
 
-**Current Windows command — operates only on already verified stored webhook batches:**
+**Operates only on already verified stored webhook batches:**
 
-```powershell
+```sh
 docker compose exec -T app health-mirror webhook-replay-pending
 ```
 
 This command does not fabricate a webhook, change health data, or ask Google to resend anything.
 It reuses already verified, stored batches and the normal read-only Google Health query path.
+A live re-delivery of a signed body that was first verified more than 24 hours earlier is accepted
+(HTTP 204) but not processed again (`WEBHOOK_REPLAY_IGNORED`); the operator command above is not
+limited.
 
-Cloudflare Tunnel does not auto-update on Windows. Periodically update `cloudflared` through
-Chocolatey, then verify that the service reconnects. Google retries failed webhook notifications
+`cloudflared` runs with `--no-autoupdate`; update it deliberately (see the
+[runbook](RUNBOOK.md#update-images-and-cloudflared)). Google retries failed webhook notifications
 for up to seven days; daily and weekly reconciliation remain the recovery layer for longer outages.
-
-For the current Windows host, `cloudflared` is an automatic Windows service. Docker Desktop must
-also start after a user signs in so the existing Compose containers can honor their
-`restart: unless-stopped` policies. Configure that idempotently from PowerShell with:
-
-**Current Windows command — changes the current-user login startup entry:**
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\enable-docker-desktop-autostart.ps1
-```
-
-The script adds only the current user's Docker Desktop login startup entry. It does not edit Docker
-settings, recreate containers, or touch volumes. This is login recovery, not pre-login Windows boot
-recovery: until that user signs in, Docker Desktop and the application are not expected to run.
+A diagnosis checklist is in the [runbook](RUNBOOK.md#the-webhook-went-quiet).
 
 ### Direct Caddy receiver (unused alternative)
 
@@ -550,21 +543,23 @@ scheduler; `failed` reports unresolved failed webhook or sync state.
 
 After a host interruption the expected recovery sequence is:
 
-1. A Windows user signs in and Docker Desktop starts from the current-user startup entry.
+1. The VM boots and systemd starts `docker.service` and `cloudflared.service`.
 2. Docker starts the existing `postgres` and `app` containers under `unless-stopped`.
 3. Compose waits for PostgreSQL's `pg_isready` health check; the app then runs migrations and its
    own database readiness query before starting the scheduler.
 4. The startup watchdog assesses the persisted gap and, when eligible, starts one bounded
-   reconciliation. The automatic `cloudflared` service resumes forwarding as soon as port 8000 is
-   healthy.
+   reconciliation. `cloudflared` forwards webhooks again as soon as port 8000 answers; until then
+   Cloudflare returns 502 and Google retries.
+5. The optional Umay bridge is a host process without a service unit; start it again by hand.
 
-If Docker Desktop is manually stopped or the user has not signed in, no in-container watchdog can
-restart the Docker engine. That host-level condition remains visible as a Cloudflare 502 and must be
-handled by Windows/Docker Desktop startup or host monitoring.
+If Docker itself is down, no in-container watchdog can notice. That host-level condition is visible
+as a Cloudflare 502 on the webhook and must be handled by host monitoring.
 
 ## Local API
 
+- `GET /health/live` (no database, no token; used by the container health check)
 - `GET /health`
+- `GET /login`, `POST /login` (exchange `APP_UI_TOKEN` for a session cookie)
 - `GET /sync/status`
 - `GET /sync/status/{data_type}`
 - `POST /sync/{data_type}`
@@ -576,7 +571,8 @@ handled by Windows/Docker Desktop startup or host monitoring.
 - `GET /google-health/capabilities` (metadata-only one-record probes)
 - `GET /google-health/devices` (sanitized paired-device metadata)
 
-Interactive OpenAPI documentation is available locally at `/docs`.
+Interactive OpenAPI documentation is available locally at `/docs`. Every route except
+`/health/live`, the login page, the OAuth callback and the webhook requires the UI token.
 
 ## Database backup and restore
 
@@ -658,7 +654,8 @@ Connect read-only analytics tools to the `analytics_*` views, such as
 `analytics_scalar_metrics`. These views expose the normalized tables while automatically excluding
 records explicitly marked `is_quarantined`. The underlying normalized tables remain available for
 auditing, and the raw JSON remains available for future Pandas/Jupyter, SQL, Grafana, n8n, or
-local-agent pipelines. No AI interpretation layer is included.
+local-agent pipelines. The archive itself has no AI layer; the optional Umay chat reads it only
+on request.
 
 ### Quarantined rollup records
 
@@ -684,7 +681,7 @@ directly, add `WHERE is_quarantined = false`.
 
 ## Non-goals
 
-- No health advice or AI analysis.
+- No medical diagnosis or health advice; AI analysis exists only in the optional, on-request Umay chat.
 - No writes, patches, or deletes against Google Health.
 - No legacy Fitbit Web API compatibility layer.
 - No mandatory hosted service, paid API, or public database exposure.

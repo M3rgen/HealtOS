@@ -23,6 +23,10 @@ The interface pairs a warm dark palette with a 3D anatomical reference and a com
 
 The archive and dashboard run without an AI subscription. Umay is optional and requires compatible Codex access. **Documentation is in English; the current dashboard and Umay voice are in Turkish.** HealtOS is a personal self-hosted application, not a public multi-user service.
 
+> **Fitbit Web API shutdown:** support for the legacy Fitbit Web API ended on September 30, 2026, and the API shuts down completely on October 30, 2026. HealtOS uses only Google Health API v4 (`health.googleapis.com/v4`), Google OAuth, and `googlehealth.*` scopes, so it is not affected by that shutdown.
+>
+> *Eski Fitbit Web API'nin desteği 30 Eylül 2026'da sona erdi ve API 30 Ekim 2026'da tamamen kapanıyor. HealthOS yalnızca Google Health API v4'ü (`health.googleapis.com/v4`), Google OAuth'u ve `googlehealth.*` scope'larını kullandığı için bu kapanıştan etkilenmez.*
+
 > **API availability:** As of October 3, 2026, Google says new Google Health API projects are not being onboarded. Real synchronization requires an eligible Google Cloud project and a linked Google Health account. You can still run the empty dashboard, manual entries, and automated tests without Google credentials. Check the [official setup guide](https://developers.google.com/health/setup) before planning an integration.
 
 ## A closer look
@@ -73,8 +77,9 @@ FastAPI serves the Vite/Three.js frontend. PostgreSQL stores the archive and syn
 | **Recommended: Docker** | Git, Docker Engine or Docker Desktop, Docker Compose v2, and a modern browser with WebGL. |
 | **Native development** | Python 3.12+, `uv` 0.12.1, PostgreSQL, and Node.js 24 for frontend builds. The shipped Compose stack uses PostgreSQL 17. |
 | **Google synchronization** | An eligible Google Cloud project, Google Health API access, an OAuth web client, and a linked Google Health account. |
-| **Optional webhooks** | A public HTTPS endpoint that forwards only `/webhooks/google-health`. |
-| **Optional Umay** | A compatible Codex CLI and authenticated account; the supplied bridge launcher targets Windows. |
+| **Server deployment** | A Linux VM (Debian is documented) with Docker Engine; see [Deployment](docs/DEPLOYMENT.md). |
+| **Optional webhooks** | A public HTTPS endpoint that forwards only `/webhooks/google-health`; the documented setup uses a Cloudflare Tunnel. |
+| **Optional Umay** | A compatible Codex CLI and authenticated ChatGPT account on the Docker host; the bridge launcher supports Linux, macOS, and Windows. |
 
 Internet access is needed to build images and synchronize with Google. AI analysis also needs access to OpenAI. Storage requirements depend on the amount of history you archive.
 
@@ -89,36 +94,43 @@ cd HealtOS
 
 ### 2. Create your private configuration
 
-**macOS / Linux**
-
 ```sh
 cp .env.example .env
 ```
 
-**Windows PowerShell**
+Open `.env` in your editor and set two values:
 
-```powershell
-Copy-Item .env.example .env
-```
+- `POSTGRES_PASSWORD`: a long random value. A hexadecimal password avoids URL-escaping issues in the
+  Compose database URL.
+- `APP_UI_TOKEN`: the access key for the dashboard and API, 32 to 512 printable characters without
+  spaces. You type it once on the login page; scripts send it as `Authorization: Bearer <token>`.
 
-Open `.env` in your editor and set `POSTGRES_PASSWORD` to a long, randomly generated value. A hexadecimal password avoids URL-escaping issues in the Compose database URL. If Python is installed, generate one locally with:
+If Python is installed, generate them locally with:
 
 ```sh
-python -c "import secrets; print(secrets.token_hex(32))"
+python3 -c "import secrets; print(secrets.token_hex(32))"        # POSTGRES_PASSWORD
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"    # APP_UI_TOKEN
 ```
 
-Store the result only in `.env`. Leave Google credentials empty for the first startup. `.env` is ignored by Git; `.env.example` contains blank secret fields.
+Store the results only in `.env`. `.env` is ignored by Git; `.env.example` contains blank secret fields.
 
 ### 3. Start HealtOS
 
+The Compose file runs the app in production mode, which refuses to start until Google and webhook
+credentials are configured. For a first local look without Google, add the development override:
+
 ```sh
-docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 docker compose ps
 ```
 
-Open **[localhost:8000](http://localhost:8000)**. The first build downloads dependencies and applies database migrations. Without Google credentials, the dashboard starts with an empty archive and reports incomplete Google configuration; manual entries remain available.
+Open **[localhost:8000](http://localhost:8000)** and enter your `APP_UI_TOKEN` on the login page. The
+first build downloads dependencies and applies database migrations. Without Google credentials, the
+dashboard starts with an empty archive and reports incomplete Google configuration; manual entries
+remain available. The development override also publishes PostgreSQL on `127.0.0.1:5432`.
 
-For a readiness check, open [localhost:8000/health](http://localhost:8000/health). Local API documentation is at [localhost:8000/docs](http://localhost:8000/docs).
+After logging in, [localhost:8000/health](http://localhost:8000/health) shows pipeline status and
+[localhost:8000/docs](http://localhost:8000/docs) the local API documentation.
 
 ### 4. Connect Google Health
 
@@ -130,13 +142,13 @@ Once your project has API access:
 4. Put `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`. Generate a Fernet key with the built image and save it as `GOOGLE_TOKEN_ENCRYPTION_KEY`:
 
    ```sh
-   docker compose exec app python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+   docker compose run --rm --no-deps app python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
 
-5. Apply the updated environment:
+5. Apply the updated environment (keep the development override until the webhook values below are set):
 
    ```sh
-   docker compose up -d --force-recreate app
+   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --force-recreate app
    ```
 
    Visit **[Connect Google](http://localhost:8000/auth/google/start)** and complete consent.
@@ -148,6 +160,8 @@ Once your project has API access:
    docker compose exec app health-mirror sync steps
    docker compose exec app health-mirror status
    ```
+
+For unattended operation, run the plain `docker compose up -d` (production mode). It additionally requires an HTTPS `GOOGLE_HEALTH_WEBHOOK_ENDPOINT_URI` and a `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` value; the [deployment guide](docs/DEPLOYMENT.md) walks through a server setup with the dashboard behind an SSH tunnel and a webhook-only Cloudflare Tunnel.
 
 Google's Testing-mode refresh tokens expire after seven days. Follow the applicable Google publication and verification requirements before relying on unattended synchronization. Detailed guidance is in the [technical reference](docs/REFERENCE.md#oauth-and-google-health-setup).
 
@@ -167,7 +181,7 @@ Backfills save progress by type and time window. Rerun an interrupted backfill t
 
 Umay is a warm, mythology-inspired companion for exploring your health history. It first discovers what your archive contains, then requests the summaries or original records needed to answer your question. Its health tools cannot modify the archive.
 
-The supplied Windows launcher creates an isolated, authenticated local Codex bridge. Follow the [bridge setup](docs/REFERENCE.md#local-codex-chat-on-windows) to enable it. The persona lives in [`app/personas/umay/soul.md`](app/personas/umay/soul.md).
+The supplied launcher, `scripts/start_codex_bridge.py`, creates an isolated, authenticated Codex bridge on the Docker host. Follow the [bridge setup](docs/REFERENCE.md#local-codex-chat-umay-bridge) (or step 9 of the [deployment guide](docs/DEPLOYMENT.md#9-optional-the-umay-bridge)) to enable it. The persona lives in [`app/personas/umay/soul.md`](app/personas/umay/soul.md).
 
 **Privacy boundary:** when you use Umay, your questions (with your time zone) and the results of the `health_archive` tool are sent to OpenAI. Each tool call returns a bounded slice: daily summaries for up to 366 days, or original Google records for at most 31 days and 200 records per page; Umay may make several calls per question. The database itself, whole tables, OAuth tokens, secrets and backups are never sent. The core archive works independently of this feature. AI responses are informational, not a diagnosis.
 
@@ -181,7 +195,8 @@ The bridge listens only on loopback or the Docker bridge address, never on all i
 - There is no application telemetry or hosted database requirement.
 - OAuth refresh tokens obtained by the callback are encrypted in PostgreSQL; protect the encryption key separately.
 - Real health records, secrets, logs, backups, and local verification outputs are excluded from this repository.
-- A public webhook deployment should expose only the webhook route. The dashboard and administrative API should stay private.
+- The dashboard and API require `APP_UI_TOKEN` (login page or bearer header), on top of the loopback binding.
+- A public webhook deployment should expose only the webhook route. The dashboard and administrative API should stay private; reach them through an SSH tunnel.
 
 Backups are encrypted and automated: a systemd timer ([`deploy/systemd/`](deploy/systemd/healthos-backup.timer)) runs [`scripts/backup.sh`](scripts/backup.sh) daily at 03:30. It streams `pg_dump` from the Compose `backup` profile through `age` (preferred) or `gpg --symmetric`, writes `BACKUP_HOST_DIR/health-<stamp>.dump.age`, and keeps 14 days. The key lives outside `.env` (`BACKUP_AGE_RECIPIENT` or a mode-600 `/etc/healthos/backup.key`).
 
@@ -191,7 +206,7 @@ make restore FILE=backups/health-<stamp>.dump.age   # restore drill into a scrat
 docker compose exec app health-mirror verify
 ```
 
-`scripts/restore.sh` never touches the live database: it restores into `health_restore` and prints row counts. Keep `GOOGLE_TOKEN_ENCRYPTION_KEY` with the backup key, away from the backups — a restored archive needs it to decrypt the stored Google tokens. See the [backup and restore reference](docs/REFERENCE.md#database-backup-and-restore).
+`scripts/restore.sh` never touches the live database: it restores into `health_restore` and prints row counts. Keep `GOOGLE_TOKEN_ENCRYPTION_KEY` with the backup key, away from the backups — a restored archive needs it to decrypt the stored Google tokens. See the [backup and restore reference](docs/REFERENCE.md#database-backup-and-restore) and the [restore drill](docs/RUNBOOK.md#backup-verify-and-restore-drill).
 
 ## Documentation
 
@@ -199,10 +214,11 @@ docker compose exec app health-mirror verify
 | --- | --- |
 | [Technical reference](docs/REFERENCE.md) | Data types, scopes, configuration, APIs, archiving, backups, and troubleshooting. |
 | [Development](docs/DEVELOPMENT.md) | Native setup, test commands, and project layout. |
-| [Deployment](docs/DEPLOYMENT.md) | Container operation and deployment checks. |
+| [Deployment](docs/DEPLOYMENT.md) | Installing on a Debian VM: Compose, SSH-tunnel access, webhook tunnel, backups, Umay bridge. |
+| [Runbook](docs/RUNBOOK.md) | Updates, migrations, key rotation, restore drills, and diagnosing a quiet webhook. |
 | [Cloudflare Tunnel](docs/CLOUDFLARE_TUNNEL.md) | A webhook-only public endpoint. |
 | [Image updates](docs/IMAGE_UPDATES.md) | Updating pinned container images. |
-| [Windows → Linux](docs/WINDOWS_TO_LINUX_MIGRATION.md) | A staged migration and rollback plan. |
+| [Legacy notes](docs/legacy/WINDOWS.md) | Running on Windows and the earlier Windows → Linux migration plan. |
 | [Contributing](CONTRIBUTING.md) | Focused changes, privacy-safe examples, and validation. |
 
 ## Project status and license
