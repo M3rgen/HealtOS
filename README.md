@@ -199,7 +199,7 @@ The bridge listens only on loopback or the Docker bridge address, never on all i
 - The dashboard and API require `APP_UI_TOKEN` (login page or bearer header), on top of the loopback binding.
 - A public webhook deployment should expose only the webhook route. The dashboard and administrative API should stay private; reach them through an SSH tunnel.
 
-Backups are encrypted and automated: a systemd timer ([`deploy/systemd/`](deploy/systemd/healthos-backup.timer)) runs [`scripts/backup.sh`](scripts/backup.sh) daily at 03:30. It streams `pg_dump` from the Compose `backup` profile through `age` (preferred) or `gpg --symmetric`, writes `BACKUP_HOST_DIR/health-<stamp>.dump.age`, and keeps 14 days. The key lives outside `.env` (`BACKUP_AGE_RECIPIENT` or a mode-600 `/etc/healthos/backup.key`).
+Backups are encrypted and automated: a systemd timer ([`deploy/systemd/`](deploy/systemd/healthos-backup.timer)) runs [`scripts/backup.sh`](scripts/backup.sh) daily at 03:30. It streams `pg_dump` from the Compose `backup` profile through `age` (preferred) or `gpg --symmetric`, writes `BACKUP_HOST_DIR/health-<stamp>.dump.age`, and **keeps every backup forever**: nothing is deleted unless you opt in with `BACKUP_RETENTION_DAYS`. A run refuses to start when the disk is short of space (it never deletes old backups to make room), and each run records its result in `BACKUP_HOST_DIR/last-backup-status.json`. The key lives outside `.env` (`BACKUP_AGE_RECIPIENT` or a mode-600 `/etc/healthos/backup.key`). **Keep a copy of the backup key (or age identity) off the host, e.g. in a password manager: if it is lost, every backup is unreadable.**
 
 ```sh
 make backup                                   # one encrypted backup now

@@ -1,0 +1,19 @@
+# Reports a failed HealthOS backup loudly on the host itself (no e-mail, no
+# external service). Started by OnFailure= in healthos-backup.service.
+#
+# Install next to the backup units:
+#   sudo install -m 644 deploy/systemd/healthos-backup-failure.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Find failures afterwards:
+#   journalctl -p crit -t healthos-backup
+#   systemctl --failed
+#   cat /opt/healthos/backups/last-backup-status.json    # BACKUP_HOST_DIR
+[Unit]
+Description=Report a failed HealthOS backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger --priority user.crit --tag healthos-backup "HealthOS backup FAILED. See: journalctl -u healthos-backup.service -n 50 and last-backup-status.json in BACKUP_HOST_DIR. No backup was deleted."
+# Also on every logged-in terminal; ignored where wall is not installed.
+ExecStart=-/usr/bin/wall "HealthOS backup FAILED: journalctl -u healthos-backup.service -n 50"

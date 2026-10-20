@@ -300,7 +300,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 | `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` | Exact secret header value configured for the subscriber, e.g. `Bearer …` |
 | `GOOGLE_HEALTH_WEBHOOK_PUBLIC_KEY_URL` | Google's permanent public signing keyset URL |
 | `WEBHOOK_HOST` | Public DNS hostname used by the optional self-hosted Caddy TLS profile |
-| `BACKUP_HOST_DIR`, `BACKUP_RETENTION_DAYS` | Host directory for encrypted dumps and retention in days (default 14); read by `scripts/backup.sh` |
+| `BACKUP_HOST_DIR`, `BACKUP_RETENTION_DAYS`, `BACKUP_MIN_FREE_MB` | Host directory for encrypted dumps; opt-in retention in days (default: empty, keep forever; only a positive number deletes); free-space guard in MiB (default: twice the newest dump, at least 1 GiB, or 5 GiB before the first dump); read by `scripts/backup.sh` |
 | `BACKFILL_START_DATE`, `BACKFILL_WINDOW_DAYS` | Earliest attempted history and checkpoint window size |
 | `GOOGLE_API_PAGE_SIZE`, `GOOGLE_API_MAX_RETRIES` | Page and exponential retry policy |
 | `EXTRA_DATA_TYPES` | Comma-separated evolving v4 data types; defaults to interval filtering |
@@ -831,7 +831,26 @@ runs [`scripts/backup.sh`](../scripts/backup.sh) on the Docker host:
    `pg_dump` to stdout (the container refuses to write a dump to a terminal);
 2. the stream is encrypted before it reaches the disk and written atomically as
    `BACKUP_HOST_DIR/health-<UTC stamp>.dump.age` (or `.dump.gpg`);
-3. after a successful backup, dumps older than `BACKUP_RETENTION_DAYS` (default 14) are deleted.
+3. the result is written to `BACKUP_HOST_DIR/last-backup-status.json`, on success and on failure.
+
+**Backups are kept forever.** The script deletes nothing unless `BACKUP_RETENTION_DAYS` is set to a
+positive number of days; then, and only after a successful new backup, `health-*` dumps older than
+that are removed. Empty, `0` or `never` mean never delete; a large value such as `36500` also works.
+
+**Free space.** Before dumping, the script checks the free space of `BACKUP_HOST_DIR`. If it is
+below `BACKUP_MIN_FREE_MB` (default: twice the newest dump, at least 1 GiB; 5 GiB before the first
+dump), it refuses to start with exit status 1, writes no file and deletes nothing; systemd marks the
+unit failed. After each successful backup it prints the remaining free space. A dump interrupted by
+a full disk or an error leaves no partial file. To make room, add disk or move old backups (see the
+[runbook](RUNBOOK.md#disk-space-for-backups)); `BACKUP_MIN_FREE_MB=0` disables the guard.
+
+**Status file.** `last-backup-status.json` holds `timestamp` (UTC), `result` (`success` or
+`failure`), `message`, `file`, `size_bytes`, `free_bytes`, `required_free_bytes`, `retention_days`
+and `pruned_files`. It is replaced atomically on every run, so a stale `timestamp` means the timer
+is not running. A failed run also starts
+[`healthos-backup-failure.service`](../deploy/systemd/healthos-backup-failure.service) via
+`OnFailure=`, which logs at priority `crit` (`journalctl -p crit -t healthos-backup`) and
+broadcasts with `wall`; nothing leaves the host.
 
 The encryption key never lives in `.env` or next to the backups:
 
@@ -842,7 +861,8 @@ The encryption key never lives in `.env` or next to the backups:
 | `/etc/healthos/backup.key` containing a passphrase | `gpg --symmetric` (AES256) | Fallback when `age` is not installed; mode `600`. |
 
 `BACKUP_KEY_FILE` overrides the key path. The script refuses to run if the key file is readable by
-group or others. Installation steps are at the top of the service file. Run a backup now with
+group or others. **Store a copy of `/etc/healthos/backup.key` (or the age identity) off the host,
+e.g. in a password manager.** Losing it makes every backup unreadable; nothing can recover it. Installation steps are at the top of the service file. Run a backup now with
 `make backup` (or `bash scripts/backup.sh`); the path of the new file is printed.
 
 **Restore drill (non-destructive to the live database):**

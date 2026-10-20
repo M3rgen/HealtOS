@@ -87,7 +87,7 @@ services:
 
   backup:
     # Streams a custom-format dump to stdout; scripts/backup.sh encrypts it on the
-    # host (age or gpg) and applies retention. Scheduled by deploy/systemd/.
+    # host (age or gpg); backups are kept forever by default. Scheduled by deploy/systemd/.
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     profiles: ["backup"]
     environment:
