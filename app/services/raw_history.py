@@ -612,6 +612,7 @@ async def _import_chunk(
     *,
     dry_run: bool,
 ) -> None:
+    stats.source_rows += len(candidates)
     usable: list[_Candidate] = []
     for candidate in candidates:
         try:

@@ -397,10 +397,18 @@ async def test_import_slots_archived_versions_in_order_and_is_idempotent(
 
     dry = await run(urls["d4"], dry_run=True)
     assert (dry.imported, len(dry.records)) == (1, 1)
+    assert dry.source_rows == 1 and dry.as_dict()["source_rows"] == 1
     assert await chain(sessions) == [(1, False, 62, "legacy"), (2, True, 64, "sync")]
 
     results = {name: await run(url) for name, url in urls.items()}
     assert [results[name].imported for name in ("d4", "d2", "d1", "d3")] == [1, 1, 1, 0]
+    # Every dump row is counted, also the one whose hash mismatches.
+    assert {name: item.source_rows for name, item in results.items()} == {
+        "d4": 1,
+        "d2": 2,
+        "d1": 1,
+        "d3": 2,
+    }
     # A record only the dump has is restored as its own row, marked source-deleted.
     assert results["d2"].restored_records == {"heart-rate": 1}
     assert results["d3"].already_present == 1
