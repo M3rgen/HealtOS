@@ -20,6 +20,15 @@ payload was gone; nothing in the database stopped a `DELETE` either. From this r
   the one exception is renumbering `version`, and on PostgreSQL only in a transaction that
   set `healthos.renumber = '1'` (only `health-mirror import-versions` does). raw_json is
   compared as text, so even a respelled number counts as a change.
+* The same guards protect what was received or entered before: `webhook_events` and
+  `webhook_notifications` refuse `DELETE`/`TRUNCATE` and any change of their received
+  payload (processing state stays updatable), `webhook_batch_items`,
+  `manual_measurements` and `manual_workouts` are append-only.
+* `raw_api_responses` keeps every HTTP response body from the Google Health API byte for
+  byte (append-only); `raw_health_data.response_id` / `raw_health_data_versions.response_id`
+  link payloads to the page they came from (the foreign key on `raw_health_data` is added
+  `NOT VALID`: no scan of existing rows). `raw_health_data_events` records every change of
+  `source_deleted_at` (append-only, by trigger).
 * Every protective trigger is `ENABLE ALWAYS`: it also fires with
   `session_replication_role = replica`. `health-mirror verify` fails when one is missing,
   disabled, or its function no longer has the body below.
@@ -99,8 +108,28 @@ _EVENT = (
     "ELSE 'source-deleted' END, "
     "coalesce(NEW.source_deleted_at, NEW.last_seen_at), {previous})"
 )
-# Tables whose rows never change once written.
-APPEND_ONLY_TABLES = ("raw_api_responses", "raw_health_data_events")
+# Tables whose rows never change once written: what Google sent, what was derived from it
+# for the timeline, and what the maintainer entered by hand (no edit or delete path exists; a
+# correction is a new entry).
+APPEND_ONLY_TABLES = (
+    "raw_api_responses",
+    "raw_health_data_events",
+    "webhook_batch_items",
+    "manual_measurements",
+    "manual_workouts",
+)
+# Tables whose rows are never deleted and whose received payload never changes, while
+# processing state (status, counters, errors, processed_at) is updated in place:
+# table -> (frozen columns, extra PostgreSQL / SQLite condition for a refused UPDATE).
+PAYLOAD_TABLES = {
+    "webhook_events": (
+        ("payload_hash", "raw_json::text", "created_at"),
+        # The signed body may be filled in once (legacy batches), never replaced.
+        "OLD.raw_body IS NOT NULL AND OLD.raw_body IS DISTINCT FROM NEW.raw_body",
+        "OLD.raw_body IS NOT NULL AND OLD.raw_body IS NOT NEW.raw_body",
+    ),
+    "webhook_notifications": (("element_hash", "raw_json::text", "created_at"), None, None),
+}
 
 
 def _row(prefix: str, columns) -> str:
@@ -197,6 +226,26 @@ for _table in APPEND_ONLY_TABLES:
     _PG_TRIGGERS[f"{_table}_append_only"] = (
         _table,
         f"BEFORE UPDATE OR DELETE ON {_table} FOR EACH ROW",
+        "healthos_refuse_change",
+    )
+    _PG_TRIGGERS[f"{_table}_no_truncate"] = (
+        _table,
+        f"BEFORE TRUNCATE ON {_table} FOR EACH STATEMENT",
+        "healthos_refuse_change",
+    )
+
+for _table, (_columns, _pg_extra, _) in PAYLOAD_TABLES.items():
+    _when = f"({_row('OLD', _columns)}) IS DISTINCT FROM ({_row('NEW', _columns)})"
+    if _pg_extra:
+        _when = f"{_when}\n      OR ({_pg_extra})"
+    _PG_TRIGGERS[f"{_table}_frozen_payload"] = (
+        _table,
+        f"BEFORE UPDATE ON {_table} FOR EACH ROW\nWHEN ({_when})",
+        "healthos_refuse_change",
+    )
+    _PG_TRIGGERS[f"{_table}_no_delete"] = (
+        _table,
+        f"BEFORE DELETE ON {_table} FOR EACH ROW",
         "healthos_refuse_change",
     )
     _PG_TRIGGERS[f"{_table}_no_truncate"] = (
@@ -331,6 +380,28 @@ BEGIN
     {_sqlite_refuse(_table, _operation)}
 END""",
         )
+
+for _table, (_columns, _, _sqlite_extra) in PAYLOAD_TABLES.items():
+    _when = _sqlite_changed(_columns)
+    if _sqlite_extra:
+        _when = f"{_when} OR ({_sqlite_extra})"
+    _SQLITE_TRIGGERS[f"{_table}_frozen_payload"] = (
+        _table,
+        f"""CREATE TRIGGER {_table}_frozen_payload
+BEFORE UPDATE ON {_table} FOR EACH ROW
+WHEN {_when}
+BEGIN
+    {_sqlite_refuse(_table, "UPDATE")}
+END""",
+    )
+    _SQLITE_TRIGGERS[f"{_table}_no_delete"] = (
+        _table,
+        f"""CREATE TRIGGER {_table}_no_delete
+BEFORE DELETE ON {_table}
+BEGIN
+    {_sqlite_refuse(_table, "DELETE")}
+END""",
+    )
 
 SQLITE_TRIGGERS = tuple((table, trigger) for trigger, (table, _) in _SQLITE_TRIGGERS.items())
 SQLITE_DDL = (*(sql for _, sql in _SQLITE_TRIGGERS.values()), VIEW_SQL)
@@ -499,13 +570,14 @@ def downgrade() -> None:
     _refuse_while_kept(context_)
     postgresql = context_.dialect.name == "postgresql"
     op.execute(f"DROP VIEW {HISTORY_VIEW}")
+    # Triggers on tables older than this revision; the tables it created go with theirs.
     if postgresql:
         for table, trigger, _ in PROTECTIVE_TRIGGERS:
-            if table == "raw_health_data":
+            if table not in KEPT_TABLES:
                 op.execute(f"DROP TRIGGER {trigger} ON {table}")
     else:
         for table, trigger in SQLITE_TRIGGERS:
-            if table == "raw_health_data":
+            if table not in KEPT_TABLES:
                 op.execute(f"DROP TRIGGER {trigger}")
     # Dropping a table drops its own triggers; then the PostgreSQL functions.
     op.drop_table("raw_health_data_events")

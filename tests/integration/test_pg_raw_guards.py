@@ -353,3 +353,27 @@ async def test_overlapping_pages_lock_in_key_order(database_url, pg_sessions) ->
         await other_engine.dispose()
     assert [item[2] for item in await chain(pg_sessions, last)] == ["1", "2", "3"]
     assert [item[2] for item in await chain(pg_sessions, first)] == ["1", "2", "3"]
+
+
+# Part 3: manual entries and webhook records are "kayıt" too.
+async def test_manual_and_webhook_records_cannot_be_removed(pg_sessions) -> None:
+    await execute(
+        pg_sessions,
+        "INSERT INTO manual_measurements (id, metric, value, measured_at) "
+        "VALUES (gen_random_uuid(), 'weight', 70.5, now())",
+        "INSERT INTO webhook_events (payload_hash, raw_json, element_count, failure_count) "
+        "VALUES ('b1', '{\"data\": 1}', 1, 0)",
+    )
+    await execute(pg_sessions, "UPDATE webhook_events SET failure_count = 2, last_error = 'x'")
+    for statement in (
+        "UPDATE manual_measurements SET value = 99",
+        "DELETE FROM manual_measurements",
+        "TRUNCATE manual_measurements",
+        "TRUNCATE manual_workouts",
+        "UPDATE webhook_events SET raw_json = '{\"data\": 1.0}'",
+        "DELETE FROM webhook_events",
+        "TRUNCATE webhook_events CASCADE",
+        "TRUNCATE webhook_notifications CASCADE",
+    ):
+        with pytest.raises(DBAPIError, match="refused"):
+            await execute(pg_sessions, statement)

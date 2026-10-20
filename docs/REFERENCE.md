@@ -542,6 +542,8 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 | Every earlier payload | `raw_health_data_versions` | append-only (renumbering only during an archive import) |
 | Source-deletion marks set and cleared | `raw_health_data_events` | append-only, written by trigger |
 | Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
+| Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only |
+| Manual measurements and workouts | `manual_measurements`, `manual_workouts` | append-only: the UI only adds entries; a correction is a new entry (for the same measurement time the newest entry wins) |
 
 ### Verbatim Google responses
 
@@ -595,6 +597,28 @@ an archive import restores a record as deleted) and `source-returned` (with the 
 again and `previous_deleted_at`, the mark being cleared). A record that disappears and comes back
 therefore keeps its whole timeline; `health-mirror history` lists the events next to the
 versions.
+
+### Write paths (audit)
+
+Every `UPDATE`, UPSERT and `DELETE` in `app/`, `scripts/` and `migrations/` that touches a table
+above, and why it is allowed:
+
+| Write | Table | Verdict |
+|---|---|---|
+| `store_records` UPSERT (`app/services/storage.py`) | `raw_health_data` | payload change → kept as a version by trigger first; `last_seen_at`, `source_deleted_at` → `NULL` (logged as an event), `payload_received_at`/`payload_source`/`response_id` change only with the payload; derived `source_*_time`/`source_timezone` |
+| `mark_source_deletions` (`app/sync/deletions.py`) | `raw_health_data` | sets `source_deleted_at` only (logged as an event); nothing deleted |
+| import-restored row takes a newer dump payload (`app/services/raw_history.py`) | `raw_health_data` | only rows the import itself created; the old payload is kept as a version by trigger |
+| version renumbering (`import-versions`) | `raw_health_data_versions` | `version` only, in a transaction with `healthos.renumber = '1'` |
+| quarantine of rollup records (migration `0002`, applied long ago) | `raw_health_data` | flag columns only, payload untouched |
+| batch/element processing (`app/services/webhook_processing.py`) | `webhook_events`, `webhook_notifications` | operational: `status`, counters, `last_error`, `processed_at`, `failure_count`, `element_count`, filling a missing `raw_body`/`signature_verified_at` once; payload frozen by trigger |
+| `signature_verified_at` backfill (migration `0003`) | `webhook_events` | operational, fills a NULL |
+| sync state, backfill jobs, reliability state, appearance, OAuth token rotation | `sync_state`, `backfill_jobs`, `reliability_state`, `appearance_settings`, `oauth_tokens` | operational metadata, not received data |
+| normalized UPSERTs | `heart_rate`, `steps`, … | derived, see below |
+| `downgrade()` of migrations | — | refuses while versions, responses or events exist (`-x allow-version-loss=1` after a backup) |
+
+Outside the database: `scripts/restore.sh` drops and recreates only its scratch target (never
+`health`), and `scripts/backup.sh` prunes old dump *files* by its retention setting (see
+[Database backup and restore](#database-backup-and-restore)).
 
 ### Derived tables
 

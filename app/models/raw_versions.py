@@ -13,12 +13,14 @@ Re-receiving the same payload changes nothing.
 Nothing received from Google is deleted: triggers refuse ``DELETE`` and ``TRUNCATE`` on
 ``raw_health_data`` (also through ``TRUNCATE ... CASCADE``) and on the history, and refuse
 changing a record's identity (``id``, ``data_type``, ``google_data_point_id``,
-``first_seen_at``, ``created_at``). History rows are append-only; the one permitted change
-is renumbering ``version`` while ``health-mirror import-versions`` slots an older version
-recovered from an archive dump in front of later ones, and on PostgreSQL only inside a
-transaction that set ``healthos.renumber = '1'`` (which only that command does). A record
-with no history rows is version 1, so existing archives need no copy: the current row of a
-record with ``n`` history rows is version ``n + 1``.
+``first_seen_at``, ``created_at``). The same guards cover the verbatim responses, the
+source-deletion events, the webhook tables (whose received payload is frozen) and the
+manual measurements and workouts (append-only). History rows are append-only; the one
+permitted change is renumbering ``version`` while ``health-mirror import-versions`` slots
+an older version recovered from an archive dump in front of later ones, and on PostgreSQL
+only inside a transaction that set ``healthos.renumber = '1'`` (which only that command
+does). A record with no history rows is version 1, so existing archives need no copy: the
+current row of a record with ``n`` history rows is version ``n + 1``.
 
 On PostgreSQL every protective trigger is ``ENABLE ALWAYS``, so it also fires under
 ``session_replication_role = replica``; ``health-mirror verify`` fails when one is
@@ -216,8 +218,28 @@ _EVENT = (
     "ELSE 'source-deleted' END, "
     "coalesce(NEW.source_deleted_at, NEW.last_seen_at), {previous})"
 )
-# Tables whose rows never change once written.
-APPEND_ONLY_TABLES = ("raw_api_responses", "raw_health_data_events")
+# Tables whose rows never change once written: what Google sent, what was derived from it
+# for the timeline, and what the maintainer entered by hand (no edit or delete path exists; a
+# correction is a new entry).
+APPEND_ONLY_TABLES = (
+    "raw_api_responses",
+    "raw_health_data_events",
+    "webhook_batch_items",
+    "manual_measurements",
+    "manual_workouts",
+)
+# Tables whose rows are never deleted and whose received payload never changes, while
+# processing state (status, counters, errors, processed_at) is updated in place:
+# table -> (frozen columns, extra PostgreSQL / SQLite condition for a refused UPDATE).
+PAYLOAD_TABLES = {
+    "webhook_events": (
+        ("payload_hash", "raw_json::text", "created_at"),
+        # The signed body may be filled in once (legacy batches), never replaced.
+        "OLD.raw_body IS NOT NULL AND OLD.raw_body IS DISTINCT FROM NEW.raw_body",
+        "OLD.raw_body IS NOT NULL AND OLD.raw_body IS NOT NEW.raw_body",
+    ),
+    "webhook_notifications": (("element_hash", "raw_json::text", "created_at"), None, None),
+}
 
 
 def _row(prefix: str, columns) -> str:
@@ -314,6 +336,26 @@ for _table in APPEND_ONLY_TABLES:
     _PG_TRIGGERS[f"{_table}_append_only"] = (
         _table,
         f"BEFORE UPDATE OR DELETE ON {_table} FOR EACH ROW",
+        "healthos_refuse_change",
+    )
+    _PG_TRIGGERS[f"{_table}_no_truncate"] = (
+        _table,
+        f"BEFORE TRUNCATE ON {_table} FOR EACH STATEMENT",
+        "healthos_refuse_change",
+    )
+
+for _table, (_columns, _pg_extra, _) in PAYLOAD_TABLES.items():
+    _when = f"({_row('OLD', _columns)}) IS DISTINCT FROM ({_row('NEW', _columns)})"
+    if _pg_extra:
+        _when = f"{_when}\n      OR ({_pg_extra})"
+    _PG_TRIGGERS[f"{_table}_frozen_payload"] = (
+        _table,
+        f"BEFORE UPDATE ON {_table} FOR EACH ROW\nWHEN ({_when})",
+        "healthos_refuse_change",
+    )
+    _PG_TRIGGERS[f"{_table}_no_delete"] = (
+        _table,
+        f"BEFORE DELETE ON {_table} FOR EACH ROW",
         "healthos_refuse_change",
     )
     _PG_TRIGGERS[f"{_table}_no_truncate"] = (
@@ -448,6 +490,28 @@ BEGIN
     {_sqlite_refuse(_table, _operation)}
 END""",
         )
+
+for _table, (_columns, _, _sqlite_extra) in PAYLOAD_TABLES.items():
+    _when = _sqlite_changed(_columns)
+    if _sqlite_extra:
+        _when = f"{_when} OR ({_sqlite_extra})"
+    _SQLITE_TRIGGERS[f"{_table}_frozen_payload"] = (
+        _table,
+        f"""CREATE TRIGGER {_table}_frozen_payload
+BEFORE UPDATE ON {_table} FOR EACH ROW
+WHEN {_when}
+BEGIN
+    {_sqlite_refuse(_table, "UPDATE")}
+END""",
+    )
+    _SQLITE_TRIGGERS[f"{_table}_no_delete"] = (
+        _table,
+        f"""CREATE TRIGGER {_table}_no_delete
+BEFORE DELETE ON {_table}
+BEGIN
+    {_sqlite_refuse(_table, "DELETE")}
+END""",
+    )
 
 SQLITE_TRIGGERS = tuple((table, trigger) for trigger, (table, _) in _SQLITE_TRIGGERS.items())
 SQLITE_DDL = (*(sql for _, sql in _SQLITE_TRIGGERS.values()), VIEW_SQL)
