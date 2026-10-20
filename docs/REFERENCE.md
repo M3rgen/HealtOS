@@ -98,6 +98,15 @@ The bridge requires a random bearer token; only the backend receives that token.
 Token and credentials are never included in frontend bundles or tool responses.
 The bridge log is `healthos-bridge\bridge.log`. Keep that local home private.
 
+The bridge listens on `CODEX_BRIDGE_BIND_HOST` (process environment or `.env`), never on
+`0.0.0.0`. Left empty, it uses the `docker0` address on Linux Docker Engine — the address
+`host.docker.internal` resolves to in the app container via Compose's `host-gateway` mapping — and
+`127.0.0.1` elsewhere (Docker Desktop forwards `host.docker.internal` to host loopback). On a Linux
+host, also apply [`deploy/firewall/codex-bridge.nft`](../deploy/firewall/codex-bridge.nft) (or
+`deploy/firewall/codex-bridge.ufw.sh`) so port 8766 accepts only loopback and Docker bridge traffic.
+A bridge started by an older launcher listened on all interfaces: stop the PID in
+`healthos-bridge/bridge.pid` and run the launcher again.
+
 Usage counts against the signed-in ChatGPT account's limits. Codex must be running
 and able to reach OpenAI. If the connection closes, use **Yeniden bağlan**. For a
 native backend outside Docker, set `CODEX_BRIDGE_URL=ws://127.0.0.1:8766` instead.

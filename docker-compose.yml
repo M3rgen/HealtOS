@@ -46,6 +46,10 @@ services:
       WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
+    extra_hosts:
+      # Linux Docker Engine: resolves to the docker0 gateway, where
+      # scripts/start_codex_bridge.py listens. Docker Desktop provides it already.
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -120,6 +121,52 @@ def check_backup_automation(compose_doc: object, verifier: str) -> list[str]:
     return errors
 
 
+# Built from parts so this file does not match its own rule.
+WILDCARD_BRIDGE = "0.0.0.0" + ":8766"
+BRIDGE_SCAN_GLOBS = (
+    "*.yml",
+    "*.md",
+    ".env.example",
+    "Dockerfile",
+    "Makefile",
+    "app/**/*.py",
+    "scripts/*",
+    "deploy/**/*",
+    "docs/**/*.md",
+)
+
+
+def repository_files() -> list[Path]:
+    """Tracked files (so local untracked notes are ignored); globbing outside Git."""
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True
+        ).stdout.decode()
+    except (OSError, subprocess.CalledProcessError):
+        return sorted({path for pattern in BRIDGE_SCAN_GLOBS for path in ROOT.glob(pattern)})
+    tracked = {ROOT / name for name in listed.split("\0") if name}
+    return sorted({path for pattern in BRIDGE_SCAN_GLOBS for path in ROOT.glob(pattern)} & tracked)
+
+
+def check_codex_bridge_binding() -> list[str]:
+    errors: list[str] = []
+    for path in repository_files():
+        if path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if WILDCARD_BRIDGE in text:
+                relative = path.relative_to(ROOT).as_posix()
+                errors.append(f"{relative}: the Codex bridge must not listen on all interfaces")
+    bridge = (ROOT / "scripts" / "start_codex_bridge.py").read_text(encoding="utf-8")
+    if "CODEX_BRIDGE_BIND_HOST" not in bridge:
+        errors.append("scripts/start_codex_bridge.py must take its bind address from the env")
+    if not (ROOT / "deploy" / "firewall" / "codex-bridge.nft").is_file():
+        errors.append("deploy/firewall/codex-bridge.nft example is missing")
+    return errors
+
+
 def check_repository() -> list[str]:
     errors: list[str] = []
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -155,6 +202,7 @@ def check_repository() -> list[str]:
     if '"WATCHDOG_ENABLED": "false"' not in verifier:
         errors.append("Compose verifier must explicitly disable all schedulers")
     errors.extend(check_backup_automation(compose_doc, verifier))
+    errors.extend(check_codex_bridge_binding())
     cloudflare = (ROOT / "deploy" / "cloudflare" / "config.example.yml").read_text(encoding="utf-8")
     if "http_status:404" not in cloudflare:
         errors.append("Cloudflare example lacks a deny-by-default final rule")
