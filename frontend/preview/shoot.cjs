@@ -152,7 +152,7 @@ async function mock(page, base, problems, scenario) {
     if (p === '/api/dashboard/export.csv') return route.fulfill({ body: 'date,steps\n', contentType: 'text/csv' });
     if (p === '/sync/status') return json(route, data.syncStatus);
     if (p === '/sync/all') return json(route, { status: 'accepted', data_types: ['steps'] }, 202);
-    if (/^\/(api|sync|auth|docs|health)(\/|$)/.test(p)) { problems.push(`unmocked ${method} ${p}`); return json(route, { detail: 'preview: not mocked' }, 404); }
+    if (/^\/(api|sync|auth|docs|health|google-health)(\/|$)/.test(p)) { problems.push(`unmocked ${method} ${p}`); return json(route, { detail: 'preview: not mocked' }, 404); }
     return route.continue();
   });
   // Freeze Vite HMR: other edits to the tree must not reload a page mid-shot.
@@ -164,7 +164,7 @@ async function mock(page, base, problems, scenario) {
     ws.onMessage((raw) => {
       const message = JSON.parse(String(raw));
       if (!message.text) return;
-      ws.send(JSON.stringify({ type: 'working', text: 'Codex düşünüyor…' }));
+      ws.send(JSON.stringify({ type: 'working', text: 'Umay düşünüyor…' }));
       const parts = fx.chatAnswer.match(/[\s\S]{1,48}/g);
       parts.forEach((text, i) => setTimeout(() => ws.send(JSON.stringify({ type: 'delta', id: 'a1', text })), 80 + i * 15));
       setTimeout(() => ws.send(JSON.stringify({ type: 'done', status: 'completed' })), 120 + parts.length * 15);
