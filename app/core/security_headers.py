@@ -29,7 +29,8 @@ APP_POLICY = (
     "frame-ancestors 'none'",
 )
 # FastAPI's interactive docs are a developer tool built from the jsDelivr CDN and an
-# inline bootstrap script; keep that exception off the dashboard itself.
+# inline bootstrap script; keep that exception off the dashboard itself, and off every
+# path when the docs are disabled (production).
 DOCS_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc"})
 DOCS_POLICY = "; ".join(
     (
@@ -54,14 +55,15 @@ def app_policy(host: str | None) -> str:
 
 
 class SecurityHeadersMiddleware:
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, docs_enabled: bool = True) -> None:
         self.app = app
+        self.docs_enabled = docs_enabled
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if scope["path"] in DOCS_PATHS:
+        if self.docs_enabled and scope["path"] in DOCS_PATHS:
             policy = DOCS_POLICY
         else:
             hosts = Headers(scope=scope).getlist("host")

@@ -129,7 +129,8 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Open `http://localhost:8000/`. The API documentation remains at `/docs`.
+Open `http://localhost:8000/`. This Compose file runs in production mode, which serves no API
+documentation; see [Local API](#local-api).
 After frontend changes, run `docker compose up -d --build app` to update this
 permanent dashboard. `npm run build` alone only updates the host files; an
 existing container keeps its bundled frontend. Port `5173` is a temporary Vite
@@ -577,7 +578,10 @@ as a Cloudflare 502 on the webhook and must be handled by host monitoring.
 - `GET /google-health/capabilities` (metadata-only one-record probes)
 - `GET /google-health/devices` (sanitized paired-device metadata)
 
-Interactive OpenAPI documentation is available locally at `/docs`. Every route except
+Interactive OpenAPI documentation (`/docs`, `/redoc`, `/openapi.json`) is served only outside
+production (`APP_ENV` other than `production`, e.g. with `docker-compose.dev.yml` or `make run`):
+its page needs inline scripts and the jsDelivr CDN, an exception the login-cookie origin should not
+carry in production. Every route except
 `/health/live`, the login page, the OAuth callback and the webhook requires the UI token.
 
 ## Database backup and restore

@@ -70,9 +70,13 @@ class Settings(BaseSettings):
     automatic_recovery_enabled: bool = True
     automatic_recovery_max_days: int = Field(default=7, ge=1, le=30)
 
+    @property
+    def production(self) -> bool:
+        return self.app_env.casefold() in {"production", "prod"}
+
     @model_validator(mode="after")
     def reject_unsafe_production_configuration(self) -> Settings:
-        if self.app_env.casefold() not in {"production", "prod"}:
+        if not self.production:
             return self
 
         unsafe: list[str] = []

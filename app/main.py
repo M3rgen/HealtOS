@@ -92,11 +92,18 @@ def create_app() -> FastAPI:
             runtime.scheduler = None
         await runtime.shutdown()
 
+    # The interactive docs need inline scripts and the jsDelivr CDN (see
+    # security_headers.DOCS_POLICY); they are a development tool, so production, where
+    # the login cookie lives, serves none of them.
+    docs = not settings.production
     application = FastAPI(
         title="Personal Health Data Mirror",
         version="0.5.0",
         description="Read-only, raw-first archive of Google Health API data",
         lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
     application.state.settings = settings
     application.state.runtime = runtime
@@ -106,7 +113,7 @@ def create_app() -> FastAPI:
         HostValidationMiddleware,
         webhook_endpoint_uri=settings.google_health_webhook_endpoint_uri,
     )
-    application.add_middleware(SecurityHeadersMiddleware)
+    application.add_middleware(SecurityHeadersMiddleware, docs_enabled=docs)
     application.include_router(health.router)
     application.include_router(login.router)
     application.include_router(auth.router)

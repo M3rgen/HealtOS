@@ -129,8 +129,9 @@ first build downloads dependencies and applies database migrations. Without Goog
 dashboard starts with an empty archive and reports incomplete Google configuration; manual entries
 remain available. The development override also publishes PostgreSQL on `127.0.0.1:5432`.
 
-After logging in, [localhost:8000/health](http://localhost:8000/health) shows pipeline status and
-[localhost:8000/docs](http://localhost:8000/docs) the local API documentation.
+After logging in, [localhost:8000/health](http://localhost:8000/health) shows pipeline status. With
+the development override, [localhost:8000/docs](http://localhost:8000/docs) serves the interactive
+API documentation; production mode serves no `/docs`, `/redoc` or `/openapi.json`.
 
 ### 4. Connect Google Health
 
