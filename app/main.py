@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,6 +21,19 @@ from app.services.runtime import build_runtime
 from app.services.scheduler import build_scheduler
 
 logger = logging.getLogger(__name__)
+# body.d736859b.glb: a content-hashed name never changes meaning, so it can be cached
+# forever; anything else under /models must be revalidated.
+HASHED_NAME = re.compile(r"[^/]+[.-][0-9a-f]{8,64}\.[A-Za-z0-9]+")
+
+
+class ModelFiles(StaticFiles):
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        hashed = HASHED_NAME.fullmatch(Path(full_path).name)
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if hashed else "no-cache"
+        )
+        return response
 
 
 def create_app() -> FastAPI:
@@ -88,7 +102,7 @@ def create_app() -> FastAPI:
     if static.is_dir():
         application.mount("/assets", StaticFiles(directory=static / "assets"), name="assets")
         if (static / "models").is_dir():
-            application.mount("/models", StaticFiles(directory=static / "models"), name="models")
+            application.mount("/models", ModelFiles(directory=static / "models"), name="models")
 
         @application.get("/", include_in_schema=False)
         async def index():

@@ -132,3 +132,33 @@ async def test_interactive_docs_get_their_cdn_exception_only(application):
     csp = assert_hardened(docs)
     assert "https://cdn.jsdelivr.net" in csp["script-src"]
     assert "cdn.jsdelivr.net" not in dashboard_csp
+
+
+@pytest.mark.parametrize(
+    "name, cached",
+    [
+        ("body.d736859b.glb", True),
+        ("body-0123456789abcdef.glb", True),
+        ("body.glb", False),
+        ("body.compressed.glb", False),
+        ("body.D736859B.glb", False),
+        ("body.d73685.glb", False),
+        ("LICENSE-CC0.txt", False),
+    ],
+)
+async def test_models_are_immutable_only_with_a_content_hash(tmp_path, name, cached):
+    from fastapi import FastAPI
+
+    (tmp_path / name).write_bytes(b"glTF")
+    models = FastAPI()
+    models.mount("/models", main.ModelFiles(directory=tmp_path), name="models")
+    async with client(models) as http:
+        first = await http.get(f"/models/{name}")
+        again = await http.get(f"/models/{name}", headers={"If-None-Match": first.headers["etag"]})
+        missing = await http.get("/models/absent.d736859b.glb")
+    expected = "public, max-age=31536000, immutable" if cached else "no-cache"
+    assert first.status_code == 200 and first.headers["cache-control"] == expected
+    assert again.status_code == 304 and again.headers["cache-control"] == expected
+    assert missing.status_code == 404 and "immutable" not in missing.headers.get(
+        "cache-control", ""
+    )
