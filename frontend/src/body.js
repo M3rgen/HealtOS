@@ -1,11 +1,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import './body.css';
 
 // Locally bundled body model (see public/models/PROVENANCE.md). glTF Y-up, feet at y=0,
 // facing +Z, ~1.75 m at basis, carrying the morph targets below on every deforming mesh.
-const MODEL_URL = '/models/body.glb';
+// Meshopt-compressed (EXT_meshopt_compression + KHR_mesh_quantization, WebP normal map); the file
+// name carries a content hash so /models can be cached as immutable. Rename it when the model changes.
+const MODEL_URL = '/models/body.d736859b.glb';
 const PEDESTAL_URL = '/assets/3d/pedestal-glow.webp';
 const MORPHS = ['fat_high', 'fat_low', 'muscle_high', 'muscle_low'];
 
@@ -138,7 +141,7 @@ function groundDecal(texture, opacity, blending) {
 // roughness 0.5 = neutral. One tile ≈ 6–7 cm on the body at 28 repeats per UV unit.
 // Missing files simply leave the detail off.
 const SKIN_DETAIL = {
-  normalUrl: '/assets/skin/skin-detail-normal.png',
+  normalUrl: '/assets/skin/skin-detail-normal.webp',
   roughnessUrl: '/assets/skin/skin-detail-roughness.webp',
   repeat: 28, // tiles across the 0–1 body UV atlas
   normalStrength: .35,
@@ -534,7 +537,8 @@ export function createBody(container, motionEnabled) {
     }
   }
 
-  new GLTFLoader().load(MODEL_URL, ({ scene: model }) => {
+  // The meshopt decoder is bundled from three (WebAssembly, so the CSP needs 'wasm-unsafe-eval').
+  new GLTFLoader().setMeshoptDecoder(MeshoptDecoder).load(MODEL_URL, ({ scene: model }) => {
     if (disposed) { disposeTree(model); return; }
     prepare(model);
     normalizer.add(model);

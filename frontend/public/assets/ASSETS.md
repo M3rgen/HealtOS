@@ -1,6 +1,6 @@
 # HealthOS custom assets (lane C)
 
-Everything here is served by Vite from `/assets/...` (it lives in `frontend/public`). UI assets total about 190 KB. The `skin/` maps are a separate budget of 1.49 MB.
+Everything here is served by Vite from `/assets/...` (it lives in `frontend/public`). UI assets total about 190 KB. The `skin/` maps are a separate budget of 456 KB (1.49 MB before the 2026-10-20 recompression).
 Palette: page #181814, surface #20201c, amber #f0c478, muted #b9b7ae, plus the existing metric tokens. Every SVG uses `currentColor`, so the existing CSS tokens color them.
 
 Provenance key:
@@ -80,13 +80,15 @@ Provenance key:
 
 | Path | UI slot | Size | Made with | Provenance |
 |---|---|---|---|---|
-| skin/skin-detail-normal.png | three.js detail **normalMap** on the body material (tangent space, **OpenGL +Y up**, three.js default). 1024², RGB. Encoded RMS tilt is about 12°. RG keep 7 bits and B 6 bits; error after renormalisation is under 1° | 989 KB | gpt-image-2 source (a flat-lit, top-down macro of skin), then a local numpy pipeline: high-pass, local-contrast equalisation, separable variance-preserving half-offset blend for seamlessness, then periodic central-difference normals | AI-generated source made for HealthOS. No scanned or third-party data |
-| skin/skin-detail-roughness.webp | three.js detail **roughnessMap** (G channel is read; the image is grayscale). 512², mean exactly 0.50 (range ≈0.43–0.57). Furrows and pores are slightly rougher. Lossless WebP | 129 KB | Derived from the height map plus a soft periodic noise | same |
-| skin/skin-pores-height.png | Height/bump reference (`bumpMap` fallback, or for Blender). 1024² grayscale, mean 0.5, pores and furrows dark. Quantised to 39 levels to fit the budget; the normal map was computed from full precision | 370 KB | same pipeline | same |
+| skin/skin-detail-normal.webp | three.js detail **normalMap** on the body material (tangent space, **OpenGL +Y up**, three.js default). 512², RGB, lossless WebP. Encoded RMS tilt is about 12°. RG keep 7 bits and B 6 bits; error after renormalisation is under 1° | 328 KB | gpt-image-2 source (a flat-lit, top-down macro of skin), then a local numpy pipeline: high-pass, local-contrast equalisation, separable variance-preserving half-offset blend for seamlessness, then periodic central-difference normals. Recompressed 2026-10-20 (see below) | AI-generated source made for HealthOS. No scanned or third-party data |
+| skin/skin-detail-roughness.webp | three.js detail **roughnessMap** (G channel is read; the image is grayscale). 512², mean exactly 0.50 (range ≈0.43–0.57). Furrows and pores are slightly rougher. Lossless WebP | 129 KB | Derived from the pore height map plus a soft periodic noise | same |
 
-**Seamlessness:** the wrap-edge pixel difference matches the interior neighbour difference on both axes (normal: 3.23 vs 3.25 in x, 4.09 vs 4.06 in y). The 3×3 tiling and 1:1 seam-crossing crops were checked visually.
+**2026-10-20 recompression (plan item 4.3):** the normal tile was 1024² PNG (989 KB). It was reduced with an exact 2×2 box filter on the decoded vectors, renormalised, re-quantised to 7/7/6 bits and saved as lossless WebP (Node script using sharp 0.35.5 as installed by `@gltf-transform/cli@4.5.1`; WebP `lossless, effort 6`). A box filter never crosses the wrap edge, so the tile stays seamless (wrap-edge vs interior neighbour difference: 18.14 vs 18.14 in x, 22.71 vs 22.73 in y, summed over RGB at 512²). The result equals the GPU's first mip level of the old 1024² tile, and at 28 repeats per UV unit the dashboard always samples mip 1 or coarser, so the rendered body is unchanged (before/after screenshots compared pixel by pixel). Lossless rather than lossy WebP was chosen because 4:2:0 chroma subsampling would bend the normals.
+The 1024² `skin-pores-height.png` (370 KB) height/bump reference was never loaded by the app and was removed; the roughness map above was already derived from it.
 
-**Recommended three.js use:** `wrapS = wrapT = RepeatWrapping`. Set `colorSpace = NoColorSpace` on all three textures (they are data, not colour). Keep mipmaps on, with anisotropy of 4–8.
+**Seamlessness:** the wrap-edge pixel difference matches the interior neighbour difference on both axes (original 1024² normal tile, per channel: 3.23 vs 3.25 in x, 4.09 vs 4.06 in y). The 3×3 tiling and 1:1 seam-crossing crops were checked visually.
+
+**Recommended three.js use:** `wrapS = wrapT = RepeatWrapping`. Set `colorSpace = NoColorSpace` on both textures (they are data, not colour). Keep mipmaps on, with anisotropy of 4–8.
 - **Repeat:** physically, one tile is about 2 cm, so a 1.75 m body on a single 0–1 (2048²) UV atlas would need about 90 repeats. At the dashboard's model size (about 350–700 px tall) that is sub-pixel and mips away to nothing. Use **about 24–32 repeats per UV unit**, which puts one tile at about 6–7 cm on the body. Go up to about 48 only for close-up zoom.
 - **Normal strength:** `normalScale ≈ (0.35, 0.35)` for a subtle look, up to 0.6 for a visible skin grain. The detail must be combined with lane A's baked normal map (for example a UDN/whiteout blend in `onBeforeCompile`, or a second UV set), not substituted for it.
 - **Roughness:** multiply the detail roughness by about 2× around the base value (detail 0.5 means "no change") so the base ORM roughness stays authoritative.
