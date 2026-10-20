@@ -1,7 +1,9 @@
+import { handleUnauthorized } from './api.js';
+
 const metrics = {
   steps: {title: 'Adım geçmişi', average: 'Günlük ortalama', color: 'var(--step-chart)'},
   sleep: {title: 'Uyku geçmişi', average: 'Ortalama uyku', color: 'var(--sleep-light)'},
-  heart: {title: 'Dinlenik nabız geçmişi', average: 'Ortalama dinlenik nabız', color: 'var(--heart-chart)'},
+  heart: {title: 'Dinlenme nabzı geçmişi', average: 'Ortalama dinlenme nabzı', color: 'var(--heart-chart)'},
 };
 const number = (value, digits = 0) => Number(value).toLocaleString('tr-TR', {maximumFractionDigits: digits});
 const date = (value, long = false) => new Intl.DateTimeFormat('tr-TR', {
@@ -113,6 +115,7 @@ export function setupMetricHistory(getTimezone) {
     try {
       const query = new URLSearchParams({metric, page, timezone: getTimezone()});
       const response = await fetch(`/api/dashboard/history?${query}`, {cache: 'no-store', signal: AbortSignal.any([pending.signal, AbortSignal.timeout(20000)])});
+      if (handleUnauthorized(response)) return;
       if (!response.ok) throw new Error('Geçmiş alınamadı. Tekrar dene.');
       const result = await response.json();
       if (controller !== pending || !dialog.open) return;
@@ -150,16 +153,12 @@ export function setupMetricHistory(getTimezone) {
     }
   }
 
-  document.querySelectorAll('[data-history-metric]').forEach(card => {
-    function open() {
-      opener = card;
+  document.querySelectorAll('[data-history-metric]').forEach(button => {
+    button.addEventListener('click', () => {
+      opener = button;
       if (!dialog.open) dialog.showModal();
       document.body.classList.add('metric-history-open');
-      load(card.dataset.historyMetric);
-    }
-    card.addEventListener('click', open);
-    card.addEventListener('keydown', event => {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+      load(button.dataset.historyMetric);
     });
   });
   document.querySelectorAll('[data-history-tab]').forEach(el => el.addEventListener('click', () => load(el.dataset.historyTab)));

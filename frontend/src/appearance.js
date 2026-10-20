@@ -22,7 +22,7 @@ const DEFAULT_GLYPH = '/assets/umay/umay-glyph.svg';
 const TEXT = {
   logo: { legend: 'Logo', hint: 'Üst çubukta ve tarayıcı sekmesinde görünür.' },
   umay: { legend: 'Umay', hint: 'Sohbet penceresinde ve karşılama ekranında görünür.' },
-  background: { legend: 'Arka plan', hint: 'Panellerin arkasındaki sayfa zemini. Paneller okunaklı kalır.' },
+  background: { legend: 'Arka plan', hint: 'Panellerin arkasındaki zemin; paneller her zaman okunaklı kalır.' },
 };
 
 // Used when the manifest cannot be loaded or lists nothing usable.
