@@ -137,6 +137,7 @@ async function mock(page, base, problems, scenario) {
   const data = { ...fx, ...fx.scenario(scenario) };
   const call = (value, q) => typeof value === 'function' ? value(q) : value;
   const json = (route, body, status = 200) => route.fulfill({ status, json: body });
+  let appearance = data.appearanceSettings; // per page: a PUT is read back by the next GET
   await page.route('**/*', async (route) => {
     const url = new URL(route.request().url());
     const method = route.request().method();
@@ -150,6 +151,10 @@ async function mock(page, base, problems, scenario) {
     if (p === '/api/dashboard/workouts') return method === 'POST'
       ? json(route, { id: 'new', ...route.request().postDataJSON(), source: 'Manuel' }, 201) : json(route, call(data.workouts, q));
     if (p === '/api/dashboard/export.csv') return route.fulfill({ body: 'date,steps\n', contentType: 'text/csv' });
+    if (p === '/api/settings/appearance') {
+      if (method === 'PUT') appearance = { selection: route.request().postDataJSON(), updated_at: new Date().toISOString() };
+      return json(route, appearance);
+    }
     if (p === '/sync/status') return json(route, data.syncStatus);
     if (p === '/sync/all') return json(route, { status: 'accepted', data_types: ['steps'] }, 202);
     if (/^\/(api|sync|auth|docs|health|google-health)(\/|$)/.test(p)) { problems.push(`unmocked ${method} ${p}`); return json(route, { detail: 'preview: not mocked' }, 404); }

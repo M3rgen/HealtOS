@@ -133,6 +133,9 @@ function scenario(name) {
   return {};
 }
 
+// GET /api/settings/appearance on a server with nothing stored yet (app/api/settings.py).
+const appearanceSettings = { selection: {}, updated_at: null };
+
 // Synthetic upload files for the appearance views/tests (generated, no assets).
 const zlib = require('node:zlib');
 function crc32(buffer) {
@@ -165,4 +168,4 @@ const uploadBackgroundPng = () => syntheticPng(640, 400, (u, v) => [Math.round(3
 // Includes a script and an id marker: tests assert neither ever reaches the DOM.
 const uploadLogoSvg = () => Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" id="uploaded-svg-marker"><script>window.uploadedSvgRan=true</script><circle cx="24" cy="24" r="18" fill="none" stroke="#48d88c" stroke-width="5"/><path d="M15 24h18" stroke="#48d88c" stroke-width="5" stroke-linecap="round"/></svg>');
 
-module.exports = { NOW, TODAY, health, dashboard, history, measurements, syncStatus, workouts, chatAnswer, scenario, syntheticPng, uploadAvatarPng, uploadBackgroundPng, uploadLogoSvg };
+module.exports = { NOW, TODAY, health, dashboard, history, measurements, syncStatus, workouts, chatAnswer, scenario, appearanceSettings, syntheticPng, uploadAvatarPng, uploadBackgroundPng, uploadLogoSvg };
