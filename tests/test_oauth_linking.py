@@ -1,4 +1,8 @@
 import asyncio
+import base64
+import hashlib
+import hmac
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -6,7 +10,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import delete, select
 
 from app.api import auth
@@ -192,3 +196,14 @@ async def test_callback_and_inflight_refresh_leave_new_connection_active(linked,
     assert (await connection(sessions))[1:] == ("scope-B", "account-B", "legacy-B")
     assert await runtime.tokens.get() == "new-access-B"
     assert await runtime.credentials.load_refresh_token() == "refresh-B"
+
+
+def test_oauth_state_signed_with_an_empty_key_is_rejected():
+    """An unset key may arrive as "" from the environment; it must not verify anything."""
+    payload = f"{int(time.time())}.nonce"
+    signature = hmac.new(b"", payload.encode(), hashlib.sha256).digest()
+    forged = f"{payload}.{base64.urlsafe_b64encode(signature).decode().rstrip('=')}"
+    settings = Settings(_env_file=None, google_token_encryption_key="")
+    with pytest.raises(HTTPException) as rejected:
+        auth._verify_state(settings, forged)
+    assert rejected.value.status_code == 400

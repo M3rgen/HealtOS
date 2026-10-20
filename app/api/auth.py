@@ -32,7 +32,7 @@ def _verify_state(settings: Settings, state: str) -> None:
         timestamp, nonce, signature = state.split(".", 2)
         payload = f"{timestamp}.{nonce}"
         secret = settings.google_token_encryption_key
-        if secret is None:
+        if not secret:  # "" would make every HMAC computable by anyone
             raise ValueError("no OAuth state key configured")
         expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()
         actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
