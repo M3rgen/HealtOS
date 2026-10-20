@@ -12,6 +12,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 PLACEHOLDERS = {"change_me", "changeme", "todo", "replace_me", "example-secret"}
 REQUIRED_PRODUCTION = {
+    "APP_UI_TOKEN",
     "POSTGRES_PASSWORD",
     "DATABASE_URL",
     "GOOGLE_CLIENT_ID",
@@ -191,6 +192,69 @@ def check_codex_bridge_binding() -> list[str]:
     return errors
 
 
+DOCUMENTATION_GLOBS = ("README.md", "AGENTS.md", "CONTRIBUTING.md", "docs/**/*.md")
+FENCED_BLOCK = re.compile(r"^ {0,3}(`{3,}|~{3,}).*?^ {0,3}\1[ \t]*$", re.MULTILINE | re.DOTALL)
+INLINE_CODE = re.compile(r"(`+)(?!`).+?(?<!`)\1", re.DOTALL)
+# `](target)` covers links, images and badges nested in links; an optional title follows.
+MARKDOWN_TARGET = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)")
+HTML_TARGET = re.compile(r"<(?:img|a|source)\b[^>]*?\s(?:src|href)=[\"']([^\"']+)[\"']", re.I)
+HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(.+?)[ \t#]*$", re.MULTILINE)
+
+
+def documentation_files(root: Path = ROOT) -> list[Path]:
+    return sorted({path for pattern in DOCUMENTATION_GLOBS for path in root.glob(pattern)})
+
+
+def strip_code(markdown: str) -> str:
+    """Drop fenced blocks and inline code so example syntax is not read as a link."""
+    return INLINE_CODE.sub("", FENCED_BLOCK.sub("", markdown))
+
+
+def heading_anchors(markdown: str) -> set[str]:
+    """GitHub-style heading slugs, including the -1, -2 suffixes of repeated headings."""
+    anchors: set[str] = set()
+    seen: dict[str, int] = {}
+    for heading in HEADING.findall(FENCED_BLOCK.sub("", markdown)):
+        text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", heading)  # keep link text only
+        text = re.sub(r"<[^>]+>", "", text).replace("`", "").strip().lower()
+        slug = re.sub(r"[^\w\- ]", "", text).replace(" ", "-")
+        count = seen.get(slug, 0)
+        seen[slug] = count + 1
+        anchors.add(slug if count == 0 else f"{slug}-{count}")
+    return anchors
+
+
+def broken_links(markdown: Path, root: Path = ROOT) -> list[str]:
+    """Relative links and image references in one Markdown file that do not resolve.
+
+    External (scheme) links and pure `#anchor` links are ignored. `file.md#anchor`
+    must name an existing file and, for Markdown targets, an existing heading.
+    """
+    content = strip_code(markdown.read_text(encoding="utf-8"))
+    targets = [*MARKDOWN_TARGET.findall(content), *HTML_TARGET.findall(content)]
+    problems: list[str] = []
+    for target in targets:
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target) or target.startswith(("#", "//")):
+            continue
+        path_part, _, fragment = target.partition("#")
+        path_part = path_part.split("?", 1)[0]
+        resolved = (markdown.parent / path_part).resolve()
+        label = f"{markdown.relative_to(root).as_posix()}: {target}"
+        if not resolved.exists():
+            problems.append(f"broken documentation link in {label}")
+        elif fragment and resolved.suffix == ".md" and resolved.is_file():
+            if fragment.lower() not in heading_anchors(resolved.read_text(encoding="utf-8")):
+                problems.append(f"broken documentation anchor in {label}")
+    return problems
+
+
+def check_documentation_links(root: Path = ROOT) -> list[str]:
+    errors: list[str] = []
+    for markdown in documentation_files(root):
+        errors.extend(broken_links(markdown, root))
+    return errors
+
+
 def check_repository() -> list[str]:
     errors: list[str] = []
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -244,18 +308,7 @@ def check_repository() -> list[str]:
             errors.append(f".env.example omits {name}")
     if any(value.casefold() in PLACEHOLDERS for value in template.values()):
         errors.append(".env.example contains an accepted placeholder secret")
-    markdown_files = [
-        *ROOT.glob("*.md"),
-        *(ROOT / "docs").glob("*.md"),
-    ]
-    for markdown in markdown_files:
-        content = markdown.read_text(encoding="utf-8")
-        for target in re.findall(r"\[[^]]+\]\(([^)]+)\)", content):
-            if target.startswith(("http://", "https://", "#", "mailto:")):
-                continue
-            relative = target.split("#", 1)[0]
-            if relative and not (markdown.parent / relative).resolve().exists():
-                errors.append(f"broken documentation link in {markdown.name}: {target}")
+    errors.extend(check_documentation_links())
     return errors
 
 
