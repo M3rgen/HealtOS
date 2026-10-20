@@ -50,13 +50,6 @@ class CredentialStore:
                 if scopes is not None:
                     token.scopes = scopes
 
-    async def save_identity(self, health_user_id: str | None, legacy_user_id: str | None) -> None:
-        async with self.sessions.begin() as session:
-            token = await session.scalar(select(OAuthToken).where(OAuthToken.subject == "me"))
-            if token:
-                token.health_user_id = health_user_id
-                token.legacy_user_id = legacy_user_id
-
     async def save_connection(
         self,
         refresh_token: str,

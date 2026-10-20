@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.models.state import JobStatus, ReliabilityState, SyncState
 from app.services.pipeline_health import (
     PipelineHealthService,
@@ -58,7 +59,7 @@ class PipelineWatchdog:
         return await self.check(trigger="startup")
 
     async def check(self, *, trigger: str, now: datetime | None = None) -> RecoveryOutcome:
-        now = _aware(now or datetime.now(UTC))
+        now = as_utc(now or datetime.now(UTC))
         snapshot = await self.health.inspect(now=now, scheduler_running=True)
         self._log_state_change(snapshot)
 
@@ -157,7 +158,7 @@ class PipelineWatchdog:
             state = await session.get(ReliabilityState, 1)
         if state is None or state.last_recovery_attempt_at is None:
             return False
-        attempted = _aware(state.last_recovery_attempt_at)
+        attempted = as_utc(state.last_recovery_attempt_at)
         return now - attempted < timedelta(minutes=self.settings.recovery_cooldown_minutes)
 
     async def _sync_running(self) -> bool:
@@ -221,8 +222,4 @@ def _recovery_gap(snapshot: PipelineSnapshot, now: datetime) -> timedelta | None
     )
     if reference is None:
         return None
-    return max(timedelta(0), now - _aware(reference))
-
-
-def _aware(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return max(timedelta(0), now - as_utc(reference))

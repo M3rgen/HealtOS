@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from app.core.timeutil import as_utc
+
 
 def incremental_start(
     last_successful_sync: datetime | None,
@@ -11,6 +13,4 @@ def incremental_start(
     now = now or datetime.now(UTC)
     if last_successful_sync is None:
         return now - safety_window
-    if last_successful_sync.tzinfo is None:
-        last_successful_sync = last_successful_sync.replace(tzinfo=UTC)
-    return min(last_successful_sync - safety_window, now)
+    return min(as_utc(last_successful_sync) - safety_window, now)

@@ -12,6 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.models.state import (
     OAuthToken,
     WebhookBatchItem,
@@ -414,9 +415,7 @@ class WebhookBatchProcessor:
 def _stale(verified_at: datetime | None, now: datetime) -> bool:
     if verified_at is None:
         return True
-    if verified_at.tzinfo is None:
-        verified_at = verified_at.replace(tzinfo=UTC)
-    return now - verified_at > SIGNED_REPLAY_MAX_AGE
+    return now - as_utc(verified_at) > SIGNED_REPLAY_MAX_AGE
 
 
 def _notification_data(item: object) -> dict | None:

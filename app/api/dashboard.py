@@ -12,11 +12,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_job_request
+from app.core.timeutil import as_utc
 from app.db.session import get_session
 from app.models.health import ExerciseSession, SleepSession, Steps
 from app.models.manual import ManualMeasurement, ManualWorkout
 from app.models.state import RawHealthData
-from app.services.dashboard import aware, dashboard_data
+from app.services.dashboard import dashboard_data
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -52,12 +53,12 @@ def workout_dict(row, source: str) -> dict:
     return {
         "id": str(row.id),
         "exercise_type": row.exercise_type,
-        "start_time": aware(row.start_time),
-        "end_time": aware(row.end_time),
+        "start_time": as_utc(row.start_time),
+        "end_time": as_utc(row.end_time),
         "duration_seconds": (
             float(row.duration_seconds)
             if source == "Fitbit" and row.duration_seconds is not None
-            else (aware(row.end_time) - aware(row.start_time)).total_seconds()
+            else (as_utc(row.end_time) - as_utc(row.start_time)).total_seconds()
         ),
         "calories_kcal": float(row.calories_kcal) if row.calories_kcal is not None else None,
         "distance_meters": float(row.distance_meters) if row.distance_meters is not None else None,
@@ -182,8 +183,8 @@ async def metric_history(
             .exists()
         )
     earliest, latest = (await session.execute(bounds)).one()
-    earliest_date = aware(earliest).astimezone(date_zone).date() if earliest else None
-    latest_date = aware(latest).astimezone(date_zone).date() if latest else None
+    earliest_date = as_utc(earliest).astimezone(date_zone).date() if earliest else None
+    latest_date = as_utc(latest).astimezone(date_zone).date() if latest else None
     total_pages = ((today - earliest_date).days // 30 + 1) if earliest_date else 1
     if page > total_pages:
         raise HTTPException(422, "Bu geçmiş sayfası bulunamadı.")

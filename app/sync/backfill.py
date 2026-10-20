@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
@@ -73,10 +74,7 @@ class BackfillService:
                         BackfillJob.status.not_in([JobStatus.completed, JobStatus.abandoned]),
                     )
                 )
-            if first_boundary is not None and first_boundary.tzinfo is None:
-                first_boundary = first_boundary.replace(tzinfo=UTC)
-            if last_boundary is not None and last_boundary.tzinfo is None:
-                last_boundary = last_boundary.replace(tzinfo=UTC)
+            first_boundary, last_boundary = as_utc(first_boundary), as_utc(last_boundary)
             ranges = []
             if first_boundary is None:
                 ranges.append((configured_start, end))

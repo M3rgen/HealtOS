@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.google_health.data_types import AccessMethod, DataTypeSpec, RecordKind
 from app.models.state import RawHealthData
 
@@ -40,7 +41,7 @@ def deletion_scope(
     """
     if not spec.time_filtered or spec.access_method != AccessMethod.list:
         return None
-    start, end = _utc(start), _utc(end)
+    start, end = as_utc(start), as_utc(end)
     if spec.kind == RecordKind.daily:
         start_date = date.fromisoformat(start.isoformat()[:10])
         end_date = date.fromisoformat(end.isoformat()[:10])
@@ -94,7 +95,3 @@ async def mark_source_deletions(
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked
-
-
-def _utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
