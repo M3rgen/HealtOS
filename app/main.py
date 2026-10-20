@@ -31,6 +31,8 @@ def create_app() -> FastAPI:
         async with SessionLocal() as session:
             await session.execute(text("SELECT 1"))
         event(logger, "DATABASE_READY")
+        # A crash leaves SyncState.status=running, which blocks watchdog recovery.
+        await runtime.incremental.recover_interrupted()
         scheduler = None
         scheduler_needed = settings.reconciliation_enabled or settings.watchdog_enabled
         if scheduler_needed and settings.app_env != "test":

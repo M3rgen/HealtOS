@@ -3,7 +3,7 @@
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.google_health.data_types import supported_data_types
@@ -50,6 +50,7 @@ async def dashboard_data(
     timezone: str,
     *,
     valid_sources_only: bool = False,
+    include_source_deleted: bool = False,
 ) -> dict:
     zone = ZoneInfo(timezone)
     first = end_date - timedelta(days=days - 1)
@@ -71,18 +72,25 @@ async def dashboard_data(
     step_hours = [None] * 24
 
     def valid_source(model, data_type: str):
-        return (
-            select(RawHealthData.id)
-            .where(
-                RawHealthData.data_type == data_type,
-                RawHealthData.google_data_point_id == model.google_data_point_id,
+        raw = select(RawHealthData.id).where(
+            RawHealthData.data_type == data_type,
+            RawHealthData.google_data_point_id == model.google_data_point_id,
+        )
+        if valid_sources_only:
+            return raw.where(
                 RawHealthData.is_quarantined.is_(False),
                 RawHealthData.source_deleted_at.is_(None),
-            )
-            .exists()
-            if valid_sources_only
-            else True
-        )
+            ).exists()
+        if include_source_deleted:
+            return true()
+        # Normalized rows outlive a source deletion; hide them unless asked for.
+        return ~raw.where(RawHealthData.source_deleted_at.is_not(None)).exists()
+
+    raw_not_deleted = (
+        true()
+        if include_source_deleted and not valid_sources_only
+        else RawHealthData.source_deleted_at.is_(None)
+    )
 
     # Split source intervals at civil-hour boundaries, including midnight and DST.
     steps = (
@@ -162,7 +170,7 @@ async def dashboard_data(
                 RawHealthData.source_start_time
                 < datetime.combine(end_date + timedelta(days=1), time.min, UTC),
                 RawHealthData.is_quarantined.is_(False),
-                RawHealthData.source_deleted_at.is_(None),
+                raw_not_deleted,
             )
             .order_by(RawHealthData.last_seen_at, RawHealthData.google_data_point_id)
         )
@@ -183,6 +191,7 @@ async def dashboard_data(
                 HeartRate.timestamp >= datetime.combine(end_date, time.min, zone).astimezone(UTC),
                 HeartRate.timestamp < stop,
                 HeartRate.is_quarantined.is_(False),
+                valid_source(HeartRate, "heart-rate"),
             )
             .order_by(HeartRate.timestamp)
         )
@@ -195,7 +204,11 @@ async def dashboard_data(
     measurements = []
     latest_weight = await session.scalar(
         select(Weight)
-        .where(Weight.is_quarantined.is_(False), Weight.timestamp < stop)
+        .where(
+            Weight.is_quarantined.is_(False),
+            Weight.timestamp < stop,
+            valid_source(Weight, "weight"),
+        )
         .order_by(Weight.timestamp.desc())
         .limit(1)
     )
@@ -217,7 +230,7 @@ async def dashboard_data(
             .where(
                 RawHealthData.data_type == data_type,
                 RawHealthData.source_start_time < stop,
-                RawHealthData.source_deleted_at.is_(None),
+                raw_not_deleted,
                 RawHealthData.is_quarantined.is_(False),
             )
             .order_by(RawHealthData.source_start_time.desc())

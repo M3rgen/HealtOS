@@ -83,3 +83,34 @@ def test_synthetic_identity_keeps_same_interval_zones_distinct():
     cardio = {**base, "activeZoneMinutes": {**base["activeZoneMinutes"], "heartRateZone": "CARDIO"}}
     spec = REGISTRY["active-zone-minutes"]
     assert source_id(spec, fat_burn) != source_id(spec, cardio)
+
+
+async def test_duplicate_ids_in_one_batch_are_upserted_once(sessions, monkeypatch):
+    """PostgreSQL rejects an ON CONFLICT statement that touches the same row twice."""
+    from app.services import storage
+
+    seen_batches = []
+    original_raw = storage._upsert_raw_many
+    original_normalized = storage._upsert_normalized_many
+
+    async def spy_raw(session, rows):
+        seen_batches.append([row["google_data_point_id"] for row in rows])
+        await original_raw(session, rows)
+
+    async def spy_normalized(session, model, rows):
+        seen_batches.append([row["google_data_point_id"] for row in rows])
+        await original_normalized(session, model, rows)
+
+    monkeypatch.setattr(storage, "_upsert_raw_many", spy_raw)
+    monkeypatch.setattr(storage, "_upsert_normalized_many", spy_normalized)
+    async with sessions.begin() as session:
+        stats = await store_records(
+            session, REGISTRY["heart-rate"], [heart_rate(60), heart_rate(70)]
+        )
+    async with sessions() as session:
+        raw_count = await session.scalar(select(func.count(RawHealthData.id)))
+        rate = await session.scalar(select(HeartRate))
+    assert seen_batches and all(len(batch) == len(set(batch)) == 1 for batch in seen_batches)
+    assert stats.inserted == 1 and stats.updated == 0
+    assert raw_count == 1
+    assert int(rate.bpm) == 70

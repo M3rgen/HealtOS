@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
@@ -15,8 +15,12 @@ from app.google_health.pagination import iter_pages
 from app.models.state import JobStatus, SyncState
 from app.services.storage import StoreStats, store_records
 from app.sync.checkpoints import incremental_start
+from app.sync.deletions import mark_source_deletions
+from app.sync.errors import error_code, error_summary
 
 logger = logging.getLogger(__name__)
+
+INTERRUPTED_ERROR = "process restarted"
 
 
 class IncrementalSync:
@@ -36,6 +40,23 @@ class IncrementalSync:
         self.sequence = 0
         self.last_runs: dict[str, dict] = {}
 
+    async def recover_interrupted(self) -> int:
+        """Fail sync states left `running` by a process that died mid-run.
+
+        Called once at startup, before any new run can start. The saved page token is
+        kept, so the next run resumes the interrupted window.
+        """
+        async with self.sessions.begin() as session:
+            result = await session.execute(
+                update(SyncState)
+                .where(SyncState.status == JobStatus.running)
+                .values(status=JobStatus.failed, last_error=INTERRUPTED_ERROR)
+            )
+        recovered = result.rowcount or 0
+        if recovered:
+            event(logger, "SYNC_STATE_RECOVERED", count=recovered)
+        return recovered
+
     def _finish(self, data_type: str, stats: StoreStats, failed: bool) -> None:
         self.sequence += 1
         self.last_runs[data_type] = {
@@ -51,6 +72,13 @@ class IncrementalSync:
         requested_start: datetime | None = None,
         requested_end: datetime | None = None,
     ) -> StoreStats:
+        """Fetch a window; an interrupted earlier window is finished first.
+
+        A saved page token belongs to the previously requested window. That window is
+        completed as a first round, and the window requested by this call always runs
+        afterwards as its own round, so a caller (e.g. a webhook element) only sees
+        success once its own range was fetched.
+        """
         if data_type not in self.specs:
             raise ValueError(f"Unsupported data type: {data_type}")
         async with self._locks.setdefault(data_type, asyncio.Lock()):
@@ -63,47 +91,40 @@ class IncrementalSync:
                 if state is None:
                     state = SyncState(data_type=data_type)
                     session.add(state)
-                resume = (
-                    state.last_page_token and state.last_requested_from and state.last_requested_to
-                )
-                request_start = (
-                    state.last_requested_from
-                    if resume
-                    else requested_start
-                    or incremental_start(
-                        state.last_successful_sync,
-                        self.settings.safety_window(data_type),
-                        request_end,
+                rounds: list[tuple[datetime, datetime, str | None]] = []
+                if state.last_page_token and state.last_requested_from and state.last_requested_to:
+                    rounds.append(
+                        (
+                            _utc(state.last_requested_from),
+                            _utc(state.last_requested_to),
+                            state.last_page_token,
+                        )
                     )
+                request_start = requested_start or incremental_start(
+                    state.last_successful_sync,
+                    self.settings.safety_window(data_type),
+                    request_end,
                 )
-                if resume:
-                    request_end = state.last_requested_to
-                page_token = state.last_page_token if resume else None
-                state.last_requested_from = request_start
-                state.last_requested_to = request_end
+                requested = (_utc(request_start), _utc(request_end))
+                if not rounds or rounds[0][:2] != requested:
+                    rounds.append((*requested, None))
                 state.status = JobStatus.running
                 state.last_error = None
-            event(logger, "SYNC_STARTED", data_type=data_type, requested_from=str(request_start))
+            event(
+                logger,
+                "SYNC_STARTED",
+                data_type=data_type,
+                requested_from=str(request_start),
+                resumed=rounds[0][2] is not None,
+            )
             total = StoreStats()
             try:
-                async for page in iter_pages(
-                    self.client, spec, request_start, request_end, page_token
-                ):
-                    async with self.sessions.begin() as session:
-                        stats = await store_records(session, spec, page.data_points)
-                        total.add(stats)
-                        state = await session.get(SyncState, data_type)
-                        state.last_page_token = page.next_page_token
-                        state.records_downloaded += len(page.data_points)
+                for round_start, round_end, page_token in rounds:
+                    await self._fetch_round(
+                        spec, round_start, round_end, page_token, total, data_type
+                    )
                 async with self.sessions.begin() as session:
                     state = await session.get(SyncState, data_type)
-                    previous_success = state.last_successful_sync
-                    if previous_success and previous_success.tzinfo is None:
-                        previous_success = previous_success.replace(tzinfo=UTC)
-                    state.last_successful_sync = (
-                        max(previous_success, request_end) if previous_success else request_end
-                    )
-                    state.last_page_token = None
                     state.status = JobStatus.completed
                     state.last_error = None
                 self._finish(data_type, total, failed=False)
@@ -118,15 +139,51 @@ class IncrementalSync:
                 async with self.sessions.begin() as session:
                     state = await session.get(SyncState, data_type)
                     state.status = JobStatus.failed
-                    state.last_error = str(exc)[:2000]
+                    state.last_error = error_summary(exc)
                 self._finish(data_type, total, failed=True)
                 event(
                     logger,
                     "SYNC_FAILED",
                     data_type=data_type,
                     error_type=type(exc).__name__,
+                    error_code=error_code(exc),
                 )
                 raise
+
+    async def _fetch_round(
+        self,
+        spec: DataTypeSpec,
+        start: datetime,
+        end: datetime,
+        page_token: str | None,
+        total: StoreStats,
+        data_type: str,
+    ) -> None:
+        async with self.sessions.begin() as session:
+            state = await session.get(SyncState, data_type)
+            state.last_requested_from = start
+            state.last_requested_to = end
+            state.last_page_token = page_token
+        # Only a fetch that starts at the first page sees the whole window, so only
+        # then can records that stopped appearing be marked as deleted at the source.
+        fetched_since = datetime.now(UTC) if page_token is None else None
+        async for page in iter_pages(self.client, spec, start, end, page_token):
+            async with self.sessions.begin() as session:
+                total.add(await store_records(session, spec, page.data_points))
+                state = await session.get(SyncState, data_type)
+                state.last_page_token = page.next_page_token
+                state.records_downloaded += len(page.data_points)
+        async with self.sessions.begin() as session:
+            state = await session.get(SyncState, data_type)
+            previous_success = state.last_successful_sync
+            state.last_successful_sync = (
+                max(_utc(previous_success), end) if previous_success else end
+            )
+            state.last_page_token = None
+            if fetched_since is not None:
+                total.source_deleted += await mark_source_deletions(
+                    session, spec, start, end, fetched_since
+                )
 
     async def run_all(self) -> dict[str, StoreStats | Exception]:
         semaphore = asyncio.Semaphore(self.settings.sync_concurrency)
@@ -140,3 +197,7 @@ class IncrementalSync:
 
         results = await asyncio.gather(*(guarded(name) for name in self.specs))
         return dict(zip(self.specs, results, strict=True))
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

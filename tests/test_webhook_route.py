@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -251,3 +251,41 @@ async def test_handshake_still_requires_exact_authorization(sessions):
     assert unauthorized.status_code == 401
     assert handshake.status_code == 201
     assert verifier.bodies == []
+
+
+async def test_redelivered_signed_body_older_than_a_day_cannot_restart_processing(sessions):
+    incremental = Incremental(fail_once={"steps"})
+    client, _, incremental, processor, tasks = await make_client(sessions, incremental)
+    payload = notification("steps")
+
+    async def age_batch(hours):
+        async with sessions.begin() as session:
+            batch = await session.scalar(select(WebhookEvent))
+            batch.signature_verified_at = datetime.now(UTC) - timedelta(hours=hours)
+
+    async def element_status():
+        async with sessions() as session:
+            return (await session.scalar(select(WebhookNotification))).status
+
+    async with client:
+        await post_signed(client, payload)
+        await finish(tasks)
+        assert (len(incremental.calls), await element_status()) == (1, "failed")
+
+        await age_batch(25)
+        stale, _ = await post_signed(client, payload)
+        await finish(tasks)
+        assert stale.status_code == 204
+        assert (len(incremental.calls), await element_status()) == (1, "failed")
+
+        await age_batch(1)
+        incremental.fail_once.add("steps")
+        fresh, _ = await post_signed(client, payload)
+        await finish(tasks)
+        assert fresh.status_code == 204
+        assert (len(incremental.calls), await element_status()) == (2, "failed")
+
+    # The operator replay path (process_pending) is not limited by the age cap.
+    await age_batch(48)
+    await processor.process_pending(recover_running=False)
+    assert (len(incremental.calls), await element_status()) == (3, "completed")

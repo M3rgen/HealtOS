@@ -26,6 +26,8 @@ class StoreStats:
     unchanged: int = 0
     normalized: int = 0
     normalization_skipped: int = 0
+    # Archived records a complete window re-fetch no longer returned (see app.sync.deletions).
+    source_deleted: int = 0
 
     def add(self, other: StoreStats) -> None:
         for field in self.__dataclass_fields__:
@@ -37,14 +39,22 @@ async def store_records(
 ) -> StoreStats:
     stats = StoreStats()
     now = datetime.now(UTC)
-    prepared = []
+    # One INSERT ... ON CONFLICT statement may not touch the same row twice on
+    # PostgreSQL, and synthetic rollup IDs can repeat within a page: last one wins.
+    by_id: dict[str, tuple] = {}
+    duplicates = 0
     for record in records:
         google_id = source_id(spec, record)
         digest = payload_hash(record)
         start = end = timezone = None
         if isinstance(record, dict):
             start, end, timezone = temporal(spec, record)
-        prepared.append((record, google_id, digest, start, end, timezone))
+        if (previous := by_id.pop(google_id, None)) is not None:
+            duplicates += 1
+            if previous[2] != digest:
+                event(logger, "RECORD_BATCH_DUPLICATE_CONFLICT", data_type=spec.name)
+        by_id[google_id] = (record, google_id, digest, start, end, timezone)
+    prepared = list(by_id.values())
 
     existing_hashes: dict[str, str] = {}
     google_ids = [item[1] for item in prepared]
@@ -101,6 +111,7 @@ async def store_records(
             inserted=stats.inserted,
             updated=stats.updated,
             unchanged=stats.unchanged,
+            duplicates=duplicates,
         )
     return stats
 

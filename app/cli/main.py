@@ -63,7 +63,9 @@ def backfill(data_type: str | None = typer.Option(None, "--data-type")) -> None:
         try:
             completed = await runtime.backfill.run([data_type] if data_type else None)
             async with SessionLocal() as session:
-                query = select(BackfillJob).where(BackfillJob.status == JobStatus.failed)
+                query = select(BackfillJob).where(
+                    BackfillJob.status.in_([JobStatus.failed, JobStatus.abandoned])
+                )
                 if data_type:
                     query = query.where(BackfillJob.data_type == data_type)
                 failed = (await session.scalars(query)).all()
@@ -75,7 +77,8 @@ def backfill(data_type: str | None = typer.Option(None, "--data-type")) -> None:
     typer.echo(f"Completed {completed} backfill windows")
     for job in failed:
         typer.echo(
-            f"backfill error: {job.data_type} {job.window_start}: {job.last_error}", err=True
+            f"backfill {job.status.value}: {job.data_type} {job.window_start}: {job.last_error}",
+            err=True,
         )
     if failed:
         raise typer.Exit(1)
