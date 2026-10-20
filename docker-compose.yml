@@ -67,19 +67,26 @@ services:
       start_period: 20s
 
   backup:
+    # Streams a custom-format dump to stdout; scripts/backup.sh encrypts it on the
+    # host (age or gpg) and applies retention. Scheduled by deploy/systemd/.
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     profiles: ["backup"]
     environment:
-      DATABASE_URL_PG: postgresql://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
-      BACKUP_DIR: /backups
-      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
-    volumes:
-      - ${BACKUP_HOST_DIR:-./backups}:/backups
-      - ./scripts:/scripts:ro
+      PGHOST: postgres
+      PGUSER: health
+      PGDATABASE: health
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ -t 1 ]; then
+        echo 'Refusing to write an unencrypted dump to a terminal; run scripts/backup.sh.' >&2;
+        exit 2; fi;
+        exec pg_dump --format=custom --compress=9
     restart: "no"
     networks:
       - database

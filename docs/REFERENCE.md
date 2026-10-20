@@ -254,10 +254,13 @@ python scripts/verify_compose.py
 # or: make compose-smoke
 ```
 
-The script uses a uniquely named Compose project prefixed `health-mirror-smoke-`, `.env.example`, a
-temporary password, backup directory, and host port `18080`. It builds the production image, waits
-for PostgreSQL and FastAPI, exercises `/health` and the installed CLI, runs the shipped compressed
-backup and restores it into a second database, verifies the PostgreSQL Alembic downgrade/upgrade
+The script uses a uniquely named Compose project prefixed `health-mirror-smoke-`, a temporary env
+file derived from `.env.example` with synthetic non-placeholder values (the app runs with
+`APP_ENV=production`), a temporary password, backup directory and throwaway backup key, and host
+port `18080`. It builds the production image, waits for PostgreSQL and FastAPI, exercises `/health`
+and the installed CLI, takes an encrypted backup with `scripts/backup.sh` (age if installed,
+otherwise gpg), restores it with `scripts/restore.sh` into a second database and checks the row
+counts, verifies the PostgreSQL Alembic downgrade/upgrade
 lifecycle, checks the hardened container and private bindings, then removes only those isolated
 resources. It does not read or modify `.env`, the normal `postgres_data` volume, or Google
 credentials. Keep live-account verification evidence private; it can contain personal health data.
@@ -286,7 +289,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 | `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` | Exact secret header value configured for the subscriber, e.g. `Bearer …` |
 | `GOOGLE_HEALTH_WEBHOOK_PUBLIC_KEY_URL` | Google's permanent public signing keyset URL |
 | `WEBHOOK_HOST` | Public DNS hostname used by the optional self-hosted Caddy TLS profile |
-| `BACKUP_HOST_DIR`, `BACKUP_RETENTION_DAYS` | Local/NAS dump directory and local retention period |
+| `BACKUP_HOST_DIR`, `BACKUP_RETENTION_DAYS` | Host directory for encrypted dumps and retention in days (default 14); read by `scripts/backup.sh` |
 | `BACKFILL_START_DATE`, `BACKFILL_WINDOW_DAYS` | Earliest attempted history and checkpoint window size |
 | `GOOGLE_API_PAGE_SIZE`, `GOOGLE_API_MAX_RETRIES` | Page and exponential retry policy |
 | `EXTRA_DATA_TYPES` | Comma-separated evolving v4 data types; defaults to interval filtering |
@@ -568,39 +571,55 @@ Interactive OpenAPI documentation is available locally at `/docs`.
 
 ## Database backup and restore
 
-Create the host backup directory first. A compressed custom-format dump:
+Daily backups are automated by [`deploy/systemd/healthos-backup.timer`](../deploy/systemd/healthos-backup.timer)
+(03:30 local time, `Persistent=true` so a missed run happens after boot), which starts
+[`deploy/systemd/healthos-backup.service`](../deploy/systemd/healthos-backup.service). The service
+runs [`scripts/backup.sh`](../scripts/backup.sh) on the Docker host:
 
-**Cross-platform command — non-destructive backup:**
+1. `docker compose --profile backup run --rm -T backup` streams a compressed custom-format
+   `pg_dump` to stdout (the container refuses to write a dump to a terminal);
+2. the stream is encrypted before it reaches the disk and written atomically as
+   `BACKUP_HOST_DIR/health-<UTC stamp>.dump.age` (or `.dump.gpg`);
+3. after a successful backup, dumps older than `BACKUP_RETENTION_DAYS` (default 14) are deleted.
+
+The encryption key never lives in `.env` or next to the backups:
+
+| Key source | Tool | Notes |
+|---|---|---|
+| `BACKUP_AGE_RECIPIENT=age1…` (in `/etc/healthos/backup.env`) | `age` | Preferred: the host holds only the public key; keep the identity offline. |
+| `/etc/healthos/backup.key` containing `AGE-SECRET-KEY-…` | `age` | Identity on the host; mode `600`. |
+| `/etc/healthos/backup.key` containing a passphrase | `gpg --symmetric` (AES256) | Fallback when `age` is not installed; mode `600`. |
+
+`BACKUP_KEY_FILE` overrides the key path. The script refuses to run if the key file is readable by
+group or others. Installation steps are at the top of the service file. Run a backup now with
+`make backup` (or `bash scripts/backup.sh`); the path of the new file is printed.
+
+**Restore drill (non-destructive to the live database):**
 
 ```sh
-mkdir -p backups
-docker compose exec -T postgres pg_dump -U health -d health -Fc > backups/health.dump
+make restore FILE=backups/health-20261020T033000Z.dump.age   # or: bash scripts/restore.sh FILE [db]
 ```
 
-Restore into an empty/replacement database after stopping the app.
+[`scripts/restore.sh`](../scripts/restore.sh) decrypts the file (age: `BACKUP_AGE_IDENTITY` or the
+key file; gpg: the key file), drops and recreates a scratch database (default `health_restore`,
+never `health`), restores into it with `pg_restore --exit-on-error`, and prints per-table row
+counts next to the live database's counts plus the restored Alembic revision. Drop the scratch
+database afterwards.
 
-**Destructive command requiring explicit confirmation:** the following deletes objects in the
-selected target database. Prove a current backup and confirm the exact target before use.
+A dump contains private health data and Fernet-encrypted OAuth refresh tokens. **A restore is only
+usable with the same `GOOGLE_TOKEN_ENCRYPTION_KEY`**; without it you must re-link Google. Store that
+key and the backup key together in a safe place that is not the backup directory.
+
+**Destructive command requiring explicit confirmation:** replacing the live database deletes its
+current objects. Prove a current backup with the drill above and confirm the target before use.
 
 ```sh
 docker compose stop app
-docker compose exec -T postgres pg_restore -U health -d health --clean --if-exists < backups/health.dump
+age --decrypt --identity /path/to/identity backups/health-<stamp>.dump.age \
+  | docker compose exec -T postgres pg_restore -U health -d health --clean --if-exists --no-owner
 docker compose start app
-health-mirror verify
+docker compose exec app health-mirror verify
 ```
-
-`scripts/backup.sh` creates timestamped compressed dumps and deletes dumps older than `BACKUP_RETENTION_DAYS` (30 by default). Set `BACKUP_HOST_DIR` to a local or NAS directory and schedule it with system cron; cloud storage is optional and not required. Test restores regularly. A database dump contains private health data and encrypted OAuth material, so protect it like the live database and separately safeguard the encryption key.
-
-The optional Compose profile includes `pg_dump` and writes to `BACKUP_HOST_DIR` (`./backups` by default), so the host does not need PostgreSQL client tools:
-
-**Cross-platform command — non-destructive backup:**
-
-```sh
-mkdir -p backups
-docker compose --profile backup run --rm backup
-```
-
-Schedule that command with cron or your NAS scheduler for automated local retention. The backup container runs only on demand and is not required by the API or synchronization services.
 
 ## Integrity verification
 

@@ -18,6 +18,21 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKUP_DIR = ROOT / f".compose-smoke-backups-{os.getpid()}"
 # Matches the `.env*` ignore rules, so it never enters Git or the image build context.
 SMOKE_ENV_FILE = ROOT / f".env.compose-smoke-{os.getpid()}"
+SMOKE_KEY_FILE = ROOT / f".env.compose-smoke-backup-key-{os.getpid()}"
+BASH = shutil.which("bash")
+
+
+def backup_key_env() -> dict[str, str]:
+    """A throwaway key for the encrypted backup/restore round trip (age, else gpg)."""
+    SMOKE_KEY_FILE.unlink(missing_ok=True)
+    if shutil.which("age") and shutil.which("age-keygen"):
+        subprocess.run(["age-keygen", "-o", str(SMOKE_KEY_FILE)], check=True, capture_output=True)
+    elif shutil.which("gpg"):
+        SMOKE_KEY_FILE.write_text(secrets.token_urlsafe(48) + "\n", encoding="utf-8")
+    else:
+        raise RuntimeError("Encrypted backup verification needs age or gpg on the host")
+    SMOKE_KEY_FILE.chmod(0o600)
+    return {"BACKUP_KEY_FILE": str(SMOKE_KEY_FILE), "COMPOSE_PROJECT_NAME": PROJECT_NAME}
 
 
 def write_smoke_env_file() -> None:
@@ -111,6 +126,9 @@ def main() -> int:
         print(
             "Docker is unavailable; install/start Docker Engine or Docker Desktop.", file=sys.stderr
         )
+        return 2
+    if BASH is None:
+        print("bash is required for scripts/backup.sh and scripts/restore.sh.", file=sys.stderr)
         return 2
 
     env = os.environ.copy()
@@ -211,33 +229,37 @@ def main() -> int:
         if not any(option.split(":", 1)[0] == "no-new-privileges" for option in security_options):
             raise RuntimeError("Application container lacks no-new-privileges")
 
-        compose("--profile", "backup", "run", "--rm", "backup", env=env)
-        backup_files = list(BACKUP_DIR.glob("health-*.dump"))
-        if len(backup_files) != 1:
-            raise RuntimeError(f"Expected one backup artifact; found {len(backup_files)}")
-        compose(
-            "exec",
-            "-T",
-            "postgres",
-            "createdb",
-            "-U",
-            "health",
-            "health_restore",
-            env=env,
+        backup_env = {**env, **backup_key_env()}
+        backup_path = Path(
+            subprocess.run(
+                [BASH, str(ROOT / "scripts" / "backup.sh")],
+                cwd=ROOT,
+                env=backup_env,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
         )
-        compose(
-            "--profile",
-            "backup",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "pg_restore",
-            "backup",
-            "--no-owner",
-            "--dbname=postgresql://health:local-smoke-test-only@postgres:5432/health_restore",
-            f"/backups/{backup_files[0].name}",
-            env=env,
-        )
+        backup_files = sorted(BACKUP_DIR.glob("health-*.dump*"))
+        if backup_files != [ROOT / backup_path] or backup_path.suffix not in {".age", ".gpg"}:
+            raise RuntimeError(f"Expected one encrypted backup artifact; found {backup_files}")
+        if (ROOT / backup_path).read_bytes()[:5] == b"PGDMP":
+            raise RuntimeError("Backup artifact is an unencrypted pg_dump archive")
+        restore_report = subprocess.run(
+            [BASH, str(ROOT / "scripts" / "restore.sh"), str(backup_path), "health_restore"],
+            cwd=ROOT,
+            env=backup_env,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout
+        counts = {
+            fields[0]: fields[1]
+            for fields in (line.split() for line in restore_report.splitlines())
+            if len(fields) == 3
+        }
+        if counts.get("manual_measurements") != "1" or counts.get("raw_health_data") != "0":
+            raise RuntimeError(f"Unexpected restored row counts: {restore_report!r}")
         restored = compose(
             "exec",
             "-T",
@@ -281,6 +303,8 @@ def main() -> int:
         return 0
     except (subprocess.CalledProcessError, RuntimeError) as exc:
         print(f"Compose smoke test failed: {exc}", file=sys.stderr)
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            print(exc.stderr, file=sys.stderr)
         return 1
     finally:
         if cleanup_needed:
@@ -292,12 +316,13 @@ def main() -> int:
                 check=False,
             )
         SMOKE_ENV_FILE.unlink(missing_ok=True)
+        SMOKE_KEY_FILE.unlink(missing_ok=True)
         if BACKUP_DIR.is_dir():
             resolved_root = ROOT.resolve()
             resolved_backup = BACKUP_DIR.resolve()
             if resolved_backup.parent != resolved_root:
                 raise RuntimeError("Refusing to remove a backup directory outside the workspace")
-            for backup_file in resolved_backup.glob("health-*.dump"):
+            for backup_file in resolved_backup.glob("health-*.dump*"):
                 backup_file.unlink()
             resolved_backup.rmdir()
 

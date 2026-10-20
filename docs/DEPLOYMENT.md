@@ -75,15 +75,16 @@ Cloudflare deployment, Windows path, and future Linux path. No current variable 
 
 ## Backup and restore safety
 
-**Current Windows or cross-platform command — non-destructive backup:**
+**Cross-platform command (needs bash and age or gpg on the host) — non-destructive backup:**
 
-```powershell
-docker compose --profile backup run --rm backup
+```sh
+bash scripts/backup.sh        # or: make backup; scheduled daily by deploy/systemd/healthos-backup.timer
 ```
 
-The backup service writes a custom-format dump to the configured host directory. Never inspect dump
-contents. Verify integrity by checking file size/hash and restoring into an isolated temporary
-database/project, as `scripts/verify_compose.py` does.
+The backup profile streams a custom-format dump that `scripts/backup.sh` encrypts before writing it
+to the configured host directory. Never inspect dump contents. Verify integrity by restoring into an
+isolated database with `scripts/restore.sh`, as `scripts/verify_compose.py` does. See the
+[backup and restore reference](REFERENCE.md#database-backup-and-restore).
 
 **Destructive command requiring explicit confirmation:** `pg_restore --clean --if-exists` deletes
 objects in its target database. Stop the app/scheduler, prove a current backup, confirm the exact

@@ -98,6 +98,28 @@ def check_compose_runtime(compose_doc: object, dev_doc: object) -> list[str]:
     return errors
 
 
+def check_backup_automation(compose_doc: object, verifier: str) -> list[str]:
+    errors: list[str] = []
+    systemd = ROOT / "deploy" / "systemd"
+    timer = systemd / "healthos-backup.timer"
+    service = systemd / "healthos-backup.service"
+    if not timer.is_file() or "Persistent=true" not in timer.read_text(encoding="utf-8"):
+        errors.append("deploy/systemd/healthos-backup.timer is missing or not Persistent=true")
+    if not service.is_file() or "scripts/backup.sh" not in service.read_text(encoding="utf-8"):
+        errors.append("deploy/systemd/healthos-backup.service must run scripts/backup.sh")
+    for script in ("backup.sh", "restore.sh"):
+        if not (ROOT / "scripts" / script).is_file():
+            errors.append(f"scripts/{script} is missing")
+    backup_script = (ROOT / "scripts" / "backup.sh").read_text(encoding="utf-8")
+    if "age --encrypt" not in backup_script or "gpg " not in backup_script:
+        errors.append("scripts/backup.sh must encrypt dumps with age or gpg")
+    if compose_service(compose_doc, "backup").get("volumes"):
+        errors.append("the backup service must stream to scripts/backup.sh, not write to a volume")
+    if "restore.sh" not in verifier or "backup.sh" not in verifier:
+        errors.append("scripts/verify_compose.py must exercise backup.sh and restore.sh")
+    return errors
+
+
 def check_repository() -> list[str]:
     errors: list[str] = []
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -132,6 +154,7 @@ def check_repository() -> list[str]:
         errors.append("Compose verifier Alembic head is stale")
     if '"WATCHDOG_ENABLED": "false"' not in verifier:
         errors.append("Compose verifier must explicitly disable all schedulers")
+    errors.extend(check_backup_automation(compose_doc, verifier))
     cloudflare = (ROOT / "deploy" / "cloudflare" / "config.example.yml").read_text(encoding="utf-8")
     if "http_status:404" not in cloudflare:
         errors.append("Cloudflare example lacks a deny-by-default final rule")

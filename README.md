@@ -179,14 +179,15 @@ The supplied Windows launcher creates an isolated, authenticated local Codex bri
 - Real health records, secrets, logs, backups, and local verification outputs are excluded from this repository.
 - A public webhook deployment should expose only the webhook route. The dashboard and administrative API should stay private.
 
-Create a backup with the optional Compose profile:
+Backups are encrypted and automated: a systemd timer ([`deploy/systemd/`](deploy/systemd/healthos-backup.timer)) runs [`scripts/backup.sh`](scripts/backup.sh) daily at 03:30. It streams `pg_dump` from the Compose `backup` profile through `age` (preferred) or `gpg --symmetric`, writes `BACKUP_HOST_DIR/health-<stamp>.dump.age`, and keeps 14 days. The key lives outside `.env` (`BACKUP_AGE_RECIPIENT` or a mode-600 `/etc/healthos/backup.key`).
 
 ```sh
-docker compose --profile backup run --rm backup
+make backup                                   # one encrypted backup now
+make restore FILE=backups/health-<stamp>.dump.age   # restore drill into a scratch database
 docker compose exec app health-mirror verify
 ```
 
-Backups are written to `BACKUP_HOST_DIR` (`./backups` by default). They contain sensitive data; protect them and test restoration to a separate database. The backup command also applies the configured retention policy. See the [backup and restore reference](docs/REFERENCE.md#database-backup-and-restore).
+`scripts/restore.sh` never touches the live database: it restores into `health_restore` and prints row counts. Keep `GOOGLE_TOKEN_ENCRYPTION_KEY` with the backup key, away from the backups — a restored archive needs it to decrypt the stored Google tokens. See the [backup and restore reference](docs/REFERENCE.md#database-backup-and-restore).
 
 ## Documentation
 

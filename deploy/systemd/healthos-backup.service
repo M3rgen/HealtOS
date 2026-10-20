@@ -1,0 +1,35 @@
+# Encrypted daily PostgreSQL backup for the HealthOS Compose deployment.
+#
+# Install (adjust /opt/healthos to the directory holding docker-compose.yml):
+#   sudo install -m 644 deploy/systemd/healthos-backup.service deploy/systemd/healthos-backup.timer /etc/systemd/system/
+#   sudo install -d -m 700 /etc/healthos
+#   # Preferred: age public key only; keep the private identity off this host.
+#   echo 'BACKUP_AGE_RECIPIENT=age1...' | sudo tee /etc/healthos/backup.env >/dev/null
+#   # Fallback: gpg passphrase file (or an age identity) readable only by root.
+#   #   sudo sh -c 'umask 077; openssl rand -base64 48 > /etc/healthos/backup.key'
+#   sudo chmod 600 /etc/healthos/backup.env
+#   sudo systemctl daemon-reload && sudo systemctl enable --now healthos-backup.timer
+#   sudo systemctl start healthos-backup.service && journalctl -u healthos-backup.service -n 20
+#
+# Store the backup key and GOOGLE_TOKEN_ENCRYPTION_KEY somewhere other than the
+# backups themselves: a restore needs both.
+[Unit]
+Description=HealthOS encrypted PostgreSQL backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# Explicit so systemd sets HOME (docker and gpg read it). Any account in the
+# docker group that can read the key file works too.
+User=root
+WorkingDirectory=/opt/healthos
+# Optional: BACKUP_AGE_RECIPIENT, BACKUP_KEY_FILE, BACKUP_HOST_DIR,
+# BACKUP_RETENTION_DAYS (default 14), COMPOSE_FILE for override files.
+EnvironmentFile=-/etc/healthos/backup.env
+ExecStart=/bin/bash /opt/healthos/scripts/backup.sh
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+Nice=10
+IOSchedulingClass=idle
