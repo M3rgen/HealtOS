@@ -1,6 +1,6 @@
-# Anatomical figure model (`body.glb`)
+# Anatomical figure model (`body.<hash>.glb`)
 
-`body.glb` is a morphable male figure with realistic but non-photographic skin, bundled locally. No remote runtime request is made. It derives from the official MakeHuman data assets, licensed **CC0 1.0 Universal**, plus original procedural work made for HealthOS. Nothing comes from a scan, an AI generator, a photo texture or any non-CC0 source. It is a generic figure, not a reconstruction of any person.
+`body.d736859b.glb` (called `body.glb` below) is a morphable male figure with realistic but non-photographic skin, bundled locally. No remote runtime request is made. It derives from the official MakeHuman data assets, licensed **CC0 1.0 Universal**, plus original procedural work made for HealthOS. Nothing comes from a scan, an AI generator, a photo texture or any non-CC0 source. It is a generic figure, not a reconstruction of any person.
 
 ## Sources (all CC0 1.0)
 
@@ -19,7 +19,7 @@ Files used from `makehuman/data/` at that revision:
 
 ## Contents of `body.glb`
 
-- **Mesh:** one mesh `Body` with a single material. glTF Y-up, feet at y = 0, basis exactly 1.75 m tall, facing +Z, horizontal centre of mass over the origin. 23,271 vertices and 43,970 triangles, with POSITION, NORMAL, TANGENT (MikkTSpace, matching the bake) and TEXCOORD_0. No Draco or meshopt compression; 4.8 MiB.
+- **Mesh:** one mesh `Body` with a single material. glTF Y-up, feet at y = 0, basis exactly 1.75 m tall, facing +Z, horizontal centre of mass over the origin. 23,271 vertices and 43,970 triangles, with POSITION, NORMAL, TANGENT (MikkTSpace, matching the bake) and TEXCOORD_0. Meshopt-compressed, 1.43 MB (see *Compression* below).
 - **Pose:** natural contrapposto, readable from the front, made with linear-blend skinning on the MakeHuman weights:
   - weight on the right leg, which stands straight under the body; the ribcage is shifted over it;
   - left knee clearly bent (about 36°) and turned slightly out, heel lifted;
@@ -35,7 +35,7 @@ Files used from `makehuman/data/` at that revision:
   - Each target also scales the sculpted muscle masses: `fat_high` keeps 25 % of them, `fat_low` 135 %, `muscle_high` 145 %, `muscle_low` 60 %.
   - `fat_high` and `muscle_high` open the arms (and stance) only as far as their volume needs.
   - Every single target and every pair at weight 1 was checked: there is no interpenetration. Upper arm to torso is at least 8.2 mm, forearms and hands to the body at least 45 mm, thigh to thigh at least 6.5 mm.
-- **Normal map (PNG 2048):** procedural relief at muscle, vein and wrinkle scale. Rounded muscle bellies with soft, wide transitions: shallow wide abdominal intersections, a soft lower-pectoral fold, serratus bellies. Also superficial veins on the forearms, biceps and lower abdomen, hand and foot tendons and knuckles, fabric thickness at the hem, the hem stitch and waistband ribbing. There is no pore detail; a tiling micro-detail layer is applied separately.
+- **Normal map (2048², lossless WebP since 2026-10-20, 7 bits per channel):** procedural relief at muscle, vein and wrinkle scale. Rounded muscle bellies with soft, wide transitions: shallow wide abdominal intersections, a soft lower-pectoral fold, serratus bellies. Also superficial veins on the forearms, biceps and lower abdomen, hand and foot tendons and knuckles, fabric thickness at the hem, the hem stitch and waistband ribbing. There is no pore detail; a tiling micro-detail layer is applied separately.
 - **Base colour (sRGB JPEG 2048), procedurally painted:**
   - skin on a single tunable base tone, `skinToneHex` **#ad8f7e** (medium, warm, mildly desaturated), with subtle low-frequency mottling;
   - cooler tones under the jaw and on the inner arms; warmer knees, elbows, knuckles, cheeks, ears and nose tip; lighter palms and soles; nails;
@@ -51,6 +51,15 @@ Files used from `makehuman/data/` at that revision:
 - **Extras:** `extras.healthos` carries `skinToneHex` and `suggestedNormalScale`, the formula `normalScale = min(1.25, max(0.05, pow(1 - fat_high, 1.8)) * (1 + 0.25 * fat_low))` with the numeric fields `max` 1.25, `min` 0.05, `exponent` 1.8 and `fatLowGain` 0.25.
 
 The build scripts and editable `.blend` are kept outside the repository; they are not needed at runtime.
+
+## Compression (2026-10-20, plan item 4.3)
+
+The Blender export (5.07 MB, all float attributes, PNG normal map) was compressed to 1.43 MB. The file name carries the first 8 hex digits of the file's SHA-256, so `/models` can be served with an immutable cache header; a changed model needs a new name and an update of `MODEL_URL` in `src/body.js`.
+
+1. **Normal map:** the 2048² PNG (1.23 MB) was rounded to 7 bits per channel and stored as lossless WebP (625 KB, `EXT_texture_webp`) by a small Node script on `@gltf-transform/core` 4.5.1 and sharp 0.35.5 (`webp({ lossless: true, effort: 6 })`). Angular error is at most 0.9° (mean 0.27°). Lossy WebP was rejected: its 4:2:0 chroma subsampling bends normals by up to 60° at block edges. The base colour and ORM JPEGs are kept byte for byte.
+2. **Geometry:** `npx @gltf-transform/cli@4.5.1 meshopt in.glb out.glb --quantize-texcoord 14` (meshoptimizer 1.2.0; level `high`: vertex reorder, `KHR_mesh_quantization` with 14-bit positions and morph deltas, 14-bit UVs, 8-bit octahedral normals and tangents, 8-bit morph normal deltas, `EXT_meshopt_compression` with filters). The quantisation scale/offset is a node transform on `Body`; `src/body.js` measures in world space, so it is unaffected. The browser decodes with three's bundled `three/addons/libs/meshopt_decoder.module.js` (WebAssembly, needs `'wasm-unsafe-eval'` in the CSP).
+
+Checked against the export with a vertex-matching diff: names, `extras.healthos` (byte-identical string), `targetNames`, material and sampler settings unchanged; same 23,271 vertices and 43,970 triangles (identical topology after the reorder remap). Maximum errors: position 0.11 mm, morph position delta 0.10 mm, UV 0.11 texel at 2048², normal 1.1°, tangent 1.1° with no handedness flips. Morph normal deltas have a mean error of 0.002; seven deltas on four crease vertices (armpits and crotch) exceed the ±1 range that quantised morph normals can store and are clamped (six by more than 0.05). The high-fat and lean renders show no visible difference there; keeping morph normals as floats would have cost 0.78 MB. Before/after dashboard renders (basis, high fat, lean/muscular) differ by a mean of 0.11–0.12 of 255 per pixel. The `extras.healthos.textures` text still says "PNG 2048" for the normal map; it is descriptive only and was left unchanged on purpose so that the extras stay byte-identical.
 
 ## Historical note
 
