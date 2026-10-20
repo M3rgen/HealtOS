@@ -3,6 +3,7 @@
 import json
 import random
 from pathlib import Path
+from typing import Any, Protocol
 
 from app.services.codex_health import HEALTH_TOOL
 
@@ -41,7 +42,7 @@ sorgu aracıyla çalış. Yanıtlarında özel anahtar, oturum bilgisi veya bağ
 """
 
 
-def load_umay_persona():
+def load_umay_persona() -> str:
     """Snapshot the site's persona for a new conversation, never global Codex config."""
     soul = SOUL_PATH.read_text(encoding="utf-8").strip()
     if not soul:
@@ -60,23 +61,34 @@ def load_umay_persona():
     )
 
 
+JsonObject = dict[str, Any]
+
+
+class Connection(Protocol):
+    """The part of a websockets client connection the RPC needs."""
+
+    async def send(self, message: str) -> None: ...
+
+    async def recv(self) -> str | bytes: ...
+
+
 class CodexRPC:
-    def __init__(self, connection):
+    def __init__(self, connection: Connection) -> None:
         self.connection = connection
         self.sequence = 0
 
-    async def send(self, payload):
+    async def send(self, payload: JsonObject) -> None:
         await self.connection.send(json.dumps(payload, ensure_ascii=False))
 
-    async def receive(self):
+    async def receive(self) -> Any:
         return json.loads(await self.connection.recv())
 
-    async def request(self, method, params):
+    async def request(self, method: str, params: JsonObject) -> int:
         self.sequence += 1
         await self.send({"id": self.sequence, "method": method, "params": params})
         return self.sequence
 
-    async def call(self, method, params):
+    async def call(self, method: str, params: JsonObject) -> Any:
         request_id = await self.request(method, params)
         while True:
             message = await self.receive()
@@ -87,7 +99,7 @@ class CodexRPC:
             if "id" in message and "method" in message:
                 await self.reject(message)
 
-    async def reject(self, message):
+    async def reject(self, message: JsonObject) -> None:
         await self.send(
             {
                 "id": message["id"],
@@ -98,7 +110,7 @@ class CodexRPC:
             }
         )
 
-    async def start(self):
+    async def start(self) -> tuple[str, str]:
         persona = load_umay_persona()
         await self.call(
             "initialize",
