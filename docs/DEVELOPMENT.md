@@ -36,6 +36,9 @@ For frontend hot reload, run `npm run dev` from `frontend` while the backend is 
 
 ## Validation
 
+`make verify` runs the static gates below (plus `pyright app`) in order, and `make test-browser`
+runs the browser checks (`cd frontend && npm run test:browser`). The individual commands:
+
 ```sh
 uv lock --check
 uv run --frozen --extra dev ruff check .
