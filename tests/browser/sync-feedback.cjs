@@ -1,6 +1,6 @@
 // Synthetic fixtures; no live account records.
 const assert = require('node:assert/strict');
-const { BASE, launch, run } = require('./lib.cjs');
+const { BASE, STEP_TIMEOUT, launch, run, until } = require('./lib.cjs');
 const TYPES = ['heart-rate', 'sleep', 'steps'];
 const SIZES = [{width:1280,height:800},{width:1440,height:900},{width:390,height:844},{width:320,height:700}];
 
@@ -46,7 +46,7 @@ async function openPage(browser, viewport, scenario) {
 
 const overflow = page => page.evaluate(()=>({x:document.documentElement.scrollWidth>innerWidth,
   y:document.documentElement.scrollHeight>innerHeight}));
-const done = page => page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:20000});
+const done = page => page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:STEP_TIMEOUT});
 
 run(async () => {
   const browser = await launch();
@@ -55,9 +55,9 @@ run(async () => {
     {
       const {page, state, context} = await openPage(browser, {width:1280,height:800}, {inserted:[10,0,2]});
       const button = page.locator('#sync-button');
+      // The mocked run stays "running" until the test sets state.finished, however slow the page is.
       await button.click();
-      await page.waitForTimeout(4500);
-      assert.ok(state.statusCalls >= 2, 'status must be polled while the run is in progress');
+      await until(() => state.statusCalls >= 2, 'status must be polled while the run is in progress');
       assert.equal(await button.isDisabled(), true);
       assert.equal(await button.getAttribute('aria-busy'), 'true');
       assert.match(await button.textContent(), /Eşitleniyor…/);
@@ -93,7 +93,9 @@ run(async () => {
     for (const viewport of SIZES) {
       const {page, state, context} = await openPage(browser, viewport, {inserted:[3,0,0]});
       await page.locator('#sync-button').click();
-      await page.waitForTimeout(2600);
+      // Measure once the page has polled a still-running status, so the busy state is fully shown.
+      await until(() => state.statusCalls >= 1, `status must be polled at ${viewport.width}x${viewport.height}`);
+      assert.equal(await page.locator('#sync-button').getAttribute('aria-busy'), 'true');
       assert.deepEqual(await overflow(page), {x:false,y:false}, `busy state overflows at ${viewport.width}x${viewport.height}`);
       state.failures = ['sleep','steps']; state.finished = true;
       await done(page);

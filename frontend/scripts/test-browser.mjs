@@ -9,6 +9,8 @@
 //   HEALTHOS_TEST_URL=http://127.0.0.1:5174 npm run test:browser   # use a server you started
 //
 // Each check prints PASS/INFO lines; exit code 0 = pass, 77 = skip, anything else = fail.
+// A check is killed after HEALTHOS_TEST_TIMEOUT_MS (default 300000; CI sets more for its slower
+// runners). tests/browser/lib.cjs documents the other HEALTHOS_TEST_* knobs (slow-machine emulation).
 // Screenshots land in frontend/.test-output/ (gitignored). Exits non-zero if any check fails.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -21,7 +23,7 @@ const FRONTEND = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const TESTS = path.resolve(FRONTEND, '../tests/browser');
 const OUTPUT = process.env.HEALTHOS_TEST_OUTPUT || path.join(FRONTEND, '.test-output');
 const SKIP_CODE = 77;
-const TIMEOUT_MS = 240_000;
+const TIMEOUT_MS = Number(process.env.HEALTHOS_TEST_TIMEOUT_MS || 300_000);
 
 function options() {
   const out = { dev: false, only: null };
@@ -32,7 +34,7 @@ function options() {
     else if (key === '--preview') out.dev = false;
     else if (key === '--only') out.only = (inline ?? argv[++i]).split(',').map((name) => name.replace(/\.cjs$/, ''));
     else if (key === '--help' || key === '-h') {
-      console.log(fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1, 12).join('\n'));
+      console.log(fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1, 14).join('\n'));
       process.exit(0);
     } else throw new Error(`Unknown argument ${argv[i]}`);
   }

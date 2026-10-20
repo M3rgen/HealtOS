@@ -10,6 +10,8 @@ run(async () => {
    const page=await browser.newPage({viewport:{width,height:900},hasTouch:width===390});
    const errors=[];page.on('pageerror',e=>errors.push(e.message));
    let saved;
+   // Collapsing animates the panel (380 ms); measure the handle only once it has settled.
+   const settled=()=>page.waitForFunction(()=>!document.querySelector('#history-panel').getAnimations().length);
    await page.route('**/health',route=>route.fulfill({json:fx.health}));
    await page.route('**/api/dashboard?**',route=>route.fulfill({json:fx.dashboard(new URL(route.request().url()).searchParams)}));
    await page.route('**/sync/status',route=>route.fulfill({json:fx.syncStatus}));
@@ -30,12 +32,14 @@ run(async () => {
    assert.match(await page.locator('#export-button').getAttribute('href'),/days=30/);
    await page.screenshot({path:shot(`history-${width}.png`),fullPage:false});
    await page.keyboard.press('Escape');await page.waitForFunction(()=>document.querySelectorAll('#history-rows tr').length===7);
+   await settled();
    await page.locator('#history-toggle').scrollIntoViewIfNeeded();
    const box=await page.locator('#history-toggle').boundingBox();
    await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width/2,box.y+box.height/2-70,{steps:8});await page.mouse.up();
    await page.waitForFunction(()=>document.querySelector('#history-panel').classList.contains('expanded'));
    await page.keyboard.press('Escape');
    if(width===390){
+    await settled();
     await page.locator('#history-toggle').scrollIntoViewIfNeeded();
     const touchBox=await page.locator('#history-toggle').boundingBox();const x=touchBox.x+touchBox.width/2,y=touchBox.y+touchBox.height/2;
     const cdp=await page.context().newCDPSession(page);

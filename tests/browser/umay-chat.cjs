@@ -64,12 +64,16 @@ run(async () => {
               '<img src=x onerror="window.umayUnsafe=true">',
               '<script>window.umayUnsafe=true</script>',
               '[zararlı](javascript:alert(1))\n\nSon cümle.'];
-            chunks.forEach((text, index) => setTimeout(() => this.onmessage?.({
-              data: JSON.stringify({type: 'delta', id: 'answer', text}),
-            }), 500 + 100 * index));
-            setTimeout(() => this.onmessage?.({data: JSON.stringify({
-              type: 'done', status: 'completed',
-            })}), 1200);
+            // The answer streams only when the test calls umayAnswer(), so the "thinking" state
+            // can be checked however slowly the page runs.
+            window.umayAnswer = () => {
+              chunks.forEach((text, index) => setTimeout(() => this.onmessage?.({
+                data: JSON.stringify({type: 'delta', id: 'answer', text}),
+              }), 100 * index));
+              setTimeout(() => this.onmessage?.({data: JSON.stringify({
+                type: 'done', status: 'completed',
+              })}), 100 * chunks.length);
+            };
           }
           close() {}
         };
@@ -136,6 +140,7 @@ run(async () => {
       await page.screenshot({path: shot(`umay-thinking-${width}.png`)});
       await page.emulateMedia({reducedMotion: 'reduce'});
       assert.equal(await page.locator('#assistant-typing span').first().evaluate(el => getComputedStyle(el).animationName), 'none');
+      await page.evaluate(() => window.umayAnswer());
       await page.locator('.chat-assistant .chat-content').getByText('Son cümle.', {exact: false}).waitFor();
       await page.waitForFunction(() => document.querySelector('#assistant-messages').getAttribute('aria-busy') === 'false');
       const result = await page.evaluate(() => {
@@ -171,9 +176,13 @@ run(async () => {
       await page.evaluate(() => window.umayTestSocket.onmessage({data: JSON.stringify({
         type: 'message', id: 'retained', text: 'Bağlantı kopsa da bu mesaj kalmalı.',
       })}));
-      await page.evaluate(() => window.umayTestSocket.onclose());
-      assert.equal(await page.locator('#assistant-status').textContent(), 'Çevrimdışı');
-      assert.equal(await page.locator('#assistant-typing').isVisible(), false);
+      // Read the offline state in the same task as the close: the automatic retry follows 1 s later.
+      const offline = await page.evaluate(() => {
+        window.umayTestSocket.onclose();
+        return {status: document.querySelector('#assistant-status').textContent,
+          typing: !!document.querySelector('#assistant-typing').checkVisibility()};
+      });
+      assert.deepEqual(offline, {status: 'Çevrimdışı', typing: false});
       await page.locator('#assistant-status').getByText('Aktif', {exact: true}).waitFor();
       assert.equal(await page.evaluate(() => window.umayConnections), 3);
       assert.equal(await page.locator('.chat-message').count(), 1);

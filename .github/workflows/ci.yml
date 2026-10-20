@@ -73,6 +73,7 @@ jobs:
     # Playwright checks in tests/browser against a Vite preview of the built frontend.
     # Every backend route is answered by synthetic fixtures; no services are needed.
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: frontend
@@ -90,4 +91,9 @@ jobs:
       - name: Build frontend
         run: npx vite build --outDir "$RUNNER_TEMP/healthos-static" --emptyOutDir
       - name: Browser checks (synthetic fixtures)
+        # Hosted runners have no GPU (software WebGL) and few cores: allow more time per wait and
+        # per check than on a workstation. The checks wait on conditions, not wall-clock sleeps.
+        env:
+          HEALTHOS_TEST_STEP_TIMEOUT_MS: "60000"
+          HEALTHOS_TEST_TIMEOUT_MS: "600000"
         run: npm run test:browser
