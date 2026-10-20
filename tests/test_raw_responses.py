@@ -390,3 +390,119 @@ def test_a_compressed_response_is_kept_as_it_came_off_the_wire(
     assert target.read_bytes() == wire
     assert f'"content_encoding": "{encoding}"' in exported.output
     asyncio.run(engine.dispose())
+
+
+async def _cancel_when(task: asyncio.Task, started: asyncio.Event) -> None:
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):  # the cancellation is never swallowed
+        await task
+
+
+async def test_a_page_received_before_a_cancellation_is_kept(sessions, monkeypatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body(steps(1)))
+
+    import app.services.storage as storage
+
+    started = asyncio.Event()
+
+    async def restart_mid_store(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()  # cancelled here, like a deploy stopping the app
+
+    monkeypatch.setattr(storage, "_upsert_normalized_many", restart_mid_store)
+    incremental = IncrementalSync(
+        Settings(_env_file=None, app_env="test"),
+        sessions,
+        client(handler, sessions),
+        {"steps": SPEC},
+    )
+    await _cancel_when(asyncio.create_task(incremental.run("steps")), started)
+    (row,) = await stored(sessions)
+    assert row.body == body(steps(1)) and row.complete
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(RawHealthData)) == 0
+
+
+async def test_a_response_received_before_a_cancelled_retry_is_kept(sessions) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=b'{"error": {"status": "UNAVAILABLE"}}')
+
+    started = asyncio.Event()
+
+    async def cancelled_backoff(_delay):
+        started.set()
+        await asyncio.Event().wait()
+
+    google = GoogleHealthClient(
+        Settings(_env_file=None, google_api_min_request_interval_seconds=0),
+        Tokens(),
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        sleep=cancelled_backoff,
+        archive=DatabaseResponseArchive(sessions),
+    )
+    start = datetime(2026, 8, 17, tzinfo=UTC)
+    task = asyncio.create_task(google.list_data_points(SPEC, start, start + timedelta(hours=1)))
+    await _cancel_when(task, started)
+    (row,) = await stored(sessions)
+    assert row.status_code == 503 and row.body == b'{"error": {"status": "UNAVAILABLE"}}'
+
+
+async def test_a_store_interrupted_by_cancellation_still_finishes(sessions) -> None:
+    from app.google_health.client import KEEP_ON_CANCEL_SECONDS
+
+    assert 0 < KEEP_ON_CANCEL_SECONDS <= 30
+    started = asyncio.Event()
+
+    class SlowArchive(DatabaseResponseArchive):
+        async def keep(self, responses):
+            started.set()
+            await asyncio.sleep(0.05)
+            await super().keep(responses)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"healthUserId": "synthetic"}')
+
+    google = client(handler)
+    google.archive = SlowArchive(sessions)
+    await _cancel_when(asyncio.create_task(google.get_identity()), started)
+    (row,) = await stored(sessions)
+    assert row.source == "identity" and row.body == b'{"healthUserId": "synthetic"}'
+
+
+async def test_a_backfill_page_received_before_a_cancellation_is_kept(
+    sessions, monkeypatch
+) -> None:
+    import app.services.storage as storage
+    from app.models.state import BackfillJob, JobStatus
+    from app.sync.backfill import BackfillService
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body(steps(3)))
+
+    started = asyncio.Event()
+
+    async def restart_mid_store(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(storage, "_upsert_normalized_many", restart_mid_store)
+    start = datetime(2026, 8, 17, tzinfo=UTC)
+    async with sessions.begin() as session:
+        job = BackfillJob(
+            data_type="steps",
+            window_start=start,
+            window_end=start + timedelta(days=1),
+            status=JobStatus.pending,
+        )
+        session.add(job)
+    backfill = BackfillService(
+        Settings(_env_file=None, app_env="test"),
+        sessions,
+        client(handler, sessions),
+        {"steps": SPEC},
+    )
+    await _cancel_when(asyncio.create_task(backfill._run_job(job.id)), started)
+    (row,) = await stored(sessions)
+    assert row.body == body(steps(3)) and row.source == "backfill"

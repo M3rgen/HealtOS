@@ -575,7 +575,9 @@ paired-device responses are stored too. A data page is stored **in the same tran
 records**: a crash keeps both or neither, and each new or changed payload in `raw_health_data`
 and `raw_health_data_versions` carries `response_id`, the page it was first read from
 (`raw_health_data_history` shows it). If storing the records fails, the responses are still kept
-in a transaction of their own. Not stored: requests that never got a response (connection
+in a transaction of their own; also when the task is cancelled (a restart or deploy between
+fetching and storing, or during a retry's back-off): the responses already received are then
+stored, shielded and for at most 10 seconds, before the cancellation goes on. Not stored: requests that never got a response (connection
 refused, timeout before headers), OAuth token exchanges with Google's OAuth server (they carry
 credentials), and webhook calls that fail authentication or the signature check (untrusted).
 

@@ -201,9 +201,10 @@ class IncrementalSync:
                     state.records_downloaded += len(page.data_points)
                     # Heartbeat per page, so recovery never fails a live run.
                     state.updated_at = datetime.now(UTC)
-            except Exception:
-                # The page's records rolled back; what Google sent is still kept.
-                await self.client.keep(page.responses)
+            except BaseException as failure:
+                # The page's records rolled back; what Google sent is still kept, also when
+                # the task was cancelled (restart, deploy) between fetching and storing.
+                await self.client.keep_after(page.responses, failure)
                 raise
         async with self.sessions.begin() as session:
             state = await session.get(SyncState, data_type)

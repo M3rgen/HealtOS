@@ -125,9 +125,37 @@ class GoogleHealthClient:
         return payload
 
     async def keep(self, responses: Sequence[CapturedResponse]) -> None:
-        """Store responses outside a page transaction (failures, probes, identity)."""
+        """Store responses outside a page transaction (failures, probes, identity).
+
+        An archive error is logged, never raised. If the calling task is cancelled while
+        the responses are being stored, the store still gets up to
+        ``KEEP_ON_CANCEL_SECONDS`` to finish before the cancellation propagates.
+        """
         if not responses or self.archive is None:
             return
+        store = asyncio.ensure_future(self._store(responses))
+        try:
+            await asyncio.shield(store)
+        except asyncio.CancelledError:
+            await _finish(store, len(responses))
+            raise
+
+    async def keep_after(
+        self, responses: Sequence[CapturedResponse], failure: BaseException
+    ) -> None:
+        """Keep responses whose page or request was cut short by ``failure``.
+
+        Also on cancellation (a restart or deploy between fetching and storing): the bytes
+        already received are stored (shielded, at most ``KEEP_ON_CANCEL_SECONDS``); the
+        caller re-raises ``failure`` either way, so a cancellation is never swallowed.
+        """
+        if isinstance(failure, Exception):
+            await self.keep(responses)
+        elif responses and self.archive is not None:
+            await _finish(asyncio.ensure_future(self._store(responses)), len(responses))
+
+    async def _store(self, responses: Sequence[CapturedResponse]) -> None:
+        assert self.archive is not None
         try:
             await self.archive.keep(responses)
         except Exception:
@@ -152,8 +180,8 @@ class GoogleHealthClient:
         captured: list[CapturedResponse] = []
         try:
             return await self._exchange(method, path, access_token, data_type, captured, kwargs)
-        except Exception:
-            await self.keep(captured)
+        except BaseException as failure:
+            await self.keep_after(captured, failure)
             raise
 
     async def _exchange(
@@ -250,6 +278,22 @@ class GoogleHealthClient:
             if delay > 0:
                 await self.sleep(delay)
             self._last_request_started = loop.time()
+
+
+# How long a cancelled task (restart, deploy) waits for responses it already received to
+# reach the database before it lets the cancellation through.
+KEEP_ON_CANCEL_SECONDS = 10.0
+
+
+async def _finish(store: asyncio.Future, count: int) -> None:
+    """Wait (bounded, shielded) for a store started on behalf of a cancelled task."""
+    try:
+        await asyncio.wait_for(asyncio.shield(store), KEEP_ON_CANCEL_SECONDS)
+    except (TimeoutError, asyncio.CancelledError):
+        logger.error(
+            "Google Health responses may not have been archived before cancellation",
+            extra={"event": "RESPONSE_ARCHIVE_INTERRUPTED", "count": count},
+        )
 
 
 # Shared with deletion marking, which must use exactly the bounds Google was sent.

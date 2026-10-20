@@ -217,8 +217,9 @@ class BackfillService:
                             job = await session.get(BackfillJob, job_id)
                             job.page_token = page.next_page_token
                             job.records_downloaded += len(page.data_points)
-                    except Exception:
-                        await self.client.keep(page.responses)
+                    except BaseException as failure:
+                        # Also on cancellation: what Google sent is kept.
+                        await self.client.keep_after(page.responses, failure)
                         raise
             async with self.sessions.begin() as session:
                 job = await session.get(BackfillJob, job_id)
