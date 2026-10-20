@@ -14,6 +14,7 @@ from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
 from app.models.state import BackfillJob, JobStatus
 from app.services.storage import store_records
+from app.sync.errors import error_summary
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ class BackfillService:
                 job.retry_count += 1
                 abandoned = job.retry_count >= ABANDON_AFTER_RETRIES
                 job.status = JobStatus.abandoned if abandoned else JobStatus.failed
-                job.last_error = str(exc)[:2000]
+                job.last_error = error_summary(exc)
                 retries = job.retry_count
             if abandoned:
                 event(

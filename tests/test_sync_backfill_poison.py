@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.api import backfill as backfill_api
 from app.core.config import Settings
 from app.db.session import get_session
-from app.google_health.client import Page
+from app.google_health.client import GoogleHealthError, Page
 from app.google_health.data_types import REGISTRY
 from app.models.state import BackfillJob, JobStatus
 from app.sync.backfill import BackfillService
@@ -26,7 +26,7 @@ class PoisonClient:
     async def list_data_points(self, spec, start, end, page_token=None):
         self.starts.append(start.replace(tzinfo=UTC))
         if start.replace(tzinfo=UTC) == POISON_START:
-            raise RuntimeError("Google Health API returned HTTP 403: PERMISSION_DENIED")
+            raise GoogleHealthError("Google Health API returned HTTP 403: PERMISSION_DENIED")
         return Page([], None)
 
 
@@ -112,3 +112,6 @@ async def test_backfill_status_lists_abandoned_windows(sessions):
     assert response.status_code == 200
     assert rows["abandoned"]["windows"] == 1
     assert rows["abandoned"]["data_type"] == "steps"
+    # Short class name + code; upstream response text is not exposed.
+    assert rows["abandoned"]["last_error"] == "GoogleHealthError (http_403)"
+    assert rows["completed"]["last_error"] is None

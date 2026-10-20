@@ -16,6 +16,7 @@ from app.models.state import JobStatus, SyncState
 from app.services.storage import StoreStats, store_records
 from app.sync.checkpoints import incremental_start
 from app.sync.deletions import mark_source_deletions
+from app.sync.errors import error_code, error_summary
 
 logger = logging.getLogger(__name__)
 
@@ -138,13 +139,14 @@ class IncrementalSync:
                 async with self.sessions.begin() as session:
                     state = await session.get(SyncState, data_type)
                     state.status = JobStatus.failed
-                    state.last_error = str(exc)[:2000]
+                    state.last_error = error_summary(exc)
                 self._finish(data_type, total, failed=True)
                 event(
                     logger,
                     "SYNC_FAILED",
                     data_type=data_type,
                     error_type=type(exc).__name__,
+                    error_code=error_code(exc),
                 )
                 raise
 
