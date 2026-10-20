@@ -70,6 +70,13 @@ class IncrementalSync:
         requested_start: datetime | None = None,
         requested_end: datetime | None = None,
     ) -> StoreStats:
+        """Fetch a window; an interrupted earlier window is finished first.
+
+        A saved page token belongs to the previously requested window. That window is
+        completed as a first round, and the window requested by this call always runs
+        afterwards as its own round, so a caller (e.g. a webhook element) only sees
+        success once its own range was fetched.
+        """
         if data_type not in self.specs:
             raise ValueError(f"Unsupported data type: {data_type}")
         async with self._locks.setdefault(data_type, asyncio.Lock()):
@@ -82,47 +89,40 @@ class IncrementalSync:
                 if state is None:
                     state = SyncState(data_type=data_type)
                     session.add(state)
-                resume = (
-                    state.last_page_token and state.last_requested_from and state.last_requested_to
-                )
-                request_start = (
-                    state.last_requested_from
-                    if resume
-                    else requested_start
-                    or incremental_start(
-                        state.last_successful_sync,
-                        self.settings.safety_window(data_type),
-                        request_end,
+                rounds: list[tuple[datetime, datetime, str | None]] = []
+                if state.last_page_token and state.last_requested_from and state.last_requested_to:
+                    rounds.append(
+                        (
+                            _utc(state.last_requested_from),
+                            _utc(state.last_requested_to),
+                            state.last_page_token,
+                        )
                     )
+                request_start = requested_start or incremental_start(
+                    state.last_successful_sync,
+                    self.settings.safety_window(data_type),
+                    request_end,
                 )
-                if resume:
-                    request_end = state.last_requested_to
-                page_token = state.last_page_token if resume else None
-                state.last_requested_from = request_start
-                state.last_requested_to = request_end
+                requested = (_utc(request_start), _utc(request_end))
+                if not rounds or rounds[0][:2] != requested:
+                    rounds.append((*requested, None))
                 state.status = JobStatus.running
                 state.last_error = None
-            event(logger, "SYNC_STARTED", data_type=data_type, requested_from=str(request_start))
+            event(
+                logger,
+                "SYNC_STARTED",
+                data_type=data_type,
+                requested_from=str(request_start),
+                resumed=rounds[0][2] is not None,
+            )
             total = StoreStats()
             try:
-                async for page in iter_pages(
-                    self.client, spec, request_start, request_end, page_token
-                ):
-                    async with self.sessions.begin() as session:
-                        stats = await store_records(session, spec, page.data_points)
-                        total.add(stats)
-                        state = await session.get(SyncState, data_type)
-                        state.last_page_token = page.next_page_token
-                        state.records_downloaded += len(page.data_points)
+                for round_start, round_end, page_token in rounds:
+                    await self._fetch_round(
+                        spec, round_start, round_end, page_token, total, data_type
+                    )
                 async with self.sessions.begin() as session:
                     state = await session.get(SyncState, data_type)
-                    previous_success = state.last_successful_sync
-                    if previous_success and previous_success.tzinfo is None:
-                        previous_success = previous_success.replace(tzinfo=UTC)
-                    state.last_successful_sync = (
-                        max(previous_success, request_end) if previous_success else request_end
-                    )
-                    state.last_page_token = None
                     state.status = JobStatus.completed
                     state.last_error = None
                 self._finish(data_type, total, failed=False)
@@ -147,6 +147,34 @@ class IncrementalSync:
                 )
                 raise
 
+    async def _fetch_round(
+        self,
+        spec: DataTypeSpec,
+        start: datetime,
+        end: datetime,
+        page_token: str | None,
+        total: StoreStats,
+        data_type: str,
+    ) -> None:
+        async with self.sessions.begin() as session:
+            state = await session.get(SyncState, data_type)
+            state.last_requested_from = start
+            state.last_requested_to = end
+            state.last_page_token = page_token
+        async for page in iter_pages(self.client, spec, start, end, page_token):
+            async with self.sessions.begin() as session:
+                total.add(await store_records(session, spec, page.data_points))
+                state = await session.get(SyncState, data_type)
+                state.last_page_token = page.next_page_token
+                state.records_downloaded += len(page.data_points)
+        async with self.sessions.begin() as session:
+            state = await session.get(SyncState, data_type)
+            previous_success = state.last_successful_sync
+            state.last_successful_sync = (
+                max(_utc(previous_success), end) if previous_success else end
+            )
+            state.last_page_token = None
+
     async def run_all(self) -> dict[str, StoreStats | Exception]:
         semaphore = asyncio.Semaphore(self.settings.sync_concurrency)
 
@@ -159,3 +187,7 @@ class IncrementalSync:
 
         results = await asyncio.gather(*(guarded(name) for name in self.specs))
         return dict(zip(self.specs, results, strict=True))
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
