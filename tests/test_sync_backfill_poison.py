@@ -1,11 +1,19 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 from fastapi import FastAPI
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+from typer.testing import CliRunner
 
 from app.api import backfill as backfill_api
+from app.cli import main as cli
 from app.core.config import Settings
+from app.db.base import Base
 from app.db.session import get_session
 from app.google_health.client import GoogleHealthError, Page
 from app.google_health.data_types import REGISTRY
@@ -59,9 +67,11 @@ def service(sessions, client):
     return BackfillService(settings, sessions, client, {"steps": REGISTRY["steps"]})
 
 
-async def jobs_by_start(sessions):
+async def jobs_by_start(sessions, data_type="steps"):
     async with sessions() as session:
-        jobs = (await session.scalars(select(BackfillJob))).all()
+        jobs = (
+            await session.scalars(select(BackfillJob).where(BackfillJob.data_type == data_type))
+        ).all()
     return {job.window_start.replace(tzinfo=UTC): job for job in jobs}
 
 
@@ -115,3 +125,64 @@ async def test_backfill_status_lists_abandoned_windows(sessions):
     # Short class name + code; upstream response text is not exposed.
     assert rows["abandoned"]["last_error"] == "GoogleHealthError (http_403)"
     assert rows["completed"]["last_error"] is None
+
+
+async def test_reset_abandoned_requeues_only_the_selected_type(sessions):
+    await add_windows(sessions, poison_retries=9)
+    backfill = service(sessions, PoisonClient())
+    await backfill.run(["steps"])
+    async with sessions.begin() as session:
+        session.add(
+            BackfillJob(
+                data_type="sleep",
+                window_start=POISON_START,
+                window_end=POISON_START + timedelta(days=1),
+                status=JobStatus.abandoned,
+                retry_count=10,
+            )
+        )
+
+    assert await backfill.reset_abandoned(["steps"]) == 1
+
+    jobs = await jobs_by_start(sessions)
+    sleep = (await jobs_by_start(sessions, "sleep"))[POISON_START]
+    assert (jobs[POISON_START].status, jobs[POISON_START].retry_count) == (JobStatus.failed, 0)
+    # The cause stays visible until the next attempt replaces it.
+    assert jobs[POISON_START].last_error == "GoogleHealthError (http_403)"
+    assert (sleep.status, sleep.retry_count) == (JobStatus.abandoned, 10)
+    assert await backfill.reset_abandoned() == 1
+
+
+class HealthyClient:
+    async def list_data_points(self, spec, start, end, page_token=None):
+        return Page([], None)
+
+
+def test_cli_reset_abandoned_requeues_then_runs(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'cli.db'}", poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def setup():
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        await add_windows(sessions, poison_retries=10)
+        async with sessions.begin() as session:
+            job = await session.scalar(
+                select(BackfillJob).where(BackfillJob.window_start == POISON_START)
+            )
+            job.status = JobStatus.abandoned
+
+    asyncio.run(setup())
+    backfill = service(sessions, HealthyClient())
+    runtime = SimpleNamespace(backfill=backfill, shutdown=AsyncMock())
+    monkeypatch.setattr(cli, "build_runtime", lambda *_: runtime)
+    monkeypatch.setattr(cli, "get_settings", lambda: backfill.settings)
+    monkeypatch.setattr(cli, "SessionLocal", sessions)
+
+    result = CliRunner().invoke(cli.app, ["backfill", "--reset-abandoned", "--data-type", "steps"])
+
+    jobs = asyncio.run(jobs_by_start(sessions))
+    asyncio.run(engine.dispose())
+    assert result.exit_code == 0, result.output
+    assert "Requeued 1 abandoned backfill window" in result.output
+    assert jobs[POISON_START].status == JobStatus.completed

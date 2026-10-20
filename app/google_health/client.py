@@ -11,7 +11,7 @@ import httpx
 
 from app.core.config import Settings
 from app.core.logging import event
-from app.google_health.data_types import AccessMethod, DataTypeSpec
+from app.google_health.data_types import AccessMethod, DataTypeSpec, query_iso
 from app.google_health.oauth import TokenProvider
 
 logger = logging.getLogger(__name__)
@@ -176,8 +176,8 @@ class GoogleHealthClient:
             self._last_request_started = loop.time()
 
 
-def _iso(value: datetime) -> str:
-    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+# Shared with deletion marking, which must use exactly the bounds Google was sent.
+_iso = query_iso
 
 
 def _minute_aligned_range(start: datetime, end: datetime) -> tuple[datetime, datetime]:

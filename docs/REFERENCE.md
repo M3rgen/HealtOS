@@ -129,7 +129,8 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Open `http://localhost:8000/`. The API documentation remains at `/docs`.
+Open `http://localhost:8000/`. This Compose file runs in production mode, which serves no API
+documentation; see [Local API](#local-api).
 After frontend changes, run `docker compose up -d --build app` to update this
 permanent dashboard. `npm run build` alone only updates the host files; an
 existing container keeps its bundled frontend. Port `5173` is a temporary Vite
@@ -344,7 +345,9 @@ curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/google-healt
 Run `health-mirror` inside the container (`docker compose exec app health-mirror …`) or in the
 native environment. Every HTTP route except `/health/live`, `/login`, the OAuth callback and the
 webhook needs the UI token: `Authorization: Bearer <APP_UI_TOKEN>`, or the login cookie in a
-browser.
+browser. The cookie names a random session issued at login and held in memory for at most 30 days;
+`POST /logout` (same-origin form, the Sistem panel's **Çıkış yap**) revokes it, and an app restart
+ends all sessions. See [DEPLOYMENT.md](DEPLOYMENT.md) for opening the UI as `healthos.localhost`.
 
 Use this to confirm the account is linked, Fitbit data is visible, and the configured scopes cover the intended types. Then verify a small persisted sync before starting the full backup.
 
@@ -370,6 +373,7 @@ curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/backfill/sta
 ```bash
 health-mirror backfill --data-type steps
 health-mirror backfill
+health-mirror backfill --reset-abandoned   # requeue abandoned windows, then run
 ```
 
 The default attempts history from 2010 in 31-day windows. Empty windows are valid and become completed checkpoints. Recent windows run first. On interruption, rerunning resumes the saved window and `pageToken`; completed windows are skipped. A window that keeps failing is moved behind the others after five failures and marked `abandoned` after ten, so it cannot stall its data type; see the [runbook](RUNBOOK.md#abandoned-backfill-windows). Use a conservative start date to maximize completeness—the official API permits queries back to the earliest recorded data.
@@ -389,6 +393,26 @@ curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/sync/status
 ```
 
 Default overlaps are 60 minutes for heart rate, 12 hours for steps/activity streams, 72 hours for sleep/temperature derivations, seven days for daily metrics, and 24 hours otherwise. UPSERT makes every replay safe.
+
+### Source deletions
+
+Google's list responses carry no tombstones; a deleted record simply stops appearing. When a window
+was fetched from its first page to its last (an incremental run, a webhook re-fetch, or a
+reconciliation), archived records that the same filter must have matched but that were not returned
+get `source_deleted_at`. Nothing is deleted; dashboards and Umay skip marked records, and a record
+that comes back is unmarked. The marked range is derived from exactly the bounds sent to Google
+(UTC, whole seconds); rollup and reconcile types (aggregates) and catalogs without a time filter are
+never marked.
+
+- Session filters use civil start times (sleep: physical end time, exclusive). A webhook re-fetch
+  of one sleep or exercise session therefore widens its window (sleep: one second past the
+  session's end; other sessions: 12 hours before and 14 hours after, the range of UTC offsets) so
+  the deleted session is inside both the query and the marked range. Outside webhooks, a
+  scheduled window only marks sessions that started at least 12 hours after its start and 14 hours
+  before its end; the rest is covered by the daily 7-day reconciliation.
+- A record whose time was moved upstream out of the window that is re-fetched looks deleted from
+  that window and is marked until a fetch covering its new time returns it again (and unmarks it).
+  For a move of more than 7 days that is the weekly 90-day reconciliation.
 
 ## Webhooks
 
@@ -552,6 +576,12 @@ After a host interruption the expected recovery sequence is:
    Cloudflare returns 502 and Google retries.
 5. The optional Umay bridge is a host process without a service unit; start it again by hand.
 
+A sync state or webhook element left `running` by a process that died is failed (and so becomes
+retryable) at startup, but only once nothing has touched it for 15 minutes: a running fetch refreshes
+its sync state on every page, so a fresher row may be a `health-mirror sync` or webhook replay still
+working in another container. Rows that were fresh at startup are re-checked once the 15 minutes
+have passed, and the watchdog likewise ignores `running` rows without a recent heartbeat.
+
 If Docker itself is down, no in-container watchdog can notice. That host-level condition is visible
 as a Cloudflare 502 on the webhook and must be handled by host monitoring.
 
@@ -571,7 +601,10 @@ as a Cloudflare 502 on the webhook and must be handled by host monitoring.
 - `GET /google-health/capabilities` (metadata-only one-record probes)
 - `GET /google-health/devices` (sanitized paired-device metadata)
 
-Interactive OpenAPI documentation is available locally at `/docs`. Every route except
+Interactive OpenAPI documentation (`/docs`, `/redoc`, `/openapi.json`) is served only outside
+production (`APP_ENV` other than `production`, e.g. with `docker-compose.dev.yml` or `make run`):
+its page needs inline scripts and the jsDelivr CDN, an exception the login-cookie origin should not
+carry in production. Every route except
 `/health/live`, the login page, the OAuth callback and the webhook requires the UI token.
 
 ## Database backup and restore

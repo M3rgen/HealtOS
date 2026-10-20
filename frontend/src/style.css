@@ -433,6 +433,8 @@ td:first-child{font-weight:520}
 .text-link{display:inline-flex;align-items:center;gap:5px;font-weight:550;border-radius:6px;text-underline-offset:4px}
 .text-link:hover{text-decoration:underline}
 .text-link .button-icon{width:var(--icon-sm);height:var(--icon-sm)}
+.logout-form{display:inline}
+.logout-form .text-link{background:none;border:0;padding:0;font:inherit;font-size:14px;font-weight:550;color:var(--amber)}
 
 /* --- Form controls --------------------------------------------------------- */
 input,select,textarea{border-radius:var(--radius-control)}

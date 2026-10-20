@@ -66,6 +66,7 @@ async def test_dashboard_policy(application):
         ("localhost:18080", "ws://localhost:18080"),  # SSH tunnel on another local port
         ("127.0.0.1:8000", "ws://127.0.0.1:8000"),
         ("LOCALHOST", "ws://localhost"),
+        ("healthos.localhost:8000", "ws://healthos.localhost:8000"),
     ],
 )
 async def test_websocket_source_follows_the_loopback_host(application, host, expected):
@@ -162,3 +163,27 @@ async def test_models_are_immutable_only_with_a_content_hash(tmp_path, name, cac
     assert missing.status_code == 404 and "immutable" not in missing.headers.get(
         "cache-control", ""
     )
+
+
+async def test_production_serves_no_interactive_docs(monkeypatch):
+    """The docs' inline-script/CDN CSP exception must not exist on the production origin."""
+    token = "p" * 40
+    settings = Settings(
+        _env_file=None,
+        app_env="production",
+        database_url="postgresql+asyncpg://mirror:synthetic@postgres:5432/mirror",
+        google_client_id="synthetic-client",
+        google_client_secret="synthetic-secret",
+        google_token_encryption_key="synthetic-encryption-key",
+        google_health_webhook_endpoint_uri="https://hooks.example/webhooks/google-health",
+        google_health_webhook_authorization="Bearer webhook-secret",
+        app_ui_token=token,
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "build_runtime", lambda *_: SimpleNamespace())
+    application = main.create_app()
+    async with client(application) as http:
+        for path in ("/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"):
+            response = await http.get(path, headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 404, path
+            assert "cdn.jsdelivr.net" not in response.headers["content-security-policy"]

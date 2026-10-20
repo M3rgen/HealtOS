@@ -1,7 +1,8 @@
-"""Self-contained login page that exchanges APP_UI_TOKEN for a session cookie."""
+"""Self-contained login page that exchanges APP_UI_TOKEN for a session cookie, and logout."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 from html import escape
@@ -14,15 +15,20 @@ from app.core.auth import (
     COOKIE_MAX_AGE,
     COOKIE_NAME,
     LOGIN_PATH,
-    cookie_value,
+    LOGOUT_PATH,
+    SessionStore,
     request_authenticated,
     safe_next,
     same_origin_form,
+    session_cookies,
     token_matches,
 )
 
 router = APIRouter(include_in_schema=False)
 MAX_FORM_BYTES = 8 * 1024
+# A small constant pause on a wrong token; the token's length makes guessing hopeless
+# anyway, this only keeps a script from hammering the form at full speed.
+FAILED_LOGIN_DELAY_SECONDS = 0.5
 
 STYLE = (
     ":root{color-scheme:dark;--page:#181814;--surface:#20201c;--inset:#242420;--line:#373731;"
@@ -87,7 +93,7 @@ def page(next_path: str, error: str | None = None, status_code: int = 200) -> HT
 <button type="submit">Giriş yap</button>
 </form>
 <p class="hint">Anahtar, sunucudaki <code>APP_UI_TOKEN</code> değeridir.
-Bu tarayıcı seni 30 gün hatırlar.</p>
+Bu tarayıcı, sunucu yeniden başlatılmadıkça seni 30 gün hatırlar.</p>
 </main>
 </body>
 </html>
@@ -103,12 +109,16 @@ def _token(request: Request) -> str | None:
     return request.app.state.settings.app_ui_token
 
 
-@router.get(LOGIN_PATH)
+def _sessions(request: Request) -> SessionStore:
+    return request.app.state.ui_sessions
+
+
+@router.api_route(LOGIN_PATH, methods=["GET", "HEAD"])
 async def login_page(
     request: Request, next_path: str | None = Query(None, alias="next")
 ) -> Response:
     target = safe_next(next_path)
-    if request_authenticated(_token(request), request.headers):
+    if request_authenticated(_token(request), request.headers, _sessions(request)):
         return RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
     return page(target)
 
@@ -131,15 +141,29 @@ async def login(request: Request) -> Response:
     if not token:
         return RedirectResponse(target, status_code=303)
     if not token_matches(token, (form.get("token") or [""])[0]):
+        await asyncio.sleep(FAILED_LOGIN_DELAY_SECONDS)
         return page(target, "token", 401)
     response = RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
     response.set_cookie(
         COOKIE_NAME,
-        cookie_value(token),
+        _sessions(request).issue(),
         max_age=COOKIE_MAX_AGE,
         path="/",
         httponly=True,
         samesite="strict",
         secure=False,
     )
+    return response
+
+
+@router.post(LOGOUT_PATH)
+async def logout(request: Request) -> Response:
+    """Revoke the browser's session and clear its cookie (exempt from the token check)."""
+    if not same_origin_form(request.headers, request.url.scheme):
+        return Response("Cross-origin logout refused", status_code=403)
+    sessions = _sessions(request)
+    for session_id in session_cookies(request.headers):
+        sessions.revoke(session_id)
+    response = RedirectResponse(LOGIN_PATH, status_code=303, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="strict", secure=False)
     return response

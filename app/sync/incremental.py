@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -22,6 +22,15 @@ from app.sync.errors import error_code, error_summary
 logger = logging.getLogger(__name__)
 
 INTERRUPTED_ERROR = "process restarted"
+# A run refreshes SyncState.updated_at on every page, so a `running` row untouched for this
+# long has no live owner. A fresher one may belong to another live process (`healthos sync`
+# in a separate container) and must not be failed underneath it.
+STALE_RUNNING_AFTER = timedelta(minutes=15)
+
+
+def stale_running_cutoff(now: datetime | None = None) -> datetime:
+    """`running` rows last updated before this instant are treated as abandoned."""
+    return (now or datetime.now(UTC)) - STALE_RUNNING_AFTER
 
 
 class IncrementalSync:
@@ -41,16 +50,20 @@ class IncrementalSync:
         self.sequence = 0
         self.last_runs: dict[str, dict] = {}
 
-    async def recover_interrupted(self) -> int:
+    async def recover_interrupted(self, now: datetime | None = None) -> int:
         """Fail sync states left `running` by a process that died mid-run.
 
-        Called once at startup, before any new run can start. The saved page token is
-        kept, so the next run resumes the interrupted window.
+        Only rows without a heartbeat for STALE_RUNNING_AFTER count: a fresher row may be
+        a live run in another process. Called at startup and once more after that grace
+        period. The saved page token is kept, so the next run resumes the window.
         """
         async with self.sessions.begin() as session:
             result = await session.execute(
                 update(SyncState)
-                .where(SyncState.status == JobStatus.running)
+                .where(
+                    SyncState.status == JobStatus.running,
+                    SyncState.updated_at < stale_running_cutoff(now),
+                )
                 .values(status=JobStatus.failed, last_error=INTERRUPTED_ERROR)
             )
         recovered = result.rowcount or 0
@@ -174,11 +187,15 @@ class IncrementalSync:
                 state = await session.get(SyncState, data_type)
                 state.last_page_token = page.next_page_token
                 state.records_downloaded += len(page.data_points)
+                # Heartbeat per page, so recovery never fails a live run (STALE_RUNNING_AFTER).
+                state.updated_at = datetime.now(UTC)
         async with self.sessions.begin() as session:
             state = await session.get(SyncState, data_type)
             previous_success = state.last_successful_sync
+            # A widened webhook window may end in the future; the watermark never does.
+            reached = min(end, datetime.now(UTC))
             state.last_successful_sync = (
-                max(as_utc(previous_success), end) if previous_success else end
+                max(as_utc(previous_success), reached) if previous_success else reached
             )
             state.last_page_token = None
             if fetched_since is not None:

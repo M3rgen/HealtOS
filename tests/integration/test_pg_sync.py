@@ -11,7 +11,7 @@ from app.core.config import Settings
 from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY
 from app.models.state import JobStatus, RawHealthData, SyncState
-from app.sync.incremental import INTERRUPTED_ERROR, IncrementalSync
+from app.sync.incremental import INTERRUPTED_ERROR, STALE_RUNNING_AFTER, IncrementalSync
 
 pytestmark = pytest.mark.integration
 
@@ -118,9 +118,12 @@ async def test_startup_recovery_fails_running_sync_states(pg_sessions) -> None:
                     last_page_token="resume-me",
                     last_requested_from=WINDOW_START,
                     last_requested_to=WINDOW_END,
+                    updated_at=datetime.now(UTC) - STALE_RUNNING_AFTER - timedelta(minutes=1),
                 ),
                 SyncState(data_type="sleep", status=JobStatus.completed),
                 SyncState(data_type="weight", status=JobStatus.abandoned),
+                # Fresh heartbeat: possibly a live run in another process.
+                SyncState(data_type="heart-rate", status=JobStatus.running),
             ]
         )
     service = IncrementalSync(
@@ -138,3 +141,4 @@ async def test_startup_recovery_fails_running_sync_states(pg_sessions) -> None:
     assert states["steps"].last_requested_to == WINDOW_END
     assert states["sleep"].status == JobStatus.completed
     assert states["weight"].status == JobStatus.abandoned
+    assert states["heart-rate"].status == JobStatus.running

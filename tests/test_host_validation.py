@@ -28,7 +28,18 @@ def application(monkeypatch):
     return application
 
 
-@pytest.mark.parametrize("host", ["localhost", "LOCALHOST:8000", "127.0.0.1:5174", "[::1]:8000"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost",
+        "LOCALHOST:8000",
+        "127.0.0.1:5174",
+        "[::1]:8000",
+        # Own cookie jar, apart from other localhost servers (see DEPLOYMENT.md).
+        "healthos.localhost:8000",
+        "HealthOS.localhost",
+    ],
+)
 async def test_local_http_control(application, host):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application), base_url="http://localhost"
@@ -42,6 +53,8 @@ async def test_local_http_control(application, host):
     [
         "attacker.example:8000",
         "localhost.attacker.example",
+        "healthos.localhost.attacker.example",
+        "other.localhost:8000",
         "localhost@attacker.example",
         "localhost:8000@attacker.example",
         "localhost:8000:evil",

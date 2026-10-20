@@ -1,8 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from enum import StrEnum
+
+from app.core.timeutil import as_utc
+
+# Session filters compare civil (local wall-clock) start times with the window bounds,
+# while records carry physical UTC times. UTC offsets range from -12:00 to +14:00.
+CIVIL_BEFORE = timedelta(hours=12)
+CIVIL_AFTER = timedelta(hours=14)
+
+
+def query_time(value: datetime) -> datetime:
+    """The instant a request bound actually names: UTC, truncated to whole seconds.
+
+    Request bounds are sent with second precision, so ``10:00:00.5`` asks Google for
+    ``10:00:00``. Anything that reasons about what a request covered (deletion marking)
+    must use these bounds, not the finer datetimes the caller passed in.
+    """
+    return as_utc(value).replace(microsecond=0)
+
+
+def query_iso(value: datetime) -> str:
+    """RFC 3339 form of ``query_time`` as written into filters and rollup ranges."""
+    return query_time(value).isoformat().replace("+00:00", "Z")
 
 
 class RecordKind(StrEnum):
@@ -76,6 +98,21 @@ class DataTypeSpec:
         else:
             field = f"{prefix}.interval.start_time"
         return f'{field} >= "{start_iso}" AND {field} < "{end_iso}"'
+
+    def covering_window(self, start: datetime, end: datetime) -> tuple[datetime, datetime]:
+        """A list window whose filter certainly matches a record spanning [start, end].
+
+        Webhook notifications name a record's physical interval. Sleep filters on end
+        time with an exclusive upper bound, so the window must end after the record does;
+        other sessions filter on civil start time, which can be 12 h behind or 14 h ahead
+        of UTC. With these windows ``deletion_scope`` covers exactly the notified record.
+        Other kinds already filter on the physical start time.
+        """
+        if self.name == "sleep":
+            return start, end + timedelta(seconds=1)
+        if self.kind == RecordKind.session and self.name != "electrocardiogram":
+            return start - CIVIL_BEFORE, end + CIVIL_AFTER
+        return start, end
 
 
 _SPECS = [

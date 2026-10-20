@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
-from app.models.state import ReliabilityState
+from app.models.state import JobStatus, ReliabilityState, SyncState
 from app.services.pipeline_health import PipelineSnapshot, PipelineStatus
 from app.services.watchdog import PipelineWatchdog
 
@@ -165,3 +165,26 @@ async def test_startup_gap_uses_oldest_frequent_stream(sessions):
 
     assert result.action == "completed"
     assert reconciliation.calls == [6]
+
+
+async def test_only_a_live_running_sync_blocks_recovery(sessions):
+    now = datetime(2026, 8, 19, 12, tzinfo=UTC)
+    async with sessions.begin() as session:
+        # Left behind by a dead process: no heartbeat for an hour.
+        session.add(
+            SyncState(
+                data_type="steps", status=JobStatus.running, updated_at=now - timedelta(hours=1)
+            )
+        )
+    watchdog, reconciliation = _watchdog(sessions, now)
+
+    assert (await watchdog.check(trigger="watchdog", now=now)).action == "completed"
+
+    async with sessions.begin() as session:
+        session.add(
+            SyncState(
+                data_type="sleep", status=JobStatus.running, updated_at=now - timedelta(minutes=1)
+            )
+        )
+        await session.delete(await session.get(ReliabilityState, 1))
+    assert (await watchdog.check(trigger="watchdog", now=now)).action == "sync_running"

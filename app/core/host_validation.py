@@ -7,7 +7,9 @@ from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 WEBHOOK_PATH = "/webhooks/google-health"
-LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
+# healthos.localhost resolves to loopback in current browsers and gets its own cookie jar,
+# apart from every other server on localhost (cookies are not isolated by port).
+LOCAL_HOSTS = frozenset({"localhost", "healthos.localhost", "127.0.0.1", "[::1]"})
 AUTHORITY = re.compile(r"(?P<host>\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+)(?::(?P<port>[0-9]{1,5}))?")
 
 

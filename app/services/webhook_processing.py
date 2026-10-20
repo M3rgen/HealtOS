@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -16,13 +16,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.core.logging import event
 from app.core.timeutil import as_utc
 from app.models.state import (
+    JobStatus,
     OAuthToken,
+    SyncState,
     WebhookBatchItem,
     WebhookEvent,
     WebhookNotification,
 )
 from app.parsers.common import parse_datetime, payload_hash
-from app.sync.incremental import IncrementalSync
+from app.sync.incremental import IncrementalSync, stale_running_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +340,8 @@ class WebhookBatchProcessor:
         spec = self.incremental.specs[data_type]
         windows: list[tuple[datetime | None, datetime | None]] = []
         if start and end:
+            # Widen session windows so the filter (and deletion marking) covers the record.
+            start, end = spec.covering_window(start, end)
             cursor = start
             while cursor < end:
                 window_end = (
@@ -405,17 +409,32 @@ class WebhookBatchProcessor:
             batch.last_error = "; ".join(error for error in errors if error)[:2000] or None
             batch.processed_at = None if incomplete else datetime.now(UTC)
 
-    async def recover_running(self) -> int:
+    async def recover_running(self, now: datetime | None = None) -> int:
         """Fail elements left `running` by a process that died mid-attempt.
 
         A `running` element is never claimed again, so without this its batch stays
-        unprocessed forever. Called at startup (before any webhook is accepted) and by
-        process_pending; failed elements are retried by the next delivery or replay.
+        unprocessed forever. Called at startup (before any webhook is accepted), once more
+        after the stale grace period, and by process_pending; failed elements are retried
+        by the next delivery or replay. An element may belong to another live process (the
+        server while a replay CLI runs, or the reverse): it is left alone while its own row
+        or the sync state of its data type (which a running fetch refreshes per page) has
+        been updated within STALE_RUNNING_AFTER.
         """
+        cutoff = stale_running_cutoff(now)
+        live_types = select(SyncState.data_type).where(
+            SyncState.status == JobStatus.running, SyncState.updated_at >= cutoff
+        )
         async with self.sessions.begin() as session:
             result = await session.execute(
                 update(WebhookNotification)
-                .where(WebhookNotification.status == "running")
+                .where(
+                    WebhookNotification.status == "running",
+                    WebhookNotification.updated_at < cutoff,
+                    or_(
+                        WebhookNotification.data_type.is_(None),
+                        WebhookNotification.data_type.not_in(live_types),
+                    ),
+                )
                 .values(status="failed", last_error=INTERRUPTED_ERROR)
             )
         recovered = result.rowcount or 0

@@ -121,11 +121,19 @@ The app only listens on the VM's loopback. From your own computer:
 ssh -N -L 8000:127.0.0.1:8000 <user>@<vm-host>
 ```
 
-Open <http://localhost:8000>. You are redirected to `/login`; enter `APP_UI_TOKEN`. The login sets
-an HttpOnly, SameSite=Strict cookie for 30 days. API clients send
-`Authorization: Bearer <APP_UI_TOKEN>` instead. Keep the local port at 8000 so the Google OAuth
-redirect (`http://localhost:8000/auth/google/callback`) lands in the tunnel; the app accepts only
-`localhost`, `127.0.0.1` and `[::1]` as host names for private routes.
+Open <http://healthos.localhost:8000> (recommended) or <http://localhost:8000>. You are redirected
+to `/login`; enter `APP_UI_TOKEN`. The login sets an HttpOnly, SameSite=Strict cookie for 30 days
+that holds a random session id, not the token; **Çıkış yap** in the Sistem panel (`POST /logout`)
+revokes it. Sessions live in the app's memory, so restarting the app logs every browser out. API
+clients send `Authorization: Bearer <APP_UI_TOKEN>` instead.
+
+Browsers do not separate cookies by port: every other server you open on `localhost` (a dev
+server, another tunnel) receives a cookie set for `localhost`. `healthos.localhost` resolves to
+loopback in current browsers (if yours does not, add `127.0.0.1 healthos.localhost` to your hosts
+file) and keeps its own cookie jar. Keep the local port at 8000 so the Google OAuth redirect
+(`http://localhost:8000/auth/google/callback`) lands in the tunnel; after consent, return to
+`healthos.localhost`. The app accepts only `localhost`, `healthos.localhost`, `127.0.0.1` and
+`[::1]` (any port) as host names for private routes.
 
 ## 6. Connect Google and import history
 
@@ -222,7 +230,7 @@ bridge). Restarting and token rotation are in the [runbook](RUNBOOK.md#restart-t
 
 - `ss -ltn` on the VM shows `127.0.0.1:8000`, the bridge on the `docker0` address only, and no 5432.
 - `https://webhook.example.com/` and `/health` return 404; only the webhook path reaches the app.
-- `http://localhost:8000` through the SSH tunnel asks for the token.
+- `http://healthos.localhost:8000` through the SSH tunnel asks for the token.
 - `systemctl list-timers healthos-backup.timer` shows the next run, and one restore drill passed.
 - Exactly one app instance runs the scheduler. If you start a second copy (for example during a
   migration), set `RECONCILIATION_ENABLED=false` and `WATCHDOG_ENABLED=false` there.
