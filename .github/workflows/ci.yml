@@ -68,3 +68,26 @@ jobs:
         run: docker compose --env-file .env.example config --quiet
       - name: Reproducible application image
         run: docker build --tag personal-health-mirror:ci .
+
+  browser:
+    # Playwright checks in tests/browser against a Vite preview of the built frontend.
+    # Every backend route is answered by synthetic fixtures; no services are needed.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.21.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frozen frontend dependencies
+        run: npm ci
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Build frontend
+        run: npx vite build --outDir "$RUNNER_TEMP/healthos-static" --emptyOutDir
+      - name: Browser checks (synthetic fixtures)
+        run: npm run test:browser
