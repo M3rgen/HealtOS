@@ -47,7 +47,9 @@ async def test_workouts_sources_month_timezone_and_validation(sessions):
             )
         await session.commit()
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=application), base_url="http://localhost"
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://localhost",
+        headers={"X-HealthOS-Request": "1"},
     ) as client:
         body = {
             "exercise_type": " Yürüyüş ",

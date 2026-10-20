@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://health:health@postgres:5432/health"
     codex_bridge_url: str = "ws://host.docker.internal:8766"
     codex_bridge_token: str | None = None
+    # Single-user UI/API bearer token; empty disables the barrier outside production.
+    app_ui_token: str | None = None
 
     google_health_base_url: str = "https://health.googleapis.com/v4"
     google_client_id: str = "CHANGE_ME"
@@ -76,6 +78,7 @@ class Settings(BaseSettings):
             "GOOGLE_CLIENT_SECRET": self.google_client_secret,
             "GOOGLE_TOKEN_ENCRYPTION_KEY": self.google_token_encryption_key,
             "GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION": self.google_health_webhook_authorization,
+            "APP_UI_TOKEN": self.app_ui_token,
         }
         for name, value in required.items():
             normalized = (value or "").strip()
@@ -92,6 +95,18 @@ class Settings(BaseSettings):
             names = ", ".join(sorted(set(unsafe)))
             raise ValueError(f"unsafe or missing production configuration: {names}")
         return self
+
+    @field_validator("app_ui_token", mode="before")
+    @classmethod
+    def valid_ui_token(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if not isinstance(value, str) or not re.fullmatch(r"[\x21-\x7e]{32,512}", value):
+            raise ValueError(
+                "APP_UI_TOKEN must be 32-512 printable ASCII characters without spaces; "
+                'generate one with: python -c "import secrets;print(secrets.token_urlsafe(32))"'
+            )
+        return value
 
     @field_validator("extra_data_types", "enabled_data_types", mode="before")
     @classmethod

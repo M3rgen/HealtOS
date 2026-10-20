@@ -47,6 +47,7 @@ def test_production_accepts_explicit_non_placeholder_secrets():
         google_token_encryption_key="encryption-key",
         google_health_webhook_endpoint_uri="https://health.example/webhooks/google-health",
         google_health_webhook_authorization="Bearer webhook-secret",
+        app_ui_token="u" * 32,
         _env_file=None,
     )
     assert settings.app_env == "production"

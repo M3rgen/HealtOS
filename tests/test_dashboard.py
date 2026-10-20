@@ -130,7 +130,9 @@ async def test_manual_api_validation_persistence_csv_and_empty_archive(sessions)
 
     application.dependency_overrides[get_session] = override_session
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=application), base_url="http://localhost"
+        transport=httpx.ASGITransport(app=application),
+        base_url="http://localhost",
+        headers={"X-HealthOS-Request": "1"},
     ) as client:
         response = await client.get("/api/dashboard?end_date=2026-09-29")
         assert response.status_code == 200

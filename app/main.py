@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,15 +10,30 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
-from app.api import auth, backfill, codex, dashboard, google_health, health, sync, webhooks
+from app.api import auth, backfill, codex, dashboard, google_health, health, login, sync, webhooks
+from app.core.auth import UITokenMiddleware
 from app.core.config import get_settings
 from app.core.host_validation import HostValidationMiddleware
 from app.core.logging import configure_logging, event
+from app.core.security_headers import SecurityHeadersMiddleware
 from app.db.session import SessionLocal
 from app.services.runtime import build_runtime
 from app.services.scheduler import build_scheduler
 
 logger = logging.getLogger(__name__)
+# body.d736859b.glb: a content-hashed name never changes meaning, so it can be cached
+# forever; anything else under /models must be revalidated.
+HASHED_NAME = re.compile(r"[^/]+[.-][0-9a-f]{8,64}\.[A-Za-z0-9]+")
+
+
+class ModelFiles(StaticFiles):
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        hashed = HASHED_NAME.fullmatch(Path(full_path).name)
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if hashed else "no-cache"
+        )
+        return response
 
 
 def create_app() -> FastAPI:
@@ -68,11 +84,15 @@ def create_app() -> FastAPI:
     )
     application.state.settings = settings
     application.state.runtime = runtime
+    # Starlette runs the last-added middleware first: headers, host check, UI token.
+    application.add_middleware(UITokenMiddleware, token=settings.app_ui_token)
     application.add_middleware(
         HostValidationMiddleware,
         webhook_endpoint_uri=settings.google_health_webhook_endpoint_uri,
     )
+    application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(health.router)
+    application.include_router(login.router)
     application.include_router(auth.router)
     application.include_router(sync.router)
     application.include_router(backfill.router)
@@ -84,7 +104,7 @@ def create_app() -> FastAPI:
     if static.is_dir():
         application.mount("/assets", StaticFiles(directory=static / "assets"), name="assets")
         if (static / "models").is_dir():
-            application.mount("/models", StaticFiles(directory=static / "models"), name="models")
+            application.mount("/models", ModelFiles(directory=static / "models"), name="models")
 
         @application.get("/", include_in_schema=False)
         async def index():

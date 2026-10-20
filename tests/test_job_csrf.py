@@ -26,16 +26,21 @@ def application(monkeypatch):
     return main.create_app()
 
 
+MANUAL_ROUTES = ["/api/dashboard/measurements", "/api/dashboard/workouts"]
+
+
 def test_interactive_api_docs_expose_job_request_header(application):
     paths = application.openapi()["paths"]
-    for path in ["/sync/all", "/sync/{data_type}", "/backfill/start"]:
+    for path in ["/sync/all", "/sync/{data_type}", "/backfill/start", *MANUAL_ROUTES]:
         parameters = paths[path]["post"]["parameters"]
         header = next(item for item in parameters if item["name"] == "X-HealthOS-Request")
         assert header["in"] == "header"
         assert header["schema"]["examples"] == ["1"]
 
 
-@pytest.mark.parametrize("path", ["/sync/all", "/sync/steps", "/backfill/start?data_type=steps"])
+@pytest.mark.parametrize(
+    "path", ["/sync/all", "/sync/steps", "/backfill/start?data_type=steps", *MANUAL_ROUTES]
+)
 @pytest.mark.parametrize(
     "headers",
     [
@@ -79,6 +84,22 @@ async def test_explicit_local_client_can_start_jobs(application, path, headers):
         response = await client.post(path, headers=headers)
     assert response.status_code == 202
     assert len(application.state.runtime.spawned) == 1
+
+
+@pytest.mark.parametrize("path", MANUAL_ROUTES)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-HealthOS-Request": "1"},
+        {"X-HealthOS-Request": "1", "Origin": "http://localhost:8000"},
+    ],
+)
+async def test_manual_entries_pass_csrf_with_explicit_header(application, path, headers):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://localhost:8000"
+    ) as client:
+        response = await client.post(path, headers=headers, json={})
+    assert response.status_code == 422  # past the CSRF gate, rejected by body validation
 
 
 @pytest.mark.parametrize("url", ["http://localhost:80", "http://[::1]:8000"])
