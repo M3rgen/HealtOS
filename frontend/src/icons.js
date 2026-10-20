@@ -25,8 +25,6 @@ const icons = {
   'chat-new': '<path d="M20.5 6.5v9a2 2 0 0 1-2 2H8l-4.5 3v-14a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2Z"/><path d="M8 11h8m-4-4v8"/>',
   'chevron-down': '<path d="m7 9.5 5 5 5-5"/>',
   'chevron-up': '<path d="m7 14.5 5-5 5 5"/>',
-  'chevron-left': '<path d="m14.5 7-5 5 5 5"/>',
-  'chevron-right': '<path d="m9.5 7 5 5-5 5"/>',
   // Not in the lane C set; drawn on the same grid and stroke.
   brush: '<path d="M14.5 5.5 18.5 9.5M20 4a1.4 1.4 0 0 0-2 0l-8.5 8.5 2 2L20 6a1.4 1.4 0 0 0 0-2Z"/><path d="M9.5 12.5c-2 0-3.5 1.5-3.5 3.5 0 1.5-1 2.5-2.5 2.5 1 1.5 2.8 2 4.5 2a4 4 0 0 0 3.5-6"/>',
   external: '<path d="M14 4.5h5.5V10m0-5.5L11 13m6 1v4.5a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 4 18.5v-10A1.5 1.5 0 0 1 5.5 7H10"/>',
@@ -34,8 +32,6 @@ const icons = {
 };
 // Data keys and earlier names that map onto the set.
 const aliases = {shoe: 'steps', moon: 'sleep', body_fat: 'body-fat', asclepius: 'umay'};
-
-export function registerIcons(map) { Object.assign(icons, map); }
 
 export function iconMarkup(name) {
   const icon = icons[aliases[name] || name] || '';
