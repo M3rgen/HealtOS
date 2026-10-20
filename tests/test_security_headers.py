@@ -63,7 +63,7 @@ async def test_dashboard_policy(application):
 @pytest.mark.parametrize(
     "host, expected",
     [
-        ("localhost:18080", "ws://localhost:18080"),  # SSH tunnel on another local port
+        ("localhost:18080", "ws://localhost:18080"),  # example SSH tunnel on another local port
         ("127.0.0.1:8000", "ws://127.0.0.1:8000"),
         ("LOCALHOST", "ws://localhost"),
         ("healthos.localhost:8000", "ws://healthos.localhost:8000"),
