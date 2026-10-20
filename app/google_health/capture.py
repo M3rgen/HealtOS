@@ -1,11 +1,13 @@
 """Every HTTP response body received from the Google Health API, as received.
 
 The client records one :class:`CapturedResponse` per HTTP exchange that produced a
-response (success, error status, retry, or a body cut off by a timeout): the entity body
-byte for byte, the request (method, path, query string, JSON body: never a header, so
-never a token), the status and a few response headers. Pages travel with their records
-and are stored in the same transaction (``app.services.storage.store_page``); everything
-else (failures, identity, devices, probes) goes to a :class:`ResponseArchive`.
+response (success, error status, retry, or a body cut off by a timeout): the body bytes
+exactly as they came off the wire (a compressed body stays compressed; its
+``content-encoding`` header is kept), the request (method, path, query string, JSON body:
+never a header, so never a token), the status and a few response headers. Pages travel
+with their records and are stored in the same transaction
+(``app.services.storage.store_page``); everything else (failures, identity, devices,
+probes) goes to a :class:`ResponseArchive`.
 """
 
 from __future__ import annotations

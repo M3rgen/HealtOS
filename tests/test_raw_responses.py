@@ -341,3 +341,52 @@ async def test_verify_reports_a_redefined_sqlite_guard(sessions) -> None:
         assert await verify_guards(session) == [
             "protective trigger raw_api_responses.raw_api_responses_no_delete was redefined"
         ]
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+def test_a_compressed_response_is_kept_as_it_came_off_the_wire(
+    tmp_path, monkeypatch, encoding
+) -> None:
+    import gzip
+    import hashlib
+    import zlib
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'wire.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    decoded = body(steps(7))
+    wire = gzip.compress(decoded, mtime=0) if encoding == "gzip" else zlib.compress(decoded)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Sent compressed although the client asked for identity; a stream, as on a socket.
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json", "content-encoding": encoding},
+            stream=httpx.ByteStream(wire),
+        )
+
+    async def fetch() -> RawApiResponse:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        start = datetime(2026, 8, 17, tzinfo=UTC)
+        page = await client(handler).list_data_points(SPEC, start, start + timedelta(hours=1))
+        assert page.data_points == [steps(7)]  # parsed from the decoded body
+        async with sessions.begin() as session:
+            await store_page(session, SPEC, page)
+        (row,) = await stored(sessions)
+        async with sessions() as session:
+            assert await verify_responses(session) == (1, [])
+        return row
+
+    row = asyncio.run(fetch())
+    assert row.body == wire and row.body != decoded
+    assert row.body_sha256 == hashlib.sha256(wire).hexdigest()
+    assert row.body_size == len(wire)
+    assert row.headers["content-encoding"] == encoding and row.complete and row.error is None
+    monkeypatch.setattr(cli, "SessionLocal", sessions)
+    target = tmp_path / "page.bin"
+    exported = CliRunner().invoke(cli.app, ["export-response", "1", "--output", str(target)])
+    assert exported.exit_code == 0, exported.output
+    assert target.read_bytes() == wire
+    assert f'"content_encoding": "{encoding}"' in exported.output
+    asyncio.run(engine.dispose())

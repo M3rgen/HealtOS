@@ -189,10 +189,13 @@ class GoogleHealthClient:
             except httpx.TransportError as exc:
                 failure: Exception | None = exc
             else:
-                # Every response is kept, also an error status or a body cut off midway.
-                body, failure = await _read_body(response)
+                # Every response is kept, also an error status or a body cut off midway:
+                # the bytes as they came off the wire (still compressed if the server
+                # ignored Accept-Encoding: identity); `body` is the decoded entity.
+                wire, cut_off = await _read_body(response)
+                body, failure = _decode(wire, response.headers, cut_off)
                 captured.append(
-                    _capture(request, response, body, failure, len(captured), data_type)
+                    _capture(request, response, wire, cut_off, failure, len(captured), data_type)
                 )
             if failure is not None or response is None:
                 exc = failure
@@ -285,23 +288,47 @@ def _backoff(attempt: int) -> float:
 
 
 async def _read_body(response: httpx.Response) -> tuple[bytes, Exception | None]:
-    """The body as received; a connection that fails mid-body still yields what arrived."""
+    """The body bytes as received on the wire, before any Content-Encoding is undone.
+
+    A connection that fails mid-body still yields what arrived.
+    """
     chunks: list[bytes] = []
     failure: Exception | None = None
     try:
-        async for chunk in response.aiter_bytes():
-            chunks.append(chunk)
-    except (httpx.TransportError, httpx.DecodingError) as exc:
+        try:
+            async for chunk in response.aiter_raw():
+                chunks.append(chunk)
+        except httpx.StreamConsumed:
+            # A response built in memory (httpx.MockTransport) read itself on creation;
+            # its stream still holds the bytes exactly as given.
+            chunks = [chunk async for chunk in response.stream]  # type: ignore[union-attr]
+    except httpx.TransportError as exc:
         failure = exc
     finally:
         await response.aclose()
     return b"".join(chunks), failure
 
 
+def _decode(
+    wire: bytes, headers: httpx.Headers, failure: Exception | None
+) -> tuple[bytes, Exception | None]:
+    """The entity body with the response's Content-Encoding (gzip, deflate, ...) undone."""
+    encoding = headers.get("content-encoding")
+    if failure is not None or not encoding or encoding.strip().lower() == "identity":
+        return wire, failure
+    try:
+        return httpx.Response(
+            200, headers={"content-encoding": encoding}, content=wire
+        ).content, None
+    except httpx.DecodingError as exc:
+        return b"", exc
+
+
 def _capture(
     request: httpx.Request,
     response: httpx.Response,
-    body: bytes,
+    wire: bytes,
+    cut_off: Exception | None,
     failure: Exception | None,
     attempt: int,
     data_type: str | None,
@@ -319,8 +346,10 @@ def _capture(
         attempt=attempt,
         status_code=response.status_code,
         headers=kept_headers(response.headers),
-        body=body,
-        complete=failure is None,
+        body=wire,
+        # The wire bytes are complete unless the connection failed mid-body; `error` also
+        # names a body that arrived whole but could not be decoded.
+        complete=cut_off is None,
         error=type(failure).__name__ if failure is not None else None,
     )
 

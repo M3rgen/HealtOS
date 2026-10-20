@@ -551,10 +551,14 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 number spellings). What Google actually sent is kept separately: every HTTP response the client
 receives from the Google Health API, one row per exchange, in **`raw_api_responses`**:
 
-- `body`: the entity body exactly as received (the client asks for `Accept-Encoding: identity`,
-  so these are the bytes on the wire; PostgreSQL's TOAST compresses the column losslessly on
-  disk), `body_sha256` and `body_size` over exactly those bytes, `complete = false` and `error`
-  (e.g. `ReadTimeout`) when the connection broke mid-body: what arrived is still stored.
+- `body`: the body bytes exactly as they came off the wire. The client asks for
+  `Accept-Encoding: identity`; should a response arrive compressed anyway, the compressed bytes
+  are stored, its `content-encoding` header is kept (and shown as `content_encoding` by
+  `health-mirror responses` / `export-response`), and only the parser sees the decoded JSON.
+  PostgreSQL's TOAST compresses the column losslessly on disk. `body_sha256` and `body_size` are
+  over exactly the stored bytes; `complete = false` and `error` (e.g. `ReadTimeout`) when the
+  connection broke mid-body: what arrived is still stored. `export-response` writes the stored
+  bytes unchanged (pipe a `gzip` one through `gzip -dc` to read it).
 - The request: `method`, `path`, `query` (the query string as sent, including `pageToken`, a
   pagination cursor) and `request_body` (the JSON of rollUp requests). Request headers are never
   stored, so neither is the access token; a credential-like query parameter would be dropped.

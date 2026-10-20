@@ -104,6 +104,9 @@ def describe(response: RawApiResponse) -> dict[str, Any]:
         "attempt": response.attempt,
         "status_code": response.status_code,
         "headers": response.headers,
+        # The body is stored as it came off the wire: still compressed when this is set
+        # (decode with e.g. `gzip -dc`); body_sha256/body_size are over those bytes.
+        "content_encoding": (response.headers or {}).get("content-encoding"),
         "body_sha256": response.body_sha256,
         "body_size": response.body_size,
         "complete": response.complete,
