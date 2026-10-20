@@ -7,6 +7,7 @@ import { setupCalendar } from './calendar.js';
 import { setupHistoryPanel } from './history-panel.js';
 import { setupWorkouts } from './workouts.js';
 import { setupAppearance } from './appearance.js';
+import { request } from './api.js';
 
 renderIcons();
 setupAppearance();
@@ -70,7 +71,7 @@ let data = null,
   activePage = 'overview',
   poll = null;
 let selectedDate = null;
-const motion = true;
+const motion = readPreference('healtos.motion', 'true') === 'true';
 $('timezone').querySelector('option[value="auto"]').textContent = `Cihaz saati (${deviceZone})`;
 if (![...$('timezone').options].some(option => option.value === zoneChoice))
   $('timezone').add(new Option(zoneChoice, zoneChoice));
@@ -112,21 +113,6 @@ function clearSyncNotice(includeStart = false) {
     $('notice').hidden = true;
     $('notice').textContent = '';
   }
-}
-async function request(url, options = {}) {
-  const response = await fetch(url, { ...options, cache: 'no-store', signal: AbortSignal.timeout(20000) });
-  const payload = await response.json();
-  if (!response.ok) {
-    const detail = payload.detail;
-    throw new Error(
-      typeof detail === 'string'
-        ? detail
-        : Array.isArray(detail)
-          ? detail.map(x => x.msg).join(' ')
-          : 'İşlem tamamlanamadı.',
-    );
-  }
-  return payload;
 }
 function query() {
   return new URLSearchParams({ days: 7, timezone: zone, ...(selectedDate ? { end_date: selectedDate } : {}) });
@@ -353,8 +339,10 @@ async function loadMeasurements() {
     $('measurement-rows').innerHTML = rows.length
       ? rows
           .map(
-            row =>
-              `<tr><td>${escape(fullDate(row.measured_at))} ${escape(timeOf(row.measured_at))}</td><td><span class="cell-icon">${iconMarkup(row.metric)}</span>${metrics[row.metric][0]}</td><td>${num(row.value, 2)} ${metrics[row.metric][1]}</td><td>Manuel</td></tr>`,
+            row => {
+              const [label, unit] = metrics[row.metric] ?? [row.metric ?? '?', ''];
+              return `<tr><td>${escape(fullDate(row.measured_at))} ${escape(timeOf(row.measured_at))}</td><td><span class="cell-icon">${iconMarkup(row.metric)}</span>${escape(label)}</td><td>${num(row.value, 2)} ${escape(unit)}</td><td>Manuel</td></tr>`;
+            },
           )
           .join('')
       : '<tr><td colspan="4">Henüz manuel ölçüm yok. Ölçüm ekleyerek başlayabilirsin.</td></tr>';

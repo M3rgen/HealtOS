@@ -150,16 +150,12 @@ export function setupMetricHistory(getTimezone) {
     }
   }
 
-  document.querySelectorAll('[data-history-metric]').forEach(card => {
-    function open() {
-      opener = card;
+  document.querySelectorAll('[data-history-metric]').forEach(button => {
+    button.addEventListener('click', () => {
+      opener = button;
       if (!dialog.open) dialog.showModal();
       document.body.classList.add('metric-history-open');
-      load(card.dataset.historyMetric);
-    }
-    card.addEventListener('click', open);
-    card.addEventListener('keydown', event => {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+      load(button.dataset.historyMetric);
     });
   });
   document.querySelectorAll('[data-history-tab]').forEach(el => el.addEventListener('click', () => load(el.dataset.historyTab)));

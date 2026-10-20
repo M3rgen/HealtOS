@@ -164,9 +164,9 @@ main{width:100%;margin:0;padding:20px 20px 30px}.overview-grid{display:grid;grid
 #overview .history-heading{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
 #overview .history-heading>div:first-child{grid-column:2;text-align:center}
 #overview .history-actions{grid-column:3;justify-self:end}
-.metric-card[role="button"]{cursor:pointer;transition:border-color .15s}
-.metric-card[role="button"]:hover{border-color:var(--amber)}
-.metric-card[role="button"]:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
+/* Each card's history button covers the whole card; the heading and values stay outside it. */
+.metric-card{position:relative;cursor:pointer}
+.metric-open{position:absolute;inset:0;z-index:1;width:100%;height:100%;margin:0;padding:0;border:0;border-radius:inherit;background:transparent;color:inherit;cursor:pointer}
 body.metric-history-open{overflow:hidden}
 #metric-history-dialog{width:min(1080px,calc(100vw - 48px));height:min(760px,calc(100dvh - 64px));max-width:none;max-height:none;padding:24px;background:var(--surface);border:1px solid var(--line);border-radius:14px;color:var(--text);--metric-accent:var(--step-chart)}
 #metric-history-dialog[open]{display:flex;flex-direction:column;gap:14px}
@@ -379,10 +379,10 @@ nav{gap:6px}
 
 /* Metric cards */
 .metric-card{background:linear-gradient(180deg,color-mix(in srgb,currentColor 6%,transparent),transparent 58%),var(--surface-sheen),var(--surface)}
-.metric-card[role="button"]{transition:border-color var(--dur) var(--ease-out),box-shadow var(--dur) var(--ease-out),transform var(--dur) var(--ease-out)}
-.metric-card[role="button"]:hover{border-color:color-mix(in srgb,currentColor 40%,transparent);box-shadow:var(--shadow-2),0 0 0 1px color-mix(in srgb,currentColor 10%,transparent);transform:translateY(-2px)}
-.metric-card[role="button"]:active{transform:translateY(0) scale(.992);transition-duration:80ms}
-.metric-card[role="button"]:focus-visible{outline:2px solid color-mix(in srgb,currentColor 75%,var(--amber));outline-offset:2px}
+.metric-card{transition:border-color var(--dur) var(--ease-out),box-shadow var(--dur) var(--ease-out),transform var(--dur) var(--ease-out)}
+.metric-card:hover{border-color:color-mix(in srgb,currentColor 40%,transparent);box-shadow:var(--shadow-2),0 0 0 1px color-mix(in srgb,currentColor 10%,transparent);transform:translateY(-2px)}
+.metric-card:has(>.metric-open:active){transform:translateY(0) scale(.992);transition-duration:80ms}
+.metric-open:focus-visible{outline:2px solid color-mix(in srgb,currentColor 75%,var(--amber));outline-offset:2px;border-radius:inherit}
 .metric-top h3{color:color-mix(in srgb,var(--text) 82%,var(--muted));font-weight:550}
 .metric-top strong{font-weight:660;letter-spacing:-.035em}
 #overview .metric-top .metric-icon{width:26px;height:26px;padding:5px;margin-right:7px;border-radius:8px;background:color-mix(in srgb,currentColor 14%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 16%,transparent)}
@@ -551,7 +551,7 @@ dialog[open]{animation:dialog-in var(--dur) var(--ease-out)}
 /* --- Page transitions ---------------------------------------------------------- */
 .page:not([hidden]){animation:page-in 260ms var(--ease-out)}
 @keyframes page-in{from{opacity:0}}
-@media(prefers-reduced-motion:reduce){.status-text.good:before{animation:none}.metric-card[role="button"]:hover{transform:none}}
+@media(prefers-reduced-motion:reduce){.status-text.good:before{animation:none}.metric-card:hover{transform:none}}
 
 /* Polish fixes: icon chips, profile label, compact pills, launcher clearance. */
 #overview .metric-top .metric-icon svg{width:100%;height:100%;margin:0}

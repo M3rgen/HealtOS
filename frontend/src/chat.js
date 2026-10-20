@@ -10,6 +10,9 @@ export function setupChat(getTimezone) {
   const dialog = $('assistant-dialog');
   let drag = null, suppressClick = false, movedLauncher = false;
   let retryTimer = null, retryDelay = 1000, pageLeaving = false;
+  // The socket opens only once Umay is first opened; automatic retries stop after MAX_RETRIES.
+  const MAX_RETRIES = 5;
+  let started = false, retries = 0;
 
   function placeDialog() {
     if (dialog.hidden) return;
@@ -120,7 +123,12 @@ export function setupChat(getTimezone) {
     return content;
   }
 
-  function connect() {
+  function connect({ automatic = false } = {}) {
+    started = true;
+    if (!automatic) {
+      retries = 0;
+      retryDelay = 1000;
+    }
     clearTimeout(retryTimer);
     retryTimer = null;
     if (socket) {
@@ -140,9 +148,10 @@ export function setupChat(getTimezone) {
       const event = JSON.parse(data);
       if (event.type === 'ready') {
         connected = true;
+        retries = 0;
         retryDelay = 1000;
         error('');
-        state(`Bağlı · ${event.model} · ${event.effort}`);
+        state('');
         if (!dialog.hidden) $('assistant-input').focus();
       } else if (event.type === 'working') {
         busy = true;
@@ -175,11 +184,15 @@ export function setupChat(getTimezone) {
       waiting = false;
       state('Çevrimdışı');
       $('assistant-reconnect').hidden = false;
-      if (!pageLeaving) {
-        if (!$('assistant-error').textContent) error('Bağlantı kesildi. Umay otomatik yeniden bağlanıyor…');
-        retryTimer = setTimeout(connect, retryDelay);
-        retryDelay = Math.min(retryDelay * 2, 30000);
+      if (pageLeaving) return;
+      if (retries >= MAX_RETRIES) {
+        error('Umay şu an çevrimdışı. Biraz sonra yeniden bağlanmayı dene.');
+        return;
       }
+      retries += 1;
+      if (!$('assistant-error').textContent) error('Bağlantı kesildi. Umay yeniden bağlanmayı deniyor…');
+      retryTimer = setTimeout(() => connect({ automatic: true }), retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 30000);
     };
     socket.onerror = () => error('Umay bağlantısına ulaşılamıyor. Otomatik yeniden denenecek.');
   }
@@ -211,8 +224,8 @@ export function setupChat(getTimezone) {
     $('assistant-dialog').hidden = false;
     placeDialog();
     $('assistant-open').setAttribute('aria-expanded', 'true');
-    if (!socket || retryTimer) connect();
-    else if (connected) $('assistant-input').focus();
+    if (connected) $('assistant-input').focus();
+    else if (!socket || socket.readyState >= WebSocket.CLOSING) connect();
   });
   $('assistant-close').addEventListener('click', () => {
     $('assistant-dialog').hidden = true;
@@ -236,10 +249,11 @@ export function setupChat(getTimezone) {
     if (connected && busy) socket.send(JSON.stringify({type: 'cancel'}));
   });
   $('assistant-new').addEventListener('click', reset);
-  $('assistant-reconnect').addEventListener('click', connect);
-  window.addEventListener('online', () => { if (!connected) connect(); });
+  $('assistant-reconnect').addEventListener('click', () => connect());
+  window.addEventListener('online', () => { if (started && !connected) connect(); });
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && !connected) connect();
+    // Coming back to the tab skips the wait of a pending retry; it does not restart a stopped one.
+    if (!document.hidden && started && !connected && retryTimer) connect({ automatic: true });
   });
   window.addEventListener('pagehide', () => {
     pageLeaving = true;
@@ -247,7 +261,8 @@ export function setupChat(getTimezone) {
     socket?.close();
   });
   window.addEventListener('pageshow', (event) => {
-    if (event.persisted) { pageLeaving = false; connect(); }
+    if (!event.persisted) return;
+    pageLeaving = false;
+    if (started) connect();
   });
-  connect();
 }
