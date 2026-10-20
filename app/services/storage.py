@@ -26,6 +26,8 @@ class StoreStats:
     unchanged: int = 0
     normalized: int = 0
     normalization_skipped: int = 0
+    # Archived records a complete window re-fetch no longer returned (see app.sync.deletions).
+    source_deleted: int = 0
 
     def add(self, other: StoreStats) -> None:
         for field in self.__dataclass_fields__:

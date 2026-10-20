@@ -15,6 +15,7 @@ from app.google_health.pagination import iter_pages
 from app.models.state import JobStatus, SyncState
 from app.services.storage import StoreStats, store_records
 from app.sync.checkpoints import incremental_start
+from app.sync.deletions import mark_source_deletions
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,9 @@ class IncrementalSync:
             state.last_requested_from = start
             state.last_requested_to = end
             state.last_page_token = page_token
+        # Only a fetch that starts at the first page sees the whole window, so only
+        # then can records that stopped appearing be marked as deleted at the source.
+        fetched_since = datetime.now(UTC) if page_token is None else None
         async for page in iter_pages(self.client, spec, start, end, page_token):
             async with self.sessions.begin() as session:
                 total.add(await store_records(session, spec, page.data_points))
@@ -174,6 +178,10 @@ class IncrementalSync:
                 max(_utc(previous_success), end) if previous_success else end
             )
             state.last_page_token = None
+            if fetched_since is not None:
+                total.source_deleted += await mark_source_deletions(
+                    session, spec, start, end, fetched_since
+                )
 
     async def run_all(self) -> dict[str, StoreStats | Exception]:
         semaphore = asyncio.Semaphore(self.settings.sync_concurrency)
