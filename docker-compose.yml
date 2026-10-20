@@ -15,6 +15,20 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # The entrypoint starts as root, fixes data-directory ownership and switches to
+    # the postgres user with su-exec; these are the only capabilities that needs.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    # read_only is not enabled yet: the image writes /var/run/postgresql and /tmp
+    # and has not been verified here with a read-only root plus tmpfs mounts.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U health -d health"]
       interval: 5s
@@ -83,6 +97,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     entrypoint:
       - /bin/sh
       - -c

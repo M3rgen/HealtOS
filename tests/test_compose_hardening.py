@@ -50,3 +50,21 @@ def test_app_resolves_host_gateway_and_repo_has_no_wildcard_bridge():
 
     assert "host.docker.internal:host-gateway" in COMPOSE["services"]["app"]["extra_hosts"]
     assert check_codex_bridge_binding() == []
+
+
+def test_postgres_and_backup_drop_capabilities():
+    postgres = COMPOSE["services"]["postgres"]
+    assert postgres["cap_drop"] == ["ALL"]
+    assert set(postgres["cap_add"]) <= {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}
+    assert "no-new-privileges:true" in postgres["security_opt"]
+    backup = COMPOSE["services"]["backup"]
+    assert backup["cap_drop"] == ["ALL"] and backup["read_only"] is True
+    assert "volumes" not in backup
+
+
+def test_alembic_ini_holds_no_database_url():
+    import configparser
+
+    parser = configparser.ConfigParser()
+    parser.read(ROOT / "alembic.ini", encoding="utf-8")
+    assert parser["alembic"]["sqlalchemy.url"] == ""

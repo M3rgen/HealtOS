@@ -229,6 +229,15 @@ def main() -> int:
         if not any(option.split(":", 1)[0] == "no-new-privileges" for option in security_options):
             raise RuntimeError("Application container lacks no-new-privileges")
 
+        postgres_container_id = compose(
+            "ps", "--quiet", "postgres", env=env, capture=True
+        ).stdout.strip()
+        postgres_host_config = json.loads(
+            docker("inspect", postgres_container_id, env=env, capture=True).stdout
+        )[0]["HostConfig"]
+        if "ALL" not in (postgres_host_config.get("CapDrop") or []):
+            raise RuntimeError("PostgreSQL container did not drop all Linux capabilities")
+
         backup_env = {**env, **backup_key_env()}
         backup_path = Path(
             subprocess.run(

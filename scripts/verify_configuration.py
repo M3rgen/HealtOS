@@ -93,9 +93,33 @@ def check_compose_runtime(compose_doc: object, dev_doc: object) -> list[str]:
             or not options.get("max-file")
         ):
             errors.append(f"{name} service lacks json-file log rotation (max-size, max-file)")
+    postgres = compose_service(compose_doc, "postgres")
+    if "ALL" not in (postgres.get("cap_drop") or []):
+        errors.append("postgres service must drop all Linux capabilities (cap_drop: [ALL])")
     dev_app = compose_service(dev_doc, "app")
     if service_environment(dev_app).get("APP_ENV") != "development":
         errors.append("docker-compose.dev.yml must override APP_ENV with development")
+    return errors
+
+
+def check_small_hardening() -> list[str]:
+    errors: list[str] = []
+    keyset_default = re.search(
+        r'google_health_webhook_public_key_url: str = \(\s*"([^"]+)"',
+        (ROOT / "app" / "core" / "config.py").read_text(encoding="utf-8"),
+    )
+    if not keyset_default or not keyset_default.group(1).startswith("https://www.gstatic.com/"):
+        errors.append("the default webhook keyset URL must be on https://www.gstatic.com/")
+    template_keyset = parse_env(ROOT / ".env.example").get("GOOGLE_HEALTH_WEBHOOK_PUBLIC_KEY_URL")
+    if template_keyset and not template_keyset.startswith("https://www.gstatic.com/"):
+        errors.append(".env.example webhook keyset URL must be on https://www.gstatic.com/")
+    alembic_url = re.search(
+        r"^sqlalchemy\.url\s*=(.*)$",
+        (ROOT / "alembic.ini").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if alembic_url and alembic_url.group(1).strip():
+        errors.append("alembic.ini sqlalchemy.url must be empty; env.py sets it from DATABASE_URL")
     return errors
 
 
@@ -203,6 +227,7 @@ def check_repository() -> list[str]:
         errors.append("Compose verifier must explicitly disable all schedulers")
     errors.extend(check_backup_automation(compose_doc, verifier))
     errors.extend(check_codex_bridge_binding())
+    errors.extend(check_small_hardening())
     cloudflare = (ROOT / "deploy" / "cloudflare" / "config.example.yml").read_text(encoding="utf-8")
     if "http_status:404" not in cloudflare:
         errors.append("Cloudflare example lacks a deny-by-default final rule")
