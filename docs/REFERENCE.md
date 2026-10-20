@@ -300,7 +300,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 | `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` | Exact secret header value configured for the subscriber, e.g. `Bearer …` |
 | `GOOGLE_HEALTH_WEBHOOK_PUBLIC_KEY_URL` | Google's permanent public signing keyset URL |
 | `WEBHOOK_HOST` | Public DNS hostname used by the optional self-hosted Caddy TLS profile |
-| `BACKUP_HOST_DIR`, `BACKUP_RETENTION_DAYS`, `BACKUP_MIN_FREE_MB` | Host directory for encrypted dumps; opt-in retention in days (default: empty, keep forever; only a positive number deletes); free-space guard in MiB (default: twice the newest dump, at least 1 GiB, or 5 GiB before the first dump); read by `scripts/backup.sh` |
+| `BACKUP_HOST_DIR`, `BACKUP_RETENTION_DAYS`, `BACKUP_MIN_FREE_MB` | Host directory for encrypted dumps; opt-in retention in days (default: empty, keep forever; only a positive whole number deletes, anything else keeps everything; set in the environment, even empty, it overrides `.env`); free-space guard in MiB (default: twice the newest dump, at least 1 GiB, or 5 GiB before the first dump); read by `scripts/backup.sh` |
 | `BACKFILL_START_DATE`, `BACKFILL_WINDOW_DAYS` | Earliest attempted history and checkpoint window size |
 | `GOOGLE_API_PAGE_SIZE`, `GOOGLE_API_MAX_RETRIES` | Page and exponential retry policy |
 | `EXTRA_DATA_TYPES` | Comma-separated evolving v4 data types; defaults to interval filtering |
@@ -839,9 +839,12 @@ runs [`scripts/backup.sh`](../scripts/backup.sh) on the Docker host:
    `BACKUP_HOST_DIR/health-<UTC stamp>.dump.age` (or `.dump.gpg`);
 3. the result is written to `BACKUP_HOST_DIR/last-backup-status.json`, on success and on failure.
 
-**Backups are kept forever.** The script deletes nothing unless `BACKUP_RETENTION_DAYS` is set to a
-positive number of days; then, and only after a successful new backup, `health-*` dumps older than
-that are removed. Empty, `0` or `never` mean never delete; a large value such as `36500` also works.
+**Backups are kept forever.** The script deletes nothing unless `BACKUP_RETENTION_DAYS` is
+explicitly set to a positive whole number of days; then, and only after a successful new backup,
+`health-*` dumps older than that are removed. Anything else deletes nothing: unset, empty, `0`,
+`never`, a negative number or any other text (that last one is reported on stderr, and the backup
+still runs). The environment wins over `.env` whenever the variable is set there, even to an empty
+value; `.env` is read only when it is not. A large value such as `36500` also works.
 
 **Free space.** Before dumping, the script checks the free space of `BACKUP_HOST_DIR`. If it is
 below `BACKUP_MIN_FREE_MB` (default: twice the newest dump, at least 1 GiB; 5 GiB before the first

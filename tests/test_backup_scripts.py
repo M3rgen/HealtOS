@@ -164,28 +164,68 @@ def test_unset_zero_never_and_36500_retention_delete_nothing(sandbox, value):
     assert status(sandbox)["pruned_files"] == 0
 
 
-@needs_gpg
-def test_retention_from_env_file_36500_is_accepted(sandbox, tmp_path: Path):
+def run_with_env_file(
+    tmp_path: Path, env: dict[str, str], content: str
+) -> subprocess.CompletedProcess[str]:
     # .env lives in the repository root; simulate it through a copy of the script tree.
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True)
     shutil.copy(ROOT / "scripts" / "backup.sh", tree / "scripts" / "backup.sh")
-    (tree / ".env").write_text("BACKUP_RETENTION_DAYS=36500\n", encoding="utf-8")
-    backups = Path(sandbox["BACKUP_HOST_DIR"])
-    dumps, _ = old_dumps(backups, days=400)
-    write_key(sandbox)
-
-    result = subprocess.run(
+    (tree / ".env").write_text(content, encoding="utf-8")
+    return subprocess.run(
         [BASH, str(tree / "scripts" / "backup.sh")],
-        env=sandbox,
+        env=env,
         text=True,
         capture_output=True,
         check=False,
     )
 
+
+@needs_gpg
+def test_retention_from_env_file_36500_is_accepted(sandbox, tmp_path: Path):
+    backups = Path(sandbox["BACKUP_HOST_DIR"])
+    dumps, _ = old_dumps(backups, days=400)
+    write_key(sandbox)
+
+    result = run_with_env_file(tmp_path, sandbox, "BACKUP_RETENTION_DAYS=36500\n")
+
     assert result.returncode == 0, result.stderr
     assert all(path.exists() for path in dumps)
     assert status(sandbox)["retention_days"] == "36500"
+
+
+@needs_gpg
+def test_a_positive_retention_in_env_file_prunes(sandbox, tmp_path: Path):
+    backups = Path(sandbox["BACKUP_HOST_DIR"])
+    dumps, others = old_dumps(backups)
+    write_key(sandbox)
+
+    result = run_with_env_file(tmp_path, sandbox, "BACKUP_RETENTION_DAYS=7\n")
+
+    assert result.returncode == 0, result.stderr
+    assert not any(path.exists() for path in dumps)
+    assert all(path.exists() for path in others)
+    assert status(sandbox)["retention_days"] == "7"
+
+
+@needs_gpg
+@pytest.mark.parametrize("value", ["", "0", "never"])
+def test_an_explicit_empty_or_never_environment_value_overrides_env_file(
+    sandbox, tmp_path: Path, value
+):
+    # An empty BACKUP_RETENTION_DAYS in the environment used to fall back to .env's 7.
+    backups = Path(sandbox["BACKUP_HOST_DIR"])
+    dumps, others = old_dumps(backups)
+    write_key(sandbox)
+
+    result = run_with_env_file(
+        tmp_path, {**sandbox, "BACKUP_RETENTION_DAYS": value}, "BACKUP_RETENTION_DAYS=7\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert all(path.exists() for path in (*dumps, *others))
+    report = status(sandbox)
+    assert report["retention_days"] == "never" and report["pruned_files"] == 0
 
 
 @needs_gpg
@@ -207,19 +247,23 @@ def test_explicit_positive_retention_prunes_only_old_health_dumps(sandbox):
     assert report["retention_days"] == "7" and report["pruned_files"] == len(dumps)
 
 
-@pytest.mark.parametrize("value", ["-5", "abc", "7d"])
-def test_invalid_retention_fails_and_deletes_nothing(sandbox, value):
+@needs_gpg
+@pytest.mark.parametrize("value", ["-5", "abc", "7d", " 7", "1e3", "99999999999999999999"])
+def test_any_other_retention_value_keeps_every_backup(sandbox, value):
+    # Neither deletes nor stops the backup: a typo must not cost a night's backup.
     backups = Path(sandbox["BACKUP_HOST_DIR"])
     dumps, others = old_dumps(backups)
     write_key(sandbox)
 
     result = run("backup.sh", {**sandbox, "BACKUP_RETENTION_DAYS": value})
 
-    assert result.returncode != 0
-    assert "BACKUP_RETENTION_DAYS" in result.stderr
+    assert result.returncode == 0, result.stderr
     assert all(path.exists() for path in (*dumps, *others))
-    assert not Path(sandbox["FAKE_DOCKER_LOG"]).exists()
-    assert status(sandbox)["result"] == "failure"
+    report = status(sandbox)
+    assert report["result"] == "success"
+    assert report["retention_days"] == "never" and report["pruned_files"] == 0
+    if len(value) <= 9:
+        assert "keeping every backup" in result.stderr
 
 
 def test_low_disk_refuses_to_start_writes_nothing_and_deletes_nothing(sandbox):

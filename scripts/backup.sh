@@ -14,8 +14,10 @@
 #   manager: without it every backup is unreadable.
 #
 # Backups are kept forever. Nothing is ever deleted unless BACKUP_RETENTION_DAYS
-# is explicitly set to a positive number of days; unset, empty, 0 or "never"
-# means never delete. Old backups are never deleted to make room.
+# is explicitly set (environment, else .env) to a positive whole number of days;
+# unset, empty, 0, "never" or anything else means never delete (a value set in
+# the environment, even empty, overrides .env). Old backups are never deleted to
+# make room.
 #
 # Free-space guard: the script refuses to start (exit 1, no file written) when
 # the backup directory has less free space than BACKUP_MIN_FREE_MB, or by
@@ -133,14 +135,29 @@ fail() {
   exit 1
 }
 
-# Retention is opt-in. 36500 (about 100 years) is accepted and is effectively never.
-retention_days="$(setting BACKUP_RETENTION_DAYS)"
+# Retention is opt-in: old dumps are deleted only when BACKUP_RETENTION_DAYS is a
+# positive whole number of days. Set in the environment (even to an empty value), the
+# environment wins and .env is not read; otherwise .env decides. Anything else (unset,
+# empty, 0, never, negative, not a number) deletes nothing; an unrecognised value only
+# warns, so a typo can neither delete backups nor stop them. 36500 (about 100 years)
+# works and is effectively never.
+if [ -n "${BACKUP_RETENTION_DAYS+set}" ]; then
+  retention_days="$BACKUP_RETENTION_DAYS"
+else
+  retention_days="$(env_file_value BACKUP_RETENTION_DAYS)"
+fi
 case "$(printf '%s' "$retention_days" | tr '[:upper:]' '[:lower:]')" in
-  '' | 0 | never) retention_days="" ;;
-  *[!0-9]*) fail "BACKUP_RETENTION_DAYS must be empty, 0 or never (keep forever), or a whole number of days" ;;
-  *) retention_days="$((10#$retention_days))" ;;
+  '' | never | *[!0-9]*)
+    case "$retention_days" in
+      '' | [Nn][Ee][Vv][Ee][Rr]) ;;
+      *) echo "backup: BACKUP_RETENTION_DAYS='$retention_days' is not a positive whole number of days; keeping every backup" >&2 ;;
+    esac
+    retention_days="" ;;
+  *)
+    retention_days="$(printf '%s' "$retention_days" | sed 's/^0*//')"
+    # 0 keeps everything; more than 9 digits is beyond any lifetime (and bash arithmetic).
+    [ "${#retention_days}" -le 9 ] || retention_days="" ;;
 esac
-[ -z "$retention_days" ] || [ "$retention_days" -ge 1 ] || retention_days=""
 [ -z "$retention_days" ] || retention_label="$retention_days"
 
 min_free_mb="$(setting BACKUP_MIN_FREE_MB)"

@@ -17,7 +17,7 @@
 # backup key makes every backup unreadable.
 #
 # Backups are kept forever; nothing is deleted unless BACKUP_RETENTION_DAYS is
-# set to a positive number. A run refuses to start when the disk is short of
+# set to a positive whole number (here, even empty, it overrides .env). A run refuses to start when the disk is short of
 # space, and a failure starts healthos-backup-failure.service (logs at crit).
 # Last result: <BACKUP_HOST_DIR>/last-backup-status.json.
 [Unit]
