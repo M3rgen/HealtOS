@@ -169,11 +169,11 @@ export function setupChat(getTimezone) {
         append('assistant', event.text, event.id);
       } else if (event.type === 'done') {
         busy = false;
-        state(event.status === 'interrupted' ? 'Yanıt durduruldu' : event.status === 'failed' ? 'Soru tamamlanamadı' : 'Yeni sorunu yazabilirsin');
+        state(event.status === 'interrupted' ? 'Yanıt durduruldu' : event.status === 'failed' ? 'Yanıt tamamlanamadı' : 'Yeni sorunu yazabilirsin');
       } else if (event.type === 'error') {
         error(event.text);
         busy = false;
-        state(connected ? 'Soru tamamlanamadı' : 'Bağlantı kurulamadı');
+        state(connected ? 'Yanıt tamamlanamadı' : 'Bağlantı kurulamadı');
       } else if (event.type === 'notice') {
         error(event.text);
       }
@@ -194,7 +194,7 @@ export function setupChat(getTimezone) {
       retryTimer = setTimeout(() => connect({ automatic: true }), retryDelay);
       retryDelay = Math.min(retryDelay * 2, 30000);
     };
-    socket.onerror = () => error('Umay bağlantısına ulaşılamıyor. Otomatik yeniden denenecek.');
+    socket.onerror = () => error('Umay’a bağlanılamadı; yeniden denenecek.');
   }
 
   function reset() {
@@ -212,7 +212,7 @@ export function setupChat(getTimezone) {
     $('assistant-input').value = '';
     busy = true;
     waiting = true;
-    state('Codex düşünüyor…');
+    state('Umay düşünüyor…');
     $('assistant-messages').scrollTop = $('assistant-messages').scrollHeight;
   }
 

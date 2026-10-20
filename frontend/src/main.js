@@ -155,8 +155,8 @@ function paintHealth() {
     health.scheduler === 'running',
   );
   $('webhook-info').innerHTML = health.latest_health_write
-    ? `Son veri güncellemesi: ${escape(fullDate(health.latest_health_write))} · ${escape(timeOf(health.latest_health_write))}<small>Google’dan alınan verilerin veritabanına son kaydedildiği zaman.</small>`
-    : 'Henüz veri kaydedilmedi.<small>Verileri almak için Şimdi eşitle düğmesini kullan.</small>';
+    ? `Son veri güncellemesi: ${escape(fullDate(health.latest_health_write))} · ${escape(timeOf(health.latest_health_write))}<small>Google’dan gelen verilerin en son kaydedildiği zaman.</small>`
+    : 'Henüz veri kaydedilmedi.<small>Verileri almak için “Şimdi eşitle” düğmesine bas.</small>';
   $('queue-state').textContent =
     `${num(health.pending_notifications ?? 0)} bekleyen · ${num((health.failed_notifications ?? 0) + (health.failed_syncs ?? 0))} hata`;
   const details = [
@@ -164,7 +164,7 @@ function paintHealth() {
     ['Google yapılandırması', health.configuration === 'healthy' ? 'Hazır' : 'Eksik'],
     ['Son kontrol', health.checked_at ? `${shortDate(health.checked_at)} ${timeOf(health.checked_at)}` : '—'],
     [
-      'Son veri yazımı',
+      'Son veri kaydı',
       health.latest_health_write
         ? `${shortDate(health.latest_health_write)} ${timeOf(health.latest_health_write)}`
         : '—',
@@ -243,7 +243,7 @@ function paintData() {
   $('profile-values').innerHTML = Object.entries(metrics)
     .map(([key, [label, unit]]) => {
       const item = data.profile[key];
-      return `<div class="measurement"><label><span class="measure-icon">${iconMarkup(key)}</span>${label}</label><button data-metric="${key}" aria-label="${label} için manuel ölçüm ekle">${item ? `${num(item.value, 1)} ${unit}` : '—'}</button><small>${item ? escape(shortDate(item.measured_at)) : key === 'muscle' ? 'Manuel ölçüm' : 'Henüz ölçüm yok'}</small></div>`;
+      return `<div class="measurement"><label><span class="measure-icon">${iconMarkup(key)}</span>${label}</label><button data-metric="${key}" aria-label="${label} için manuel ölçüm ekle">${item ? `${num(item.value, 1)} ${unit}` : '—'}</button><small>${item ? escape(shortDate(item.measured_at)) : key === 'muscle' ? 'Yalnız elle girilir' : 'Henüz ölçüm yok'}</small></div>`;
     })
     .join('');
   // Drive the 3D body's morphs from the latest profile measurements (missing values keep the basis).
@@ -253,8 +253,8 @@ function paintData() {
     bodyFatPct: data.profile.body_fat?.value,
     musclePct: data.profile.muscle?.value,
   });
-  $('steps-label').textContent = first.partial ? 'Bugünkü adım' : 'Seçilen gün adım';
-  $('sleep-label').textContent = first.partial ? 'Son gece uyku' : 'Seçilen gün uyku';
+  $('steps-label').textContent = first.partial ? 'Bugünkü adım' : 'O günkü adım';
+  $('sleep-label').textContent = first.partial ? 'Dün geceki uyku' : 'O geceki uyku';
   $('steps-value').textContent = num(first.steps);
   $('sleep-value').textContent = duration(first.sleep_seconds);
   $('heart-value').textContent = first.resting_bpm == null ? '—' : `${num(first.resting_bpm)} bpm`;
@@ -359,7 +359,7 @@ async function loadMeasurements() {
             },
           )
           .join('')
-      : '<tr><td colspan="4">Henüz manuel ölçüm yok. Ölçüm ekleyerek başlayabilirsin.</td></tr>';
+      : '<tr><td colspan="4">Henüz elle girilmiş ölçüm yok. “Ölçüm ekle” ile başlayabilirsin.</td></tr>';
   } catch {
     notice('Ölçüm geçmişi alınamadı. Tekrar dene.', true);
   }
@@ -405,7 +405,7 @@ function openMeasurement(metric = 'weight') {
   const local = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   $('measurement-date').value = local;
   $('measurement-date').max = local;
-  $('input-timezone').textContent = `Bu formun saat dilimi: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
+  $('input-timezone').textContent = `Girdiğin saat ${Intl.DateTimeFormat().resolvedOptions().timeZone} saat diliminde kaydedilir.`;
   if (data?.profile[metric]) $('measurement-value').value = data.profile[metric].value;
   setBounds();
   $('measurement-dialog').showModal();
@@ -439,7 +439,7 @@ $('measurement-form').addEventListener('submit', async event => {
       }),
     });
     $('measurement-dialog').close();
-    notice('Manuel ölçüm kaydedildi.');
+    notice('Ölçüm kaydedildi.');
     await refresh();
     if (activePage === 'measurements') await loadMeasurements();
   } catch (error) {
@@ -466,7 +466,7 @@ async function watchSync() {
       .sort((a, b) => new Date(b) - new Date(a));
     if (!times[0]) return '';
     const day = fullDate(times[0]) === fullDate(new Date()) ? '' : `${shortDate(times[0])} `;
-    return ` Saatin son eşitlemesi: ${day}${timeOf(times[0])}`;
+    return ` Saatinin son eşitlemesi: ${day}${timeOf(times[0])}`;
   } catch {
     return '';
   }

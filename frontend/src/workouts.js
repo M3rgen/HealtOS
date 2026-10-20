@@ -31,7 +31,7 @@ export function setupWorkouts({request,getZone,getToday,escape,num,duration,full
     try {
       const fields = form.elements;
       const start = new Date(fields.start_time.value), end = new Date(fields.end_time.value);
-      if (end <= start || end > new Date()) throw new Error('Bitiş başlangıçtan sonra olmalı ve gelecekte olmamalı.');
+      if (end <= start || end > new Date()) throw new Error('Bitiş saati başlangıçtan sonra ve şu andan önce olmalı.');
       await request('/api/dashboard/workouts', {method:'POST',headers:{'Content-Type':'application/json','X-HealthOS-Request':'1'},body:JSON.stringify({
         exercise_type:fields.exercise_type.value,start_time:start.toISOString(),end_time:end.toISOString(),
         calories_kcal:fields.calories_kcal.value === '' ? null : Number(fields.calories_kcal.value),

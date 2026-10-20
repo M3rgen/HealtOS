@@ -3,7 +3,7 @@ import { handleUnauthorized } from './api.js';
 const metrics = {
   steps: {title: 'Adım geçmişi', average: 'Günlük ortalama', color: 'var(--step-chart)'},
   sleep: {title: 'Uyku geçmişi', average: 'Ortalama uyku', color: 'var(--sleep-light)'},
-  heart: {title: 'Dinlenik nabız geçmişi', average: 'Ortalama dinlenik nabız', color: 'var(--heart-chart)'},
+  heart: {title: 'Dinlenme nabzı geçmişi', average: 'Ortalama dinlenme nabzı', color: 'var(--heart-chart)'},
 };
 const number = (value, digits = 0) => Number(value).toLocaleString('tr-TR', {maximumFractionDigits: digits});
 const date = (value, long = false) => new Intl.DateTimeFormat('tr-TR', {
