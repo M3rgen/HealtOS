@@ -40,6 +40,35 @@ Migrations are additive (no destructive `DROP` outside `downgrade()`); some down
 undo PostgreSQL enum additions, so roll back with a restore rather than `alembic downgrade` on the
 live archive.
 
+### `20261020_0010` (raw_json json → jsonb)
+
+This one rewrites `raw_health_data`, `webhook_events` and `webhook_notifications` (and rebuilds
+their indexes) under an exclusive lock. It runs before the app serves, so the app is down until it
+finishes: expect seconds to a few minutes for a few hundred thousand raw rows, during which
+webhooks fail and Google retries them. The rewrite needs free disk of roughly the size of those
+tables. It first reads every row both ways and aborts, converting nothing, if any payload would
+read back differently as jsonb (`-0.0`, a float written as `1e+16`, a `\u0000` escape).
+
+```sh
+docker compose exec app alembic current          # expect 20261020_0009
+docker compose exec postgres psql -U health -d health \
+  -c "SELECT pg_size_pretty(pg_total_relation_size('raw_health_data'))"
+df -h /var/lib/docker
+make backup                                       # mandatory: the only exact rollback
+git pull --ff-only
+docker compose up -d --build
+docker compose logs -f app                        # wait for "Running upgrade ... 20261020_0010"
+docker compose exec app alembic current          # expect 20261020_0010 (head)
+docker compose exec app health-mirror verify     # payload hashes still match
+api /health
+```
+
+If the log shows `raw_json -> jsonb would change ...` or `unsupported Unicode escape sequence`,
+nothing was converted and the database is still on `20261020_0009`; check out the previous commit,
+rebuild, and report the listed row keys. `alembic downgrade 20261020_0009` converts back to `json`
+with every value kept, but the stored text is jsonb's spelling, not the original; restore the
+backup if the original text is needed.
+
 ## Update images and cloudflared
 
 Base images are pinned by tag and digest; follow [IMAGE_UPDATES.md](IMAGE_UPDATES.md) and change one
