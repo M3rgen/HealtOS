@@ -506,3 +506,25 @@ async def test_a_backfill_page_received_before_a_cancellation_is_kept(
     await _cancel_when(asyncio.create_task(backfill._run_job(job.id)), started)
     (row,) = await stored(sessions)
     assert row.body == body(steps(3)) and row.source == "backfill"
+
+
+async def test_gap_repair_keeps_a_page_whose_records_fail_to_store(sessions, monkeypatch) -> None:
+    import app.services.storage as storage
+    from scripts.audit_date_gaps import repair_window
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body(steps(5)))
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("normalizer bug")
+
+    monkeypatch.setattr(storage, "_upsert_normalized_many", broken)
+    start = datetime(2026, 8, 17, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="normalizer bug"):
+        await repair_window(
+            client(handler, sessions), sessions, SPEC, start, start + timedelta(days=1), "gap:1"
+        )
+    (row,) = await stored(sessions)
+    assert row.body == body(steps(5)) and row.source == "gap-repair"
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(RawHealthData)) == 0

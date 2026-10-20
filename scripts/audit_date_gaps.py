@@ -52,6 +52,28 @@ async def audit(zone, end):
         return [dict(row) for row in result.mappings()]
 
 
+async def repair_window(google, sessions, spec, start, stop, run) -> StoreStats:
+    """Re-fetch [start, stop) page by page, storing each page with its responses.
+
+    Like the sync path: if storing a page fails (or the run is cancelled), its records roll
+    back but the responses Google sent are still kept, then the error propagates.
+    """
+    stats = StoreStats()
+    cursor = start
+    while cursor < stop:
+        window_end = min(cursor + timedelta(days=spec.max_window_days or 7), stop)
+        with provenance(source="gap-repair", context_id=run):
+            async for page in iter_pages(google, spec, cursor, window_end):
+                try:
+                    async with sessions.begin() as session:
+                        stats.add(await store_page(session, spec, page, source="gap-repair"))
+                except BaseException as failure:
+                    await google.keep_after(page.responses, failure)
+                    raise
+        cursor = window_end
+    return stats
+
+
 async def main(args):
     end = datetime.now(ZoneInfo(args.timezone)).date() - timedelta(days=1)
     before = await audit(args.timezone, end)
@@ -76,18 +98,8 @@ async def main(args):
             start = datetime.combine(gap["missing_from"] - timedelta(days=1), time.min, zone)
             stop = datetime.combine(gap["missing_to"] + timedelta(days=2), time.min, zone)
             start, stop = start.astimezone(UTC), stop.astimezone(UTC)
-            stats = StoreStats()
             try:
-                cursor = start
-                while cursor < stop:
-                    window_end = min(cursor + timedelta(days=spec.max_window_days or 7), stop)
-                    with provenance(source="gap-repair", context_id=run):
-                        async for page in iter_pages(runtime.google, spec, cursor, window_end):
-                            async with SessionLocal.begin() as session:
-                                stats.add(
-                                    await store_page(session, spec, page, source="gap-repair")
-                                )
-                    cursor = window_end
+                stats = await repair_window(runtime.google, SessionLocal, spec, start, stop, run)
                 totals.add(stats)
                 print(
                     json.dumps(
