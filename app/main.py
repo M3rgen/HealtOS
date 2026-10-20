@@ -14,6 +14,7 @@ from app.core.auth import UITokenMiddleware
 from app.core.config import get_settings
 from app.core.host_validation import HostValidationMiddleware
 from app.core.logging import configure_logging, event
+from app.core.security_headers import SecurityHeadersMiddleware
 from app.db.session import SessionLocal
 from app.services.runtime import build_runtime
 from app.services.scheduler import build_scheduler
@@ -67,12 +68,13 @@ def create_app() -> FastAPI:
     )
     application.state.settings = settings
     application.state.runtime = runtime
-    # Starlette runs the last-added middleware first: host check, then the UI token.
+    # Starlette runs the last-added middleware first: headers, host check, UI token.
     application.add_middleware(UITokenMiddleware, token=settings.app_ui_token)
     application.add_middleware(
         HostValidationMiddleware,
         webhook_endpoint_uri=settings.google_health_webhook_endpoint_uri,
     )
+    application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(health.router)
     application.include_router(login.router)
     application.include_router(auth.router)

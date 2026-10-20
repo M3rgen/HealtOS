@@ -11,6 +11,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import require_job_request
 from app.db.session import get_session
 from app.models.health import ExerciseSession, SleepSession, Steps
 from app.models.manual import ManualMeasurement, ManualWorkout
@@ -64,7 +65,7 @@ def workout_dict(row, source: str) -> dict:
     }
 
 
-@router.post("/workouts", status_code=201)
+@router.post("/workouts", status_code=201, dependencies=[Depends(require_job_request)])
 async def add_workout(body: WorkoutInput, session: AsyncSession = Depends(get_session)) -> dict:
     item = ManualWorkout(**body.model_dump())
     session.add(item)
@@ -264,7 +265,7 @@ class MeasurementInput(BaseModel):
         return self
 
 
-@router.post("/measurements", status_code=201)
+@router.post("/measurements", status_code=201, dependencies=[Depends(require_job_request)])
 async def add_measurement(
     body: MeasurementInput, session: AsyncSession = Depends(get_session)
 ) -> dict:
