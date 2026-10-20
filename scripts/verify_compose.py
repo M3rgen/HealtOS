@@ -22,7 +22,29 @@ SMOKE_KEY_FILE = ROOT / f".env.compose-smoke-backup-key-{os.getpid()}"
 BASH = shutil.which("bash")
 
 
-# Runs inside the app container; APP_UI_TOKEN comes from the Compose environment.
+# Both smoke scripts run inside the app container; APP_UI_TOKEN (the throwaway token set in
+# main()) comes from the Compose environment. Every route except /health/live and the login,
+# webhook and OAuth-callback routes needs it, so each request sends it; the explicit
+# "no token -> 401" probes are the only exceptions.
+HEALTH_SMOKE_SCRIPT = "\n".join(
+    [
+        "import json, os, urllib.error, urllib.request",
+        "base = 'http://127.0.0.1:8000'",
+        "auth = {'Authorization': 'Bearer ' + os.environ['APP_UI_TOKEN']}",
+        "assert urllib.request.urlopen(base + '/health/live', timeout=5).status == 200",
+        "try:",
+        "    urllib.request.urlopen(base + '/health', timeout=5)",
+        "    raise SystemExit('/health answered without a bearer token')",
+        "except urllib.error.HTTPError as error:",
+        "    assert error.code == 401, error.code",
+        "request = urllib.request.Request(base + '/health', headers=auth)",
+        "result = json.load(urllib.request.urlopen(request, timeout=5))",
+        "assert result['database'] == 'healthy', result",
+        "assert result['service'] == 'personal-health-mirror', result",
+        "assert result['scheduler'] == 'disabled', result",
+    ]
+)
+
 UI_SMOKE_SCRIPT = "\n".join(
     [
         "import json, os, re, urllib.error, urllib.request",
@@ -209,14 +231,7 @@ def main() -> int:
             "app",
             "python",
             "-c",
-            (
-                "import json,urllib.request; "
-                "result=json.load(urllib.request.urlopen("
-                "'http://127.0.0.1:8000/health',timeout=5)); "
-                "assert result['database']=='healthy', result; "
-                "assert result['service']=='personal-health-mirror', result; "
-                "assert result['scheduler']=='disabled', result"
-            ),
+            HEALTH_SMOKE_SCRIPT,
             env=env,
         )
         compose("exec", "-T", "app", "health-mirror", "status", env=env)
@@ -322,7 +337,8 @@ def main() -> int:
             raise RuntimeError(f"Unexpected app host binding: {app_bindings!r}")
 
         print(
-            "Compose smoke test passed: build, PostgreSQL, migration, UI assets, dashboard, "
+            "Compose smoke test passed: build, PostgreSQL, migration, health (token required), "
+            "UI assets, dashboard, "
             "manual measurement, CSV, API, CLI, "
             "backup/restore, hardened runtime, and bindings."
         )

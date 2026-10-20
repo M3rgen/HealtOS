@@ -76,3 +76,96 @@ def test_ui_smoke_script_compiles_and_authenticates():
     compile(UI_SMOKE_SCRIPT, "ui_smoke", "exec")
     assert "Bearer " in UI_SMOKE_SCRIPT and "'X-HealthOS-Request': '1'" in UI_SMOKE_SCRIPT
     assert COMPOSE["services"]["app"]["environment"]["APP_UI_TOKEN"].startswith("${APP_UI_TOKEN:?")
+
+
+def _run_smoke_scripts_against_fake_app(monkeypatch, token: str):
+    """Execute the in-container smoke scripts with urllib answered like UITokenMiddleware."""
+    import io
+    import json
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlsplit
+
+    from app.core.auth import EXEMPT
+    from scripts.verify_compose import HEALTH_SMOKE_SCRIPT, UI_SMOKE_SCRIPT
+
+    saved: list[dict] = []
+    calls: list[tuple[str, str, bool]] = []
+
+    class Response(io.BytesIO):
+        def __init__(self, body: bytes, status: int = 200) -> None:
+            super().__init__(body)
+            self.status = status
+
+    def payload(method: str, path: str, data: bytes | None) -> Response:
+        if path == "/":
+            return Response(
+                b'<title>HealtOS</title><script src="/assets/a.js"></script>'
+                b'<link href="/assets/a.css">'
+            )
+        if path.startswith("/assets/") or path == "/health/live":
+            return Response(b"{}")
+        if path == "/health":
+            body = {
+                "database": "healthy",
+                "service": "personal-health-mirror",
+                "scheduler": "disabled",
+            }
+            return Response(json.dumps(body).encode())
+        if path == "/api/dashboard":
+            profile = {"muscle": {"value": saved[-1]["value"]}} if saved else {}
+            days = [{"steps": None}] * 7
+            return Response(json.dumps({"days": days, "profile": profile}).encode())
+        if path == "/api/dashboard/measurements" and method == "POST":
+            saved.append(json.loads(data or b"{}"))
+            return Response(b"{}", status=201)
+        if path == "/api/dashboard/measurements":
+            return Response(json.dumps([{**m, "source": "Manuel"} for m in saved]).encode())
+        if path == "/api/dashboard/export.csv":
+            return Response(b"date,sleep_seconds,timezone\n2026-09-29,,UTC\n")
+        raise AssertionError(f"unexpected smoke request {method} {path}")
+
+    def urlopen(request, *args, **kwargs):
+        if isinstance(request, str):
+            request = urllib.request.Request(request)
+        method, path = request.get_method(), urlsplit(request.full_url).path
+        authorized = request.get_header("Authorization") == f"Bearer {token}"
+        calls.append((method, path, authorized))
+        if not authorized and (method, path) not in EXEMPT:
+            raise urllib.error.HTTPError(request.full_url, 401, "auth_required", None, None)
+        return payload(method, path, request.data)
+
+    monkeypatch.setenv("APP_UI_TOKEN", token)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    for script in (HEALTH_SMOKE_SCRIPT, UI_SMOKE_SCRIPT):
+        exec(compile(script, "smoke", "exec"), {})
+    return calls
+
+
+def test_smoke_scripts_send_the_ui_token_to_every_protected_route(monkeypatch):
+    from app.core.auth import EXEMPT
+
+    calls = _run_smoke_scripts_against_fake_app(monkeypatch, "t" * 40)
+    anonymous = {
+        (method, path) for method, path, ok in calls if not ok and (method, path) not in EXEMPT
+    }
+    # Only the explicit "rejected without a token" probes go out unauthenticated.
+    assert anonymous == {("GET", "/health"), ("GET", "/api/dashboard")}
+    assert ("GET", "/health", True) in calls and ("GET", "/health/live", False) in calls
+    assert ("POST", "/api/dashboard/measurements", True) in calls
+
+
+def test_smoke_scripts_fail_when_the_bearer_header_is_missing(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    real = urllib.request.Request
+
+    class Unauthenticated(real):  # strips the bearer header, as a forgotten header would
+        def __init__(self, *args, headers=None, **kwargs):
+            headers = {k: v for k, v in (headers or {}).items() if k != "Authorization"}
+            super().__init__(*args, headers=headers, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "Request", Unauthenticated)
+    with pytest.raises(urllib.error.HTTPError):
+        _run_smoke_scripts_against_fake_app(monkeypatch, "t" * 40)
