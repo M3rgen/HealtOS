@@ -1,3 +1,10 @@
+# Bounded json-file logs so a chatty container cannot fill the VM disk (5 x 20 MB each).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
@@ -15,6 +22,7 @@ services:
       retries: 10
     networks:
       - database
+    logging: *default-logging
     # Deliberately no public port. Use the optional development override if needed.
 
   app:
@@ -44,6 +52,7 @@ services:
     networks:
       - database
       - application
+    logging: *default-logging
     healthcheck:
       test:
         - CMD
@@ -94,6 +103,7 @@ services:
         condition: service_healthy
     networks:
       - application
+    logging: *default-logging
 
 networks:
   database:

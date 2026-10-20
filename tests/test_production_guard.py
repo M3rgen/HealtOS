@@ -28,7 +28,8 @@ def test_verifier_rejects_compose_without_production_app_env():
         {"services": {"app": {"environment": {"APP_ENV": "development"}}}},
         {"services": {"app": {"environment": ["APP_ENV=development"]}}},
     )
-    assert errors == ["docker-compose.yml app service must set APP_ENV: production"]
+    assert "docker-compose.yml app service must set APP_ENV: production" in errors
+    assert not any("docker-compose.dev.yml" in error for error in errors)
 
 
 def test_compose_production_with_template_placeholders_refuses_to_start(monkeypatch):

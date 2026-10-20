@@ -83,6 +83,15 @@ def check_compose_runtime(compose_doc: object, dev_doc: object) -> list[str]:
     app = compose_service(compose_doc, "app")
     if service_environment(app).get("APP_ENV") != "production":
         errors.append("docker-compose.yml app service must set APP_ENV: production")
+    for name in ("postgres", "app"):
+        logging = compose_service(compose_doc, name).get("logging") or {}
+        options = logging.get("options") or {}
+        if (
+            logging.get("driver") != "json-file"
+            or not options.get("max-size")
+            or not options.get("max-file")
+        ):
+            errors.append(f"{name} service lacks json-file log rotation (max-size, max-file)")
     dev_app = compose_service(dev_doc, "app")
     if service_environment(dev_app).get("APP_ENV") != "development":
         errors.append("docker-compose.dev.yml must override APP_ENV with development")

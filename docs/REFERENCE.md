@@ -192,7 +192,7 @@ The implementation follows the official [v4 REST reference](https://developers.g
 
 There is no telemetry, tracking SDK, external logging service, hosted database, paid synchronization service, API proxy, or mandatory cloud backup. The mandatory software components are open-source and run on your hardware. Google Cloud/API account policies and any infrastructure or domain you independently choose are outside the project; no paid product is required by this code.
 
-PostgreSQL has no published host port in the production Compose file. FastAPI is published only on `127.0.0.1`. The application container runs as an unprivileged UID with all Linux capabilities dropped, `no-new-privileges`, and a read-only root filesystem. Put a self-hosted reverse proxy with HTTPS in front of it before exposing the webhook. Secrets are environment variables; tokens are never logged. OAuth refresh tokens obtained by the callback are Fernet-encrypted in PostgreSQL using a key that stays in the environment.
+PostgreSQL has no published host port in the production Compose file. FastAPI is published only on `127.0.0.1`. The application container runs as an unprivileged UID with all Linux capabilities dropped, `no-new-privileges`, and a read-only root filesystem. Container logs use the `json-file` driver with rotation (`max-size: 20m`, `max-file: 5`) for PostgreSQL, the app, and Caddy. Put a self-hosted reverse proxy with HTTPS in front of it before exposing the webhook. Secrets are environment variables; tokens are never logged. OAuth refresh tokens obtained by the callback are Fernet-encrypted in PostgreSQL using a key that stays in the environment.
 
 ## Requirements
 
