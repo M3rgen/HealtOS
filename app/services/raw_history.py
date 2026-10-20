@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from sqlalchemy import (
@@ -35,13 +36,22 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.logging import event
 from app.core.timeutil import as_utc
-from app.models.raw_versions import HISTORY_VIEW, RawHealthDataVersion
+from app.models.raw_versions import (
+    FUNCTION_BODIES,
+    HISTORY_VIEW,
+    PROTECTIVE_TRIGGERS,
+    RENUMBER_SETTING,
+    SQLITE_TRIGGERS,
+    RawHealthDataVersion,
+)
 from app.models.state import RawHealthData, RawJSON
 from app.parsers.common import payload_hash
+from app.services.storage import dialect_insert
 
 logger = logging.getLogger(__name__)
 
@@ -158,19 +168,74 @@ _DUPLICATE_CURRENT_SQL = text(
     "GROUP BY data_type, google_data_point_id HAVING count(*) > 1"
 )
 # A version exists only because the payload changed: two neighbouring versions (the
-# last one and the current row included) never carry the same payload.
+# last one and the current row included) never carry the same payload and stored text.
 _REPEAT_SQL = text(
     "SELECT raw_id, version FROM ("
-    "  SELECT raw_id, version, payload_hash,"
-    "         lag(payload_hash) OVER (PARTITION BY raw_id ORDER BY version) AS previous"
+    "  SELECT raw_id, version, payload_hash, body,"
+    "         lag(payload_hash) OVER (PARTITION BY raw_id ORDER BY version) AS previous,"
+    "         lag(body) OVER (PARTITION BY raw_id ORDER BY version) AS previous_body"
     "  FROM ("
-    "    SELECT raw_id, version, payload_hash FROM raw_health_data_versions"
+    "    SELECT raw_id, version, payload_hash, CAST(raw_json AS TEXT) AS body"
+    "    FROM raw_health_data_versions"
     "    UNION ALL"
-    "    SELECT r.id, 2147483647, r.payload_hash FROM raw_health_data r"
+    "    SELECT r.id, 2147483647, r.payload_hash, CAST(r.raw_json AS TEXT) FROM raw_health_data r"
     "    WHERE r.id IN (SELECT raw_id FROM raw_health_data_versions)"
     "  ) AS chain"
-    ") AS neighbours WHERE payload_hash = previous"
+    ") AS neighbours WHERE payload_hash = previous AND body = previous_body"
 )
+
+_PG_TRIGGERS_SQL = text(
+    "SELECT c.relname, t.tgname, t.tgenabled, p.proname, p.prosrc "
+    "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc p ON p.oid = t.tgfoid "
+    "WHERE NOT t.tgisinternal AND n.nspname = current_schema()"
+)
+_ENABLED = {"O": "enabled (not ALWAYS)", "D": "disabled", "R": "replica-only", "A": "always"}
+
+
+async def verify_guards(session: AsyncSession) -> list[str]:
+    """Every protective trigger exists, always fires, and runs its expected function body.
+
+    A trigger that is missing, disabled (``ALTER TABLE ... DISABLE TRIGGER``), demoted to
+    ordinary ``ENABLE`` (then ``session_replication_role = replica`` skips it), or whose
+    function was replaced would let a delete or overwrite through unnoticed.
+    """
+    errors: list[str] = []
+    if session.get_bind().dialect.name != "postgresql":
+        names = set(
+            (
+                await session.execute(
+                    text("SELECT tbl_name, name FROM sqlite_master WHERE type = 'trigger'")
+                )
+            ).tuples()
+        )
+        for table, trigger in SQLITE_TRIGGERS:
+            if (table, trigger) not in names:
+                errors.append(f"protective trigger missing: {table}.{trigger}")
+        return errors
+    found = {
+        (table, trigger): (enabled, function, body)
+        for table, trigger, enabled, function, body in (
+            await session.execute(_PG_TRIGGERS_SQL)
+        ).tuples()
+    }
+    for table, trigger, function in PROTECTIVE_TRIGGERS:
+        if (table, trigger) not in found:
+            errors.append(f"protective trigger missing: {table}.{trigger}")
+            continue
+        enabled, actual_function, body = found[(table, trigger)]
+        if isinstance(enabled, bytes):
+            enabled = enabled.decode()
+        if enabled != "A":
+            errors.append(
+                f"protective trigger {table}.{trigger} is {_ENABLED.get(enabled, enabled)}; "
+                f"run ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}"
+            )
+        if actual_function != function:
+            errors.append(f"protective trigger {table}.{trigger} calls {actual_function}()")
+        elif body != FUNCTION_BODIES[function]:
+            errors.append(f"protective function {function}() was changed")
+    return errors
 
 
 async def verify_versions(session: AsyncSession) -> tuple[int, list[str]]:
@@ -223,9 +288,12 @@ class ImportStats:
     renumbered: int = 0
     # Records with at least one imported version (raw ids, counted once across chunks).
     records: set[Any] = field(default_factory=set)
-    # Records in the dump that the live archive does not have at all (reported, not copied).
-    missing_records: dict[str, int] = field(default_factory=dict)
+    # Records in the dump that the live archive did not have at all: imported as rows of
+    # their own, marked source-deleted (per data type).
+    restored_records: dict[str, int] = field(default_factory=dict)
     source_hash_mismatches: list[str] = field(default_factory=list)
+    # Payloads jsonb cannot store unchanged (e.g. 1e+16, \u0000): skipped, keep the dump.
+    unrepresentable: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -234,8 +302,9 @@ class ImportStats:
             "imported": self.imported,
             "renumbered": self.renumbered,
             "records_with_new_versions": len(self.records),
-            "missing_records": dict(sorted(self.missing_records.items())),
+            "restored_records": dict(sorted(self.restored_records.items())),
             "source_hash_mismatches": self.source_hash_mismatches,
+            "unrepresentable": self.unrepresentable,
         }
 
 
@@ -251,6 +320,15 @@ class _Candidate:
     received_at: datetime | None
     last_seen_at: datetime
     superseded_at: datetime | None
+    first_seen_at: datetime | None = None
+    source_deleted_at: datetime | None = None
+    is_quarantined: bool | None = None
+    quarantine_reason: str | None = None
+    value: Any = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.data_type}/{self.google_id}"
 
 
 def source_database_url(from_db: str, target_url: str) -> str:
@@ -264,6 +342,17 @@ def source_database_url(from_db: str, target_url: str) -> str:
     if url.render_as_string(hide_password=False) == target_url:
         raise ValueError("the source database is the live archive itself")
     return url.render_as_string(hide_password=False)
+
+
+async def newest_sighting(engine: AsyncEngine) -> datetime | None:
+    """When the dump last saw any record (orders several dumps newest first)."""
+    async with engine.connect() as connection:
+        value = await connection.scalar(
+            text("SELECT max(last_seen_at) FROM raw_health_data").columns(
+                max=DateTime(timezone=True)
+            )
+        )
+    return as_utc(value) if isinstance(value, datetime) else None
 
 
 async def _source_columns(engine: AsyncEngine) -> dict[str, set[str]]:
@@ -286,6 +375,8 @@ _TIMES = {
     "received_at": DateTime(timezone=True),
     "last_seen_at": DateTime(timezone=True),
     "superseded_at": DateTime(timezone=True),
+    "first_seen_at": DateTime(timezone=True),
+    "source_deleted_at": DateTime(timezone=True),
 }
 
 
@@ -293,16 +384,17 @@ def _source_query(table: str, columns: set[str]):
     # raw_json is read as text and parsed here: a json-typed column (dumps before
     # 20261020_0010) and SQLite text then behave the same, and a JSON string payload is
     # not mistaken for already-parsed text.
-    received = (
-        "received_at"
-        if "received_at" in columns
-        else ("payload_received_at" if "payload_received_at" in columns else "NULL")
-    )
-    superseded = "superseded_at" if "superseded_at" in columns else "NULL"
+    def pick(*names: str) -> str:
+        return next((name for name in names if name in columns), "NULL")
+
     sql = (
         "SELECT data_type, google_data_point_id, CAST(raw_json AS TEXT) AS raw_text, "
         "payload_hash, source_start_time, source_end_time, source_timezone, "
-        f"{received} AS received_at, last_seen_at, {superseded} AS superseded_at "
+        f"{pick('received_at', 'payload_received_at')} AS received_at, last_seen_at, "
+        f"{pick('superseded_at')} AS superseded_at, {pick('first_seen_at')} AS first_seen_at, "
+        f"{pick('source_deleted_at')} AS source_deleted_at, "
+        f"{pick('is_quarantined')} AS is_quarantined, "
+        f"{pick('quarantine_reason')} AS quarantine_reason "
         f"FROM {table} ORDER BY data_type, google_data_point_id, last_seen_at"
     )
     return text(sql).columns(
@@ -311,6 +403,8 @@ def _source_query(table: str, columns: set[str]):
         raw_text=String(),
         payload_hash=String(),
         source_timezone=String(),
+        is_quarantined=Boolean(),
+        quarantine_reason=String(),
         **_TIMES,
     )
 
@@ -322,12 +416,16 @@ async def import_versions(
     batch_size: int = 2_000,
     dry_run: bool = False,
 ) -> ImportStats:
-    """Insert every (record, payload) of the source dump that the archive lacks.
+    """Insert every (record, payload) occurrence of the source dump that the archive lacks.
 
-    Payloads already present for a record (as its current row or any version) are
-    skipped, so a second run adds nothing. New versions are slotted into each record's
-    history by the time they were last seen; existing history rows keep their relative
-    order and are only renumbered. Current rows are never modified.
+    Each record's versions and the dump's sightings are merged into one timeline by the
+    time they were last seen; a dump payload is "already present" only when it lands next
+    to the same payload in that timeline, so a payload that returned later (A, B, A) is
+    kept as its own occurrence. Existing history rows keep their relative order and are
+    only renumbered; current rows are never modified. A record the live archive does not
+    have at all is imported as a new row marked ``source_deleted_at`` (its latest dump
+    payload as current version, earlier ones as history), so nothing that ever existed is
+    lost. Payloads jsonb cannot store unchanged are skipped and listed.
     """
     stats = ImportStats()
     tables = await _source_columns(source_engine)
@@ -338,31 +436,95 @@ async def import_versions(
             result = await connection.stream(
                 _source_query(table, columns).execution_options(yield_per=batch_size)
             )
+            pending: list[_Candidate] = []
             async for chunk in result.partitions(batch_size):
-                candidates = [
-                    _Candidate(
-                        row.data_type,
-                        row.google_data_point_id,
-                        row.raw_text,
-                        row.payload_hash,
-                        row.source_start_time,
-                        row.source_end_time,
-                        row.source_timezone,
-                        row.received_at,
-                        row.last_seen_at,
-                        row.superseded_at,
-                    )
-                    for row in chunk
-                ]
-                stats.source_rows += len(candidates)
-                await _import_chunk(target, candidates, stats, dry_run=dry_run)
+                pending.extend(_candidate(row) for row in chunk)
+                if len(pending) < batch_size:
+                    continue
+                # Keep every record's rows in one chunk: cut before the last record.
+                last = (pending[-1].data_type, pending[-1].google_id)
+                cut = len(pending)
+                while cut and (pending[cut - 1].data_type, pending[cut - 1].google_id) == last:
+                    cut -= 1
+                if cut:
+                    await _import_chunk(target, pending[:cut], stats, dry_run=dry_run)
+                    pending = pending[cut:]
+            if pending:
+                await _import_chunk(target, pending, stats, dry_run=dry_run)
     event(
         logger,
         "RAW_VERSIONS_IMPORTED",
         dry_run=dry_run,
+        unrepresentable=len(stats.unrepresentable),
         **{key: value for key, value in stats.as_dict().items() if isinstance(value, int)},
     )
     return stats
+
+
+def _candidate(row) -> _Candidate:
+    return _Candidate(
+        row.data_type,
+        row.google_data_point_id,
+        row.raw_text,
+        row.payload_hash,
+        as_utc(row.source_start_time),
+        as_utc(row.source_end_time),
+        row.source_timezone,
+        as_utc(row.received_at),
+        as_utc(row.last_seen_at),
+        as_utc(row.superseded_at),
+        as_utc(row.first_seen_at),
+        as_utc(row.source_deleted_at),
+        row.is_quarantined,
+        row.quarantine_reason,
+    )
+
+
+_ROUND_TRIP_SQL = text(
+    "SELECT u.ord, CAST(u.t AS jsonb)::text FROM unnest(CAST(:texts AS text[])) "
+    "WITH ORDINALITY AS u(t, ord)"
+)
+
+
+async def _jsonb_rejects(session: AsyncSession, candidates: list[_Candidate]) -> set[int]:
+    """Positions of candidates whose payload jsonb would refuse or read back changed.
+
+    The text checked is what the insert sends (SQLAlchemy's json.dumps of the value). A
+    batch the cast rejects (\\u0000, Infinity) is retried row by row to find the culprits.
+    """
+
+    async def round_trip(texts: list[str]) -> list[str]:
+        rows = await session.execute(_ROUND_TRIP_SQL, {"texts": texts})
+        return [stored for _, stored in sorted(rows.tuples().all())]
+
+    def changed(candidate: _Candidate, stored: str) -> bool:
+        return payload_hash(json.loads(stored)) != candidate.payload_hash
+
+    texts = [json.dumps(candidate.value) for candidate in candidates]
+    try:
+        async with session.begin_nested():
+            stored = await round_trip(texts)
+        return {i for i, item in enumerate(candidates) if changed(item, stored[i])}
+    except DBAPIError:
+        rejected = set()
+        for index, (candidate, raw) in enumerate(zip(candidates, texts, strict=True)):
+            try:
+                async with session.begin_nested():
+                    (stored_one,) = await round_trip([raw])
+            except DBAPIError:
+                rejected.add(index)
+                continue
+            if changed(candidate, stored_one):
+                rejected.add(index)
+        return rejected
+
+
+@dataclass
+class _Old:
+    version: int
+    row_id: Any
+    payload_hash: str
+    last_seen_at: datetime
 
 
 async def _import_chunk(
@@ -372,124 +534,294 @@ async def _import_chunk(
     *,
     dry_run: bool,
 ) -> None:
-    by_type: dict[str, list[_Candidate]] = defaultdict(list)
+    usable: list[_Candidate] = []
     for candidate in candidates:
-        by_type[candidate.data_type].append(candidate)
+        try:
+            candidate.value = json.loads(candidate.raw_text)
+            intact = payload_hash(candidate.value) == candidate.payload_hash
+        except ValueError:
+            intact = False
+        if intact:
+            usable.append(candidate)
+        else:
+            stats.source_hash_mismatches.append(candidate.label)
     async with target.begin() as session:
-        # Lock the current rows: the version trigger computes the next version number
-        # under the same row lock, so live writes and this renumbering never interleave.
-        current: dict[tuple[str, str], tuple[Any, str]] = {}
-        for data_type, items in by_type.items():
-            rows = await session.execute(
-                select(
-                    RawHealthData.id, RawHealthData.google_data_point_id, RawHealthData.payload_hash
+        postgresql = session.get_bind().dialect.name == "postgresql"
+        if postgresql and usable:
+            rejected = await _jsonb_rejects(session, usable)
+            stats.unrepresentable.extend(usable[i].label for i in sorted(rejected))
+            usable = [item for i, item in enumerate(usable) if i not in rejected]
+        by_key: dict[tuple[str, str], list[_Candidate]] = defaultdict(list)
+        for candidate in usable:
+            by_key[(candidate.data_type, candidate.google_id)].append(candidate)
+        current = await _lock_current(session, by_key)
+        missing = [key for key in by_key if key not in current]
+        for key in missing:
+            items = by_key[key]
+            latest = max(items, key=lambda item: item.last_seen_at)
+            if dry_run:
+                restored: _Current | None = _Current(
+                    None, latest.payload_hash, latest.last_seen_at, IMPORT_SOURCE
                 )
-                .where(
-                    RawHealthData.data_type == data_type,
-                    RawHealthData.google_data_point_id.in_({item.google_id for item in items}),
-                )
-                .with_for_update()
-            )
-            for raw_id, google_id, digest in rows.tuples():
-                current[(data_type, google_id)] = (raw_id, digest)
-        history: dict[Any, list[tuple[int, int, str, datetime]]] = defaultdict(list)
-        raw_ids = [raw_id for raw_id, _ in current.values()]
-        for offset in range(0, len(raw_ids), 5_000):
-            rows = await session.execute(
-                select(
-                    RawHealthDataVersion.raw_id,
-                    RawHealthDataVersion.id,
-                    RawHealthDataVersion.version,
-                    RawHealthDataVersion.payload_hash,
-                    RawHealthDataVersion.last_seen_at,
-                ).where(RawHealthDataVersion.raw_id.in_(raw_ids[offset : offset + 5_000]))
-            )
-            for raw_id, row_id, version, digest, last_seen in rows.tuples():
-                history[raw_id].append((version, row_id, digest, as_utc(last_seen)))
-
-        new: dict[Any, dict[str, _Candidate]] = defaultdict(dict)
-        for candidate in candidates:
-            key = (candidate.data_type, candidate.google_id)
-            if key not in current:
-                stats.missing_records[candidate.data_type] = (
-                    stats.missing_records.get(candidate.data_type, 0) + 1
-                )
-                continue
-            raw_id, current_hash = current[key]
-            known = {current_hash, *(item[2] for item in history[raw_id])}
-            if candidate.payload_hash in known:
-                stats.already_present += 1
-                continue
-            try:
-                intact = payload_hash(json.loads(candidate.raw_text)) == candidate.payload_hash
-            except ValueError:
-                intact = False
-            if not intact:
-                stats.source_hash_mismatches.append(f"{key[0]}/{key[1]}")
-                continue
-            seen = new[raw_id].get(candidate.payload_hash)
-            if seen is None:
-                new[raw_id][candidate.payload_hash] = candidate
-                stats.imported += 1
             else:
-                # The same payload in the dump's raw and history tables: keep the later sighting.
-                seen.last_seen_at = max(as_utc(seen.last_seen_at), as_utc(candidate.last_seen_at))
-        if not new:
+                restored = await _restore_record(session, latest)
+            if restored is None:
+                # A live write created the record meanwhile: merge into that row instead.
+                current.update(await _lock_current(session, {key: items}))
+                continue
+            items.remove(latest)
+            current[key] = restored
+            stats.restored_records[key[0]] = stats.restored_records.get(key[0], 0) + 1
+        # A restored record (current row written by an import) may meet a newer sighting
+        # in a later dump: that payload becomes current, the trigger keeps the old one.
+        promoted: dict[Any, _Old] = {}
+        for key, items in by_key.items():
+            row = current[key]
+            newer = [item for item in items if item.last_seen_at > row.last_seen_at]
+            if row.payload_source != IMPORT_SOURCE or not newer:
+                continue
+            newest = max(newer, key=lambda item: item.last_seen_at)
+            items.remove(newest)
+            stats.already_present += newest.payload_hash == row.payload_hash
+            stats.imported += newest.payload_hash != row.payload_hash
+            if not dry_run:
+                await _promote(session, row.raw_id, newest)
+            elif newest.payload_hash != row.payload_hash:
+                promoted[key] = _Old(1 << 30, None, row.payload_hash, row.last_seen_at)
+            current[key] = _Current(
+                row.raw_id, newest.payload_hash, newest.last_seen_at, IMPORT_SOURCE
+            )
+        history = await _load_history(session, [row.raw_id for row in current.values()])
+
+        plans: dict[Any, list[tuple[str, Any]]] = {}
+        for key, items in by_key.items():
+            raw_id, current_hash = current[key].raw_id, current[key].payload_hash
+            stored = history.get(raw_id, []) if raw_id is not None else []
+            if key in promoted:
+                stored = [*stored, promoted[key]]
+            timeline, present = _merge(stored, current_hash, items)
+            stats.already_present += present
+            new = [item for kind, item in timeline if kind == "new"]
+            if not new:
+                continue
+            stats.imported += len(new)
+            stats.records.add(raw_id if raw_id is not None else key)
+            plans[raw_id] = timeline
+        if dry_run or not plans:
             return
-        stats.records.update(new)
-        if dry_run:
-            return
-        await _insert_versions(session, new, history, stats)
+        await _write_timelines(session, plans, stats, postgresql=postgresql)
 
 
-async def _insert_versions(
+@dataclass
+class _Current:
+    raw_id: Any
+    payload_hash: str
+    last_seen_at: datetime
+    payload_source: str | None
+
+
+async def _lock_current(
+    session: AsyncSession, by_key: dict[tuple[str, str], list[_Candidate]]
+) -> dict[tuple[str, str], _Current]:
+    # Lock the current rows (in key order, like store_records): the version trigger
+    # computes the next version number under the same row lock, so live writes and this
+    # renumbering never interleave.
+    current: dict[tuple[str, str], _Current] = {}
+    by_type: dict[str, list[str]] = defaultdict(list)
+    for data_type, google_id in by_key:
+        by_type[data_type].append(google_id)
+    for data_type in sorted(by_type):
+        google_ids = sorted(by_type[data_type])
+        rows = await session.execute(
+            select(
+                RawHealthData.google_data_point_id,
+                RawHealthData.id,
+                RawHealthData.payload_hash,
+                RawHealthData.last_seen_at,
+                RawHealthData.payload_source,
+            )
+            .where(
+                RawHealthData.data_type == data_type,
+                RawHealthData.google_data_point_id.in_(google_ids),
+            )
+            .order_by(RawHealthData.google_data_point_id)
+            .with_for_update()
+        )
+        for google_id, raw_id, digest, last_seen, origin in rows.tuples():
+            current[(data_type, google_id)] = _Current(raw_id, digest, as_utc(last_seen), origin)
+    return current
+
+
+async def _restore_record(session: AsyncSession, latest: _Candidate) -> _Current | None:
+    """Insert a record the live archive lacks as its own (source-deleted) current row.
+
+    ``None`` when a live write created the same record first (nothing inserted).
+    """
+    table = cast(Table, RawHealthData.__table__)
+    statement = (
+        dialect_insert(session, table)
+        .values(
+            id=uuid.uuid4(),
+            google_data_point_id=latest.google_id,
+            data_type=latest.data_type,
+            source_start_time=latest.source_start_time,
+            source_end_time=latest.source_end_time,
+            source_timezone=latest.source_timezone,
+            raw_json=latest.value,
+            payload_hash=latest.payload_hash,
+            first_seen_at=latest.first_seen_at or latest.received_at or latest.last_seen_at,
+            last_seen_at=latest.last_seen_at,
+            # Absent from the live archive: kept, but not shown as current data.
+            source_deleted_at=latest.source_deleted_at or datetime.now(UTC),
+            is_quarantined=bool(latest.is_quarantined),
+            quarantine_reason=latest.quarantine_reason,
+            payload_received_at=latest.received_at,
+            payload_source=IMPORT_SOURCE,
+        )
+        .on_conflict_do_nothing(index_elements=["data_type", "google_data_point_id"])
+        .returning(table.c.id)
+    )
+    raw_id = await session.scalar(statement)
+    if raw_id is None:
+        return None
+    stored = await session.scalar(select(RawHealthData.raw_json).where(RawHealthData.id == raw_id))
+    if payload_hash(stored) != latest.payload_hash:
+        raise RuntimeError(f"restored payload would not read back unchanged: {latest.label}")
+    return _Current(raw_id, latest.payload_hash, latest.last_seen_at, IMPORT_SOURCE)
+
+
+async def _promote(session: AsyncSession, raw_id: Any, newest: _Candidate) -> None:
+    """Make a newer dump sighting the current payload of an import-restored record."""
+    await session.execute(
+        update(RawHealthData)
+        .where(RawHealthData.id == raw_id)
+        .values(
+            raw_json=newest.value,
+            payload_hash=newest.payload_hash,
+            source_start_time=newest.source_start_time,
+            source_end_time=newest.source_end_time,
+            source_timezone=newest.source_timezone,
+            last_seen_at=newest.last_seen_at,
+            payload_received_at=newest.received_at,
+            payload_source=IMPORT_SOURCE,
+        )
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _load_history(session: AsyncSession, raw_ids: list[Any]) -> dict[Any, list[_Old]]:
+    history: dict[Any, list[_Old]] = defaultdict(list)
+    raw_ids = [raw_id for raw_id in raw_ids if raw_id is not None]
+    for offset in range(0, len(raw_ids), 5_000):
+        rows = await session.execute(
+            select(
+                RawHealthDataVersion.raw_id,
+                RawHealthDataVersion.id,
+                RawHealthDataVersion.version,
+                RawHealthDataVersion.payload_hash,
+                RawHealthDataVersion.last_seen_at,
+            ).where(RawHealthDataVersion.raw_id.in_(raw_ids[offset : offset + 5_000]))
+        )
+        for raw_id, row_id, version, digest, last_seen in rows.tuples():
+            history[raw_id].append(_Old(version, row_id, digest, as_utc(last_seen)))
+    for items in history.values():
+        items.sort(key=lambda item: item.version)
+    return history
+
+
+def _merge(
+    existing: list[_Old], current_hash: str, incoming: list[_Candidate]
+) -> tuple[list[tuple[str, Any]], int]:
+    """One record's history timeline with the dump's sightings slotted in by time.
+
+    Returns the history entries (``("old", _Old)`` or ``("new", _Candidate)``, oldest
+    first, the current row excluded) and how many sightings were already present. Equal
+    neighbouring payloads are one occurrence: a sighting next to a stored version with the
+    same payload adds nothing, and consecutive sightings of one payload become one version.
+    """
+    incoming = sorted(incoming, key=lambda item: item.last_seen_at)
+    merged: list[tuple[str, Any]] = []
+    position = 0
+    for old in existing:
+        # On a tie the archived sighting (older evidence) goes first.
+        while position < len(incoming) and incoming[position].last_seen_at <= old.last_seen_at:
+            merged.append(("new", incoming[position]))
+            position += 1
+        merged.append(("old", old))
+    merged.extend(("new", item) for item in incoming[position:])
+    merged.append(("current", current_hash))
+
+    def digest(entry: tuple[str, Any]) -> str:
+        kind, item = entry
+        return item if kind == "current" else item.payload_hash
+
+    timeline: list[tuple[str, Any]] = []
+    present = 0
+    start = 0
+    while start < len(merged):
+        end = start + 1
+        while end < len(merged) and digest(merged[end]) == digest(merged[start]):
+            end += 1
+        run = merged[start:end]
+        stored = [entry for entry in run if entry[0] != "new"]
+        sightings = [item for kind, item in run if kind == "new"]
+        if stored:
+            present += len(sightings)
+            timeline.extend(entry for entry in stored if entry[0] == "old")
+        else:
+            first = sightings[0]
+            first.last_seen_at = max(item.last_seen_at for item in sightings)
+            known = [item.superseded_at for item in sightings if item.superseded_at is not None]
+            first.superseded_at = max(known) if known else None
+            present += len(sightings) - 1
+            timeline.append(("new", first))
+        start = end
+    return timeline, present
+
+
+async def _write_timelines(
     session: AsyncSession,
-    new: dict[Any, dict[str, _Candidate]],
-    history: dict[Any, list[tuple[int, int, str, datetime]]],
+    plans: dict[Any, list[tuple[str, Any]]],
     stats: ImportStats,
+    *,
+    postgresql: bool,
 ) -> None:
     moves: list[dict[str, Any]] = []
     inserts: list[dict[str, Any]] = []
-    for raw_id, by_hash in new.items():
-        existing = sorted(history[raw_id])
-        incoming = sorted(by_hash.values(), key=lambda item: as_utc(item.last_seen_at))
-        # Merge by last-seen time; the existing history keeps its order, and on a tie the
-        # archived payload (older evidence) goes first.
-        merged: list[tuple[str, Any]] = []
-        position = 0
-        for version, row_id, _, last_seen in existing:
-            while position < len(incoming) and as_utc(incoming[position].last_seen_at) <= last_seen:
-                merged.append(("new", incoming[position]))
-                position += 1
-            merged.append(("old", (version, row_id)))
-        merged.extend(("new", item) for item in incoming[position:])
-        for number, (kind, item) in enumerate(merged, start=1):
+    for raw_id, timeline in plans.items():
+        for number, (kind, item) in enumerate(timeline, start=1):
             if kind == "old":
-                version, row_id = item
-                if version != number:
-                    moves.append({"row_id": row_id, "parked": -number})
+                if item.version != number:
+                    moves.append({"row_id": item.row_id, "parked": -number})
                 continue
             inserts.append(
                 {
                     "raw_id": raw_id,
                     "data_type": item.data_type,
                     "google_data_point_id": item.google_id,
-                    "version": -number,
-                    "raw_json": json.loads(item.raw_text),
+                    "version": number,
+                    "raw_json": item.value,
                     "payload_hash": item.payload_hash,
-                    "source_start_time": as_utc(item.source_start_time),
-                    "source_end_time": as_utc(item.source_end_time),
+                    "source_start_time": item.source_start_time,
+                    "source_end_time": item.source_end_time,
                     "source_timezone": item.source_timezone,
-                    "received_at": as_utc(item.received_at),
-                    "last_seen_at": as_utc(item.last_seen_at),
-                    "superseded_at": as_utc(item.superseded_at),
+                    "received_at": item.received_at,
+                    "last_seen_at": item.last_seen_at,
+                    # Replaced after it was last seen (exact when the dump knew it).
+                    "superseded_at": item.superseded_at or item.last_seen_at,
                     "source": IMPORT_SOURCE,
                 }
             )
     table = cast(Table, RawHealthDataVersion.__table__)
-    # Park every number that changes below zero first, then flip them back: the unique
-    # (raw_id, version) constraint holds after every statement.
     if moves:
+        if postgresql:
+            # The history guard lets `version` change only inside this transaction.
+            await session.execute(
+                text("SELECT set_config(:name, '1', true)"), {"name": RENUMBER_SETTING}
+            )
+        # Park every number that changes below zero first, insert the new versions into
+        # the freed numbers, then flip the parked ones back: the unique (raw_id, version)
+        # constraint holds after every statement.
         await session.execute(
             update(table)
             .where(table.c.id == bindparam("row_id"))
@@ -498,16 +830,18 @@ async def _insert_versions(
         )
         stats.renumbered += len(moves)
     await session.execute(table.insert(), inserts)
-    await session.execute(
-        update(table)
-        .where(and_(table.c.raw_id.in_(list(new)), table.c.version < 0))
-        .values(version=-table.c.version)
-    )
-    # What the database stores must hash like the dump did (jsonb may respell numbers).
+    if moves:
+        await session.execute(
+            update(table)
+            .where(and_(table.c.raw_id.in_(list(plans)), table.c.version < 0))
+            .values(version=-table.c.version)
+        )
+    # What the database stores must hash like the dump did (checked before, so this only
+    # guards against a jsonb surprise; the chunk then rolls back as a whole).
     rows = await session.execute(
         select(
             table.c.raw_json, table.c.payload_hash, table.c.data_type, table.c.google_data_point_id
-        ).where(table.c.raw_id.in_(list(new)), table.c.source == IMPORT_SOURCE)
+        ).where(table.c.raw_id.in_(list(plans)), table.c.source == IMPORT_SOURCE)
     )
     for raw_json, digest, data_type, google_id in rows.tuples():
         if payload_hash(raw_json) != digest:

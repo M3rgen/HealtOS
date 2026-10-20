@@ -1,34 +1,41 @@
-"""Keep every payload version of a raw record: `raw_health_data_versions`.
+"""Keep every payload version of a raw record and refuse deleting any record.
 
 Until now a re-fetch that brought a different payload for an existing
 `(data_type, google_data_point_id)` overwrote `raw_health_data.raw_json`, and the previous
-payload was gone. From this revision on:
+payload was gone; nothing in the database stopped a `DELETE` either. From this revision on:
 
 * `raw_health_data` still holds the current version of every record (all readers stay as
   they are). It gains two nullable columns, `payload_received_at` and `payload_source`:
-  when and through which path (sync, webhook, reconciliation, backfill) the current
-  payload arrived. NULL means "stored before this revision".
+  when and through which path (sync, webhook, reconciliation, backfill, gap-repair,
+  archive-import) the current payload arrived. NULL means "stored before this revision".
 * A `BEFORE UPDATE` trigger on `raw_health_data` copies the row being replaced into the
-  new append-only table `raw_health_data_versions` whenever `payload_hash` changes, in the
-  same statement as the overwrite: the old payload is kept even if the batch crashes
-  (both roll back) or two writers race (the trigger runs under the row lock and sees the
-  row it really replaces). The same payload received again writes nothing.
-* `raw_health_data_versions` refuses UPDATE (except renumbering `version`), DELETE and
-  TRUNCATE through triggers; its foreign key keeps the current row from being deleted.
+  new append-only table `raw_health_data_versions` whenever `payload_hash` *or* the stored
+  text (`raw_json::text`) changes, in the same statement as the overwrite: the old payload
+  is kept even if the batch crashes (both roll back) or two writers race (the trigger runs
+  under the row lock and sees the row it really replaces). The same payload received
+  again writes nothing.
+* Triggers refuse `DELETE` and `TRUNCATE` on `raw_health_data` (a `TRUNCATE ... CASCADE`
+  from any referencing table reaches the same trigger) and refuse changing a record's
+  identity columns. `raw_health_data_versions` refuses `UPDATE`, `DELETE` and `TRUNCATE`;
+  the one exception is renumbering `version`, and on PostgreSQL only in a transaction that
+  set `healthos.renumber = '1'` (only `health-mirror import-versions` does). raw_json is
+  compared as text, so even a respelled number counts as a change.
+* Every protective trigger is `ENABLE ALWAYS`: it also fires with
+  `session_replication_role = replica`. `health-mirror verify` fails when one is missing,
+  disabled, or its function no longer has the body below.
 * The view `raw_health_data_history` lists every version of every record (history rows
   plus the current row) with version number, `valid_from`/`valid_to` and `is_current`.
 
 Seeding: a record without history rows *is* version 1, and the view numbers the current
 row `max(history version) + 1`. So the existing archive needs no copy: no row of
 `raw_health_data` is rewritten, nothing is stored twice, and the upgrade is catalog-only
-(nullable `ADD COLUMN` without a default, an empty table, two functions, three triggers,
-one view): well under a second, independent of table size, with no extra disk. The
-history then grows only by the payloads that Google actually replaces (a few thousand
-rows a day at most).
+(nullable `ADD COLUMN` without a default, an empty table, functions, triggers, one view):
+well under a second, independent of table size, with no extra disk.
 
 downgrade() drops only these new objects. It refuses while history rows exist, because
 dropping them would lose exactly the versions this revision keeps; pass
-`-x allow-version-loss=1` to downgrade anyway (after a backup).
+`-x allow-version-loss=1` to downgrade anyway (after a backup). Offline (`--sql`) the
+check is emitted as a `DO` block that raises in the generated script itself.
 
 The trigger and view SQL below is a frozen copy of app/models/raw_versions.py, which
 builds the same objects for `create_all`; tests/test_raw_versions.py compares them.
@@ -43,7 +50,105 @@ down_revision = "20261020_0010"
 branch_labels = None
 depends_on = None
 
-VIEW_SQL = """CREATE VIEW raw_health_data_history AS
+HISTORY_VIEW = "raw_health_data_history"
+RENUMBER_SETTING = "healthos.renumber"
+# Tables whose rows a downgrade would drop; it refuses while any of them has rows.
+KEPT_TABLES = ("raw_health_data_versions",)
+
+# Columns copied from the replaced raw row; the trigger SQL lists them in this order.
+_COPY = (
+    "raw_id, data_type, google_data_point_id, version, raw_json, payload_hash, "
+    "source_start_time, source_end_time, source_timezone, received_at, last_seen_at, "
+    "superseded_at, source"
+)
+_OLD = (
+    "OLD.id, OLD.data_type, OLD.google_data_point_id, "
+    "(SELECT coalesce(max(v.version), 0) + 1 FROM raw_health_data_versions v "
+    "WHERE v.raw_id = OLD.id), "
+    "OLD.raw_json, OLD.payload_hash, OLD.source_start_time, OLD.source_end_time, "
+    "OLD.source_timezone, OLD.payload_received_at, OLD.last_seen_at, NEW.last_seen_at, "
+    "coalesce(OLD.payload_source, 'legacy')"
+)
+# Every history column except `version`: these may never change. raw_json is compared as
+# text, so a respelled number (1.0 for 1) counts as a change.
+_FROZEN = (
+    "id",
+    "raw_id",
+    "data_type",
+    "google_data_point_id",
+    "raw_json::text",
+    "payload_hash",
+    "source_start_time",
+    "source_end_time",
+    "source_timezone",
+    "received_at",
+    "last_seen_at",
+    "superseded_at",
+    "source",
+    "created_at",
+)
+# A raw record's identity: never rewritten (a new key is a new record).
+_IDENTITY = ("id", "data_type", "google_data_point_id", "first_seen_at", "created_at")
+
+
+def _row(prefix: str, columns) -> str:
+    return ", ".join(f"{prefix}.{column}" for column in columns)
+
+
+def _sqlite_changed(columns) -> str:
+    return " OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in (c.split("::")[0] for c in columns))
+
+
+FUNCTION_BODIES = {
+    "healthos_refuse_change": """
+BEGIN
+    RAISE EXCEPTION USING MESSAGE =
+        TG_TABLE_NAME || ' keeps every record: ' || TG_OP || ' refused';
+END
+""",
+    "raw_health_data_keep_version": f"""
+BEGIN
+    INSERT INTO raw_health_data_versions ({_COPY})
+    VALUES ({_OLD});
+    RETURN NEW;
+END
+""",
+    "raw_health_data_versions_append_only": f"""
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND current_setting('{RENUMBER_SETTING}', true) = '1'
+       AND ({_row("NEW", _FROZEN)}) IS NOT DISTINCT FROM ({_row("OLD", _FROZEN)}) THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING MESSAGE =
+        'raw_health_data_versions is append-only: ' || TG_OP || ' refused';
+END
+""",
+}
+
+# (table, trigger, function) of every protective PostgreSQL trigger; verify checks them.
+PROTECTIVE_TRIGGERS = (
+    ("raw_health_data", "raw_health_data_keep_version", "raw_health_data_keep_version"),
+    ("raw_health_data", "raw_health_data_frozen_identity", "healthos_refuse_change"),
+    ("raw_health_data", "raw_health_data_no_delete", "healthos_refuse_change"),
+    ("raw_health_data", "raw_health_data_no_truncate", "healthos_refuse_change"),
+    (
+        "raw_health_data_versions",
+        "raw_health_data_versions_append_only",
+        "raw_health_data_versions_append_only",
+    ),
+    ("raw_health_data_versions", "raw_health_data_versions_no_truncate", "healthos_refuse_change"),
+)
+# (table, trigger) of every protective SQLite trigger (SQLite cannot disable triggers).
+SQLITE_TRIGGERS = (
+    ("raw_health_data", "raw_health_data_keep_version"),
+    ("raw_health_data", "raw_health_data_frozen_identity"),
+    ("raw_health_data", "raw_health_data_no_delete"),
+    ("raw_health_data_versions", "raw_health_data_versions_no_delete"),
+    ("raw_health_data_versions", "raw_health_data_versions_no_update"),
+)
+
+VIEW_SQL = f"""CREATE VIEW {HISTORY_VIEW} AS
 SELECT v.data_type, v.google_data_point_id, v.raw_id, v.version, (1 = 0) AS is_current,
        v.raw_json, v.payload_hash, v.source,
        coalesce(v.received_at, CASE WHEN v.version = 1 THEN r.first_seen_at END) AS valid_from,
@@ -64,87 +169,71 @@ SELECT r.data_type, r.google_data_point_id, r.id,
        NULL, r.last_seen_at, r.source_start_time, r.source_end_time, r.source_deleted_at, NULL
 FROM raw_health_data r"""
 
-_COPY = (
-    "raw_id, data_type, google_data_point_id, version, raw_json, payload_hash, "
-    "source_start_time, source_end_time, source_timezone, received_at, last_seen_at, "
-    "superseded_at, source"
-)
-_OLD = (
-    "OLD.id, OLD.data_type, OLD.google_data_point_id, "
-    "(SELECT coalesce(max(v.version), 0) + 1 FROM raw_health_data_versions v "
-    "WHERE v.raw_id = OLD.id), "
-    "OLD.raw_json, OLD.payload_hash, OLD.source_start_time, OLD.source_end_time, "
-    "OLD.source_timezone, OLD.payload_received_at, OLD.last_seen_at, NEW.last_seen_at, "
-    "coalesce(OLD.payload_source, 'legacy')"
-)
-_FROZEN = (
-    "id",
-    "raw_id",
-    "data_type",
-    "google_data_point_id",
-    "raw_json",
-    "payload_hash",
-    "source_start_time",
-    "source_end_time",
-    "source_timezone",
-    "received_at",
-    "last_seen_at",
-    "superseded_at",
-    "source",
-    "created_at",
-)
+_TRIGGER_SQL = {
+    "raw_health_data_keep_version": """BEFORE UPDATE ON raw_health_data FOR EACH ROW
+WHEN (OLD.payload_hash IS DISTINCT FROM NEW.payload_hash
+      OR OLD.raw_json::text IS DISTINCT FROM NEW.raw_json::text)""",
+    "raw_health_data_frozen_identity": f"""BEFORE UPDATE ON raw_health_data FOR EACH ROW
+WHEN (({_row("OLD", _IDENTITY)}) IS DISTINCT FROM ({_row("NEW", _IDENTITY)}))""",
+    "raw_health_data_no_delete": "BEFORE DELETE ON raw_health_data FOR EACH ROW",
+    "raw_health_data_no_truncate": "BEFORE TRUNCATE ON raw_health_data FOR EACH STATEMENT",
+    "raw_health_data_versions_append_only": (
+        "BEFORE UPDATE OR DELETE ON raw_health_data_versions FOR EACH ROW"
+    ),
+    "raw_health_data_versions_no_truncate": (
+        "BEFORE TRUNCATE ON raw_health_data_versions FOR EACH STATEMENT"
+    ),
+}
 
 POSTGRESQL_DDL = (
-    f"""CREATE FUNCTION raw_health_data_keep_version() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    INSERT INTO raw_health_data_versions ({_COPY})
-    VALUES ({_OLD});
-    RETURN NEW;
-END
-$$""",
-    """CREATE TRIGGER raw_health_data_keep_version
-BEFORE UPDATE ON raw_health_data FOR EACH ROW
-WHEN (OLD.payload_hash IS DISTINCT FROM NEW.payload_hash)
-EXECUTE FUNCTION raw_health_data_keep_version()""",
-    f"""CREATE FUNCTION raw_health_data_versions_append_only() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF TG_OP = 'UPDATE' THEN
-        IF ({", ".join(f"NEW.{c}" for c in _FROZEN)})
-           IS NOT DISTINCT FROM ({", ".join(f"OLD.{c}" for c in _FROZEN)}) THEN
-            RETURN NEW;
-        END IF;
-    END IF;
-    RAISE EXCEPTION USING MESSAGE =
-        'raw_health_data_versions is append-only: ' || TG_OP || ' refused';
-END
-$$""",
-    """CREATE TRIGGER raw_health_data_versions_append_only
-BEFORE UPDATE OR DELETE ON raw_health_data_versions FOR EACH ROW
-EXECUTE FUNCTION raw_health_data_versions_append_only()""",
-    """CREATE TRIGGER raw_health_data_versions_no_truncate
-BEFORE TRUNCATE ON raw_health_data_versions FOR EACH STATEMENT
-EXECUTE FUNCTION raw_health_data_versions_append_only()""",
+    *(
+        f"CREATE FUNCTION {name}() RETURNS trigger\nLANGUAGE plpgsql AS $${body}$$"
+        for name, body in FUNCTION_BODIES.items()
+    ),
+    *(
+        f"CREATE TRIGGER {trigger}\n{_TRIGGER_SQL[trigger]}\nEXECUTE FUNCTION {function}()"
+        for _, trigger, function in PROTECTIVE_TRIGGERS
+    ),
+    *(
+        f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}"
+        for table, trigger, _ in PROTECTIVE_TRIGGERS
+    ),
     VIEW_SQL,
 )
+
+
+def _sqlite_refuse(table: str, operation: str) -> str:
+    return f"SELECT RAISE(ABORT, '{table} keeps every record: {operation} refused');"
+
 
 SQLITE_DDL = (
     f"""CREATE TRIGGER raw_health_data_keep_version
 BEFORE UPDATE ON raw_health_data FOR EACH ROW
-WHEN OLD.payload_hash IS NOT NEW.payload_hash
+WHEN OLD.payload_hash IS NOT NEW.payload_hash OR OLD.raw_json IS NOT NEW.raw_json
 BEGIN
     INSERT INTO raw_health_data_versions ({_COPY})
     VALUES ({_OLD});
+END""",
+    f"""CREATE TRIGGER raw_health_data_frozen_identity
+BEFORE UPDATE ON raw_health_data FOR EACH ROW
+WHEN {_sqlite_changed(_IDENTITY)}
+BEGIN
+    {_sqlite_refuse("raw_health_data", "UPDATE")}
+END""",
+    f"""CREATE TRIGGER raw_health_data_no_delete
+BEFORE DELETE ON raw_health_data
+BEGIN
+    {_sqlite_refuse("raw_health_data", "DELETE")}
 END""",
     """CREATE TRIGGER raw_health_data_versions_no_delete
 BEFORE DELETE ON raw_health_data_versions
 BEGIN
     SELECT RAISE(ABORT, 'raw_health_data_versions is append-only: DELETE refused');
 END""",
+    # SQLite (tests only) has no session settings: renumbering is not gated there.
     f"""CREATE TRIGGER raw_health_data_versions_no_update
 BEFORE UPDATE ON raw_health_data_versions FOR EACH ROW
-WHEN {" OR ".join(f"NEW.{c} IS NOT OLD.{c}" for c in _FROZEN)}
+WHEN {_sqlite_changed(_FROZEN)}
 BEGIN
     SELECT RAISE(ABORT, 'raw_health_data_versions is append-only: UPDATE refused');
 END""",
@@ -212,26 +301,49 @@ def upgrade() -> None:
         op.execute(statement)
 
 
+def _refuse_while_kept(context_) -> None:
+    allow_loss = context.get_x_argument(as_dictionary=True).get("allow-version-loss") == "1"
+    if allow_loss:
+        return
+    hint = "Take a backup, then rerun with -x allow-version-loss=1"
+    if context_.as_sql:
+        if context_.dialect.name != "postgresql":
+            raise RuntimeError(f"offline downgrade cannot check {', '.join(KEPT_TABLES)}; {hint}")
+        # The generated script must not drop kept rows either: it checks when it runs.
+        for table in KEPT_TABLES:
+            op.execute(
+                f"""DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM {table}) THEN
+        RAISE EXCEPTION '{table} holds rows that downgrading would drop; {hint}';
+    END IF;
+END
+$$"""
+            )
+        return
+    for table in KEPT_TABLES:
+        kept = op.get_bind().scalar(sa.text(f"SELECT count(*) FROM {table}"))
+        if kept:
+            raise RuntimeError(f"{table} holds {kept} row(s); downgrading would drop them. {hint}")
+
+
 def downgrade() -> None:
     context_ = op.get_context()
-    allow_loss = context.get_x_argument(as_dictionary=True).get("allow-version-loss") == "1"
-    if not context_.as_sql and not allow_loss:
-        kept = op.get_bind().scalar(sa.text("SELECT count(*) FROM raw_health_data_versions"))
-        if kept:
-            raise RuntimeError(
-                f"raw_health_data_versions holds {kept} earlier payload version(s); "
-                "downgrading would drop them. Take a backup, then rerun with "
-                "-x allow-version-loss=1"
-            )
-    op.execute("DROP VIEW raw_health_data_history")
-    if context_.dialect.name == "postgresql":
-        op.execute("DROP TRIGGER raw_health_data_keep_version ON raw_health_data")
-        op.execute("DROP FUNCTION raw_health_data_keep_version()")
+    _refuse_while_kept(context_)
+    postgresql = context_.dialect.name == "postgresql"
+    op.execute(f"DROP VIEW {HISTORY_VIEW}")
+    if postgresql:
+        for table, trigger, _ in PROTECTIVE_TRIGGERS:
+            if table == "raw_health_data":
+                op.execute(f"DROP TRIGGER {trigger} ON {table}")
     else:
-        op.execute("DROP TRIGGER raw_health_data_keep_version")
-    # Dropping the table drops its own triggers; then the PostgreSQL guard function.
+        for table, trigger in SQLITE_TRIGGERS:
+            if table == "raw_health_data":
+                op.execute(f"DROP TRIGGER {trigger}")
+    # Dropping the table drops its own triggers; then the PostgreSQL functions.
     op.drop_table("raw_health_data_versions")
-    if context_.dialect.name == "postgresql":
-        op.execute("DROP FUNCTION raw_health_data_versions_append_only()")
+    if postgresql:
+        for name in FUNCTION_BODIES:
+            op.execute(f"DROP FUNCTION {name}()")
     op.drop_column("raw_health_data", "payload_source")
     op.drop_column("raw_health_data", "payload_received_at")

@@ -7,7 +7,7 @@ import importlib.util
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -401,7 +401,8 @@ async def test_import_slots_archived_versions_in_order_and_is_idempotent(
 
     results = {name: await run(url) for name, url in urls.items()}
     assert [results[name].imported for name in ("d4", "d2", "d1", "d3")] == [1, 1, 1, 0]
-    assert results["d2"].missing_records == {"heart-rate": 1}
+    # A record only the dump has is restored as its own row, marked source-deleted.
+    assert results["d2"].restored_records == {"heart-rate": 1}
     assert results["d3"].already_present == 1
     assert results["d3"].source_hash_mismatches == [f"heart-rate/{corrupt}"]
     assert await chain(sessions) == [
@@ -417,8 +418,15 @@ async def test_import_slots_archived_versions_in_order_and_is_idempotent(
         raw = await session.scalar(
             select(RawHealthData).where(RawHealthData.google_data_point_id == NAME)
         )
+        restored = await session.scalar(
+            select(RawHealthData).where(RawHealthData.google_data_point_id == missing)
+        )
         assert await verify_versions(session) == (4, [])
     assert raw is not None and raw.raw_json == heart_rate(64)
+    assert restored is not None and restored.raw_json == heart_rate(1, missing)
+    assert restored.source_deleted_at is not None
+    assert restored.payload_source == "archive-import"
+    assert sum(sum(item.restored_records.values()) for item in again) == 0
     # Later live changes continue the numbering.
     await store(sessions, heart_rate(65))
     assert [item[0] for item in await chain(sessions)] == [1, 2, 3, 4, 5, 6]
@@ -469,3 +477,73 @@ def test_synthetic_ids_are_versioned_too() -> None:
     record = {"steps": {"interval": {"startTime": "a", "endTime": "b"}, "count": "1"}}
     changed = {"steps": {"interval": {"startTime": "a", "endTime": "b"}, "count": "2"}}
     assert source_id(spec, record) == source_id(spec, changed)
+
+
+def test_offline_downgrade_script_checks_before_dropping_history(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://health:health@postgres:5432/health")
+    get_settings.cache_clear()
+    try:
+        command.downgrade(Config("alembic.ini"), "20261020_0011:20261020_0010", sql=True)
+        script = capsys.readouterr().out
+    finally:
+        get_settings.cache_clear()
+    guard = script.index("IF EXISTS (SELECT 1 FROM raw_health_data_versions)")
+    assert "RAISE EXCEPTION" in script[guard:]
+    assert guard < script.index("DROP TABLE raw_health_data_versions")
+
+
+async def test_raw_records_cannot_be_deleted_or_rekeyed_on_sqlite(sessions):
+    await store(sessions, heart_rate(60))
+    for statement in (
+        "DELETE FROM raw_health_data",
+        "UPDATE raw_health_data SET google_data_point_id = 'other'",
+    ):
+        with pytest.raises((IntegrityError, OperationalError), match="refused"):
+            async with sessions.begin() as session:
+                await session.execute(text(statement))
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(RawHealthData)) == 1
+
+
+async def test_gap_repair_labels_its_versions(sessions, monkeypatch):
+    from app.google_health.client import Page
+
+    path = Path("scripts/audit_date_gaps.py")
+    spec = importlib.util.spec_from_file_location("audit_date_gaps", path)
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    await store(sessions, heart_rate(60))
+    gaps = iter(
+        [
+            [
+                {
+                    "data_type": SPEC.name,
+                    "missing_from": date(2026, 8, 1),
+                    "missing_to": date(2026, 8, 1),
+                }
+            ],
+            [],
+        ]
+    )
+
+    async def audit(zone, end):
+        return next(gaps)
+
+    async def pages(client, spec_, start, end):
+        yield Page([heart_rate(61)], None)
+
+    class Runtime:
+        google = None
+        incremental = type("Incremental", (), {"specs": {SPEC.name: SPEC}})()
+
+        async def shutdown(self):
+            pass
+
+    monkeypatch.setattr(script, "audit", audit)
+    monkeypatch.setattr(script, "iter_pages", pages)
+    monkeypatch.setattr(script, "SessionLocal", sessions)
+    monkeypatch.setattr(script, "build_runtime", lambda settings, sessions_: Runtime())
+    monkeypatch.setattr(script, "get_settings", lambda: None)
+    await script.main(type("Args", (), {"repair": True, "timezone": "UTC"})())
+    assert await chain(sessions) == [(1, False, 60, "sync"), (2, True, 61, "gap-repair")]

@@ -429,12 +429,29 @@ from the stored one, the old payload is **kept as a version**, never overwritten
   payload arrived; both are NULL for payloads stored before migration `20261020_0011`.
 - `raw_health_data_versions` holds every earlier payload, numbered per record (1 = oldest), with
   `received_at` (NULL if unknown), `last_seen_at` (the last fetch that still returned it),
-  `superseded_at` (the fetch that replaced it), `source` (as above, `legacy` for pre-0011
-  payloads, `archive-import` for payloads recovered from old dumps) and `raw_id` (the current row).
-  A database trigger writes the row in the same statement that replaces the payload, so a crash
-  or two concurrent writers cannot lose it. Re-receiving the same payload writes nothing. The table
-  is append-only: triggers refuse `UPDATE` (except renumbering `version` during an archive import),
-  `DELETE` and `TRUNCATE`, and its foreign key keeps the current row from being deleted.
+  `superseded_at` (the fetch that replaced it), `source` (as above, `gap-repair` for
+  `scripts/audit_date_gaps.py --repair`, `legacy` for pre-0011 payloads, `archive-import` for
+  payloads recovered from old dumps) and `raw_id` (the current row). A database trigger writes the
+  row in the same statement that replaces the payload, whenever `payload_hash` **or** the stored
+  text (`raw_json::text`) changes, so a crash, two concurrent writers or a hand-written `UPDATE`
+  cannot lose it. Re-receiving the same payload writes nothing. The table is append-only: triggers
+  refuse `UPDATE`, `DELETE` and `TRUNCATE`; the one exception is renumbering `version`, which
+  PostgreSQL allows only inside a transaction that set `healthos.renumber = '1'` (only
+  `health-mirror import-versions` does). `raw_json` is compared as text, so even `1.0` for `1`
+  counts as a change.
+- **No record is ever deleted.** Triggers on `raw_health_data` refuse `DELETE` (with or without
+  history), `TRUNCATE` (also when reached through `TRUNCATE ... CASCADE` from a referencing table)
+  and any change of a record's identity (`id`, `data_type`, `google_data_point_id`,
+  `first_seen_at`, `created_at`). Every protective trigger is `ENABLE ALWAYS`, so
+  `session_replication_role = replica` does not bypass it either, and `health-mirror verify`
+  fails if one is missing, disabled, or its function body was replaced. What a trigger cannot
+  stop is a superuser's DDL (`DROP TABLE`, `ALTER TABLE ... DISABLE TRIGGER`); `verify` detects
+  the latter, and backups (see below) cover the former.
+- Writers lock rows in key order (each page's rows are sorted before the UPSERT), so two
+  overlapping pages written at the same time wait for each other instead of deadlocking.
+- `source_start_time`, `source_end_time` and `source_timezone` are derived from `raw_json` by the
+  parser; they are copied into each version but a recomputation alone (same payload) does not
+  create one.
 - A record that appears more than once in one page with different payloads becomes one version
   per payload, in page order.
 - Normalized tables stay "current state": they are derived from the current raw payload and can be
@@ -486,14 +503,29 @@ health-mirror history --data-type resting-heart-rate --id 'users/me/dataTypes/�
 
 Before migration `20261020_0011` a changed payload overwrote the stored one; those versions only
 survive in older backups. `health-mirror import-versions --from-db <database>` reads a restored
-dump (any revision, including `json`-typed `raw_json` from before `20261020_0010`) and adds every
-`(record, payload_hash)` the archive does not have yet as a version with `source =
-'archive-import'`, slotted by its `last_seen_at`. Current rows are never changed; existing history
-rows keep their order and are only renumbered. Running it again adds nothing, and dumps can be
-imported in any order. Rows whose stored hash does not match their payload are reported and
-skipped; records that exist only in the dump are counted under `missing_records`, not copied.
-`--dry-run` only counts. `--from-db` takes a database name on the live server or a full SQLAlchemy
-URL. Procedure: [RUNBOOK](RUNBOOK.md#import-payload-versions-from-archive-dumps).
+dump (any revision, including `json`-typed `raw_json` from before `20261020_0010`) and merges each
+record's dump rows into its timeline by `last_seen_at`:
+
+- A dump payload is *already present* only when it lands next to the same payload in that
+  timeline. A payload that left and came back (A → B → A) therefore stays three versions; it is
+  never deduplicated against an older, non-adjacent version.
+- New payloads become versions with `source = 'archive-import'` and `superseded_at` set (the
+  dump's own value when it has one, otherwise the payload's last sighting), so
+  `history --since` lists them. Existing history rows keep their order and are only renumbered.
+- A record the live archive does not have at all is **imported as its own row** (`payload_source =
+  'archive-import'`, `source_deleted_at` set to the dump's value or the import time, so dashboards
+  skip it), its latest dump payload as current version and earlier ones as history. Nothing that
+  ever existed is lost. Live current rows are never changed; an import-restored row may take a
+  newer payload from a later dump (the trigger keeps the old one).
+- Rows whose stored hash does not match their payload (`source_hash_mismatches`) and payloads
+  jsonb cannot store unchanged (`unrepresentable`: a float written as `1e+16`, `-0.0`, a `\u0000`
+  escape) are skipped and listed, without aborting the rest; `--dry-run` reports both too, and the
+  command exits 1 so the dump is kept.
+
+Running it again adds nothing. Dumps are lossless when imported **newest first** (an older
+sighting then always lands at the old end of a timeline); `--from-db` may be repeated and the
+command sorts the dumps that way itself. `--from-db` takes a database name on the live server or a
+full SQLAlchemy URL. Procedure: [RUNBOOK](RUNBOOK.md#import-payload-versions-from-archive-dumps).
 
 ## Webhooks
 
@@ -748,10 +780,12 @@ docker compose exec app health-mirror verify
 health-mirror verify
 ```
 
-This recalculates every raw payload hash and every history payload hash, checks that each record
-has exactly one current row, that its version numbers run 1..n without gaps, that history rows
-match their record's key, and that no version repeats its neighbour's payload, and reports sync
-errors. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
+This first checks that every protective trigger exists, is `ENABLE ALWAYS` and still calls its
+original function body (a disabled or replaced guard would let deletes through unnoticed), then
+recalculates every raw payload hash and every history payload hash, checks that each record has
+exactly one current row, that its version numbers run 1..n without gaps, that history rows match
+their record's key, and that no version repeats its neighbour's payload, and reports sync errors.
+It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
 
 ## Troubleshooting
 

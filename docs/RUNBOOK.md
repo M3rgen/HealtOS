@@ -69,15 +69,15 @@ rebuild, and report the listed row keys. `alembic downgrade 20261020_0009` conve
 with every value kept, but the stored text is jsonb's spelling, not the original; restore the
 backup if the original text is needed.
 
-### `20261020_0011` (raw payload versions)
+### `20261020_0011` (raw payload versions and delete guards)
 
-Adds `raw_health_data_versions`, two nullable columns on `raw_health_data`, the version triggers
-and the `raw_health_data_history` view (see
-[Raw record versions](REFERENCE.md#raw-record-versions)). It copies no rows: existing records
-become version 1 implicitly, so the upgrade is catalog-only and takes well under a second
-regardless of table size (measured: 0.4 s on a 1.4 GB, 1 M-row table), needs no extra disk, and
-holds its exclusive lock on `raw_health_data` only for that moment. The app restarts as for any
-update (a few seconds; Google retries webhooks).
+Adds `raw_health_data_versions`, two nullable columns on `raw_health_data`, the version and guard
+triggers (no `DELETE`/`TRUNCATE`/identity change on `raw_health_data`, append-only history) and the
+`raw_health_data_history` view (see [Raw record versions](REFERENCE.md#raw-record-versions)). It
+copies no rows: existing records become version 1 implicitly, so the upgrade is catalog-only and
+takes well under a second regardless of table size, needs no extra disk, and holds its exclusive
+lock on `raw_health_data` only for that moment. The app restarts as for any update (a few seconds;
+Google retries webhooks).
 
 ```sh
 make backup
@@ -86,27 +86,36 @@ git pull --ff-only
 docker compose up -d --build
 docker compose logs app | grep 20261020_0011     # "Running upgrade 20261020_0010 -> 20261020_0011"
 docker compose exec app alembic current          # expect 20261020_0011 (head)
-docker compose exec app health-mirror verify     # "... raw records and 0 earlier versions"
+docker compose exec app health-mirror verify     # exit 0: guards in place, hashes match
 api /health
 ```
 
 `alembic downgrade 20261020_0010` refuses while history rows exist (it would drop them); after a
-backup, `alembic -x allow-version-loss=1 downgrade 20261020_0010` forces it. Prefer restoring the
-backup.
+backup, `alembic -x allow-version-loss=1 downgrade 20261020_0010` forces it. An offline script
+(`alembic downgrade --sql`) contains the same check as a `DO` block that raises when it runs.
+Prefer restoring the backup.
+
+If `verify` reports a guard as `disabled` or `enabled (not ALWAYS)` (for example after a
+`pg_restore --disable-triggers` data-only restore), re-enable it with the `ALTER TABLE ... ENABLE
+ALWAYS TRIGGER ...` statement it prints. A *missing* trigger or a *changed* function means the
+schema was altered by hand: restore from a backup rather than patching it.
 
 ## Import payload versions from archive dumps
 
 Payload versions overwritten before `20261020_0011` survive only in older dumps. Import them one
-dump at a time: restore into a scratch database, import, drop the scratch database. The live
-archive keeps running; each batch of 2,000 records is locked for a moment while its versions are
-added. A restored dump needs free disk of roughly the live database's size; check `df -h` first.
+dump at a time, **newest first** (that order keeps a payload that came back, A → B → A, as three
+versions): restore into a scratch database, import, drop the scratch database. The live archive
+keeps running; each batch of 2,000 records is locked for a moment while its versions are added. A
+restored dump needs free disk of roughly the live database's size; check `df -h` first. (With disk
+for several, restore them all and pass `--from-db` once per database: the command orders them
+newest first itself.)
 
 ```sh
 make backup                                          # a fresh backup of the live archive first
-for dump in /path/to/encrypted/archive-*.dump.gpg; do
+for dump in $(ls -r /path/to/encrypted/archive-*.dump.gpg); do   # newest first (timestamped names)
   bash scripts/restore.sh "$dump" health_archive     # decrypts (BACKUP_KEY_FILE) into a scratch DB
   docker compose exec -T app health-mirror import-versions --from-db health_archive --dry-run
-  docker compose exec -T app health-mirror import-versions --from-db health_archive
+  docker compose exec -T app health-mirror import-versions --from-db health_archive || break
   docker compose exec -T postgres dropdb -U health health_archive
 done
 docker compose exec app health-mirror verify
@@ -116,11 +125,12 @@ docker compose exec app health-mirror history --data-type heart-rate-variability
 `restore.sh` never touches `health` and decrypts `.gpg` files with the passphrase in
 `BACKUP_KEY_FILE` (default `/etc/healthos/backup.key`) and `.age` files with
 `BACKUP_AGE_IDENTITY`; the decrypted dump is streamed into `pg_restore` and never written to disk.
-Each import prints JSON: `imported` versions added, `already_present`, `renumbered` existing history
-rows, `missing_records` (records only the dump has: reported, not copied) and
-`source_hash_mismatches` (dump rows whose hash does not match their payload: skipped; the command
-exits 1). The order of the dumps does not matter and a repeated import adds nothing. Expect about
-30 seconds per million dump rows for the scan, plus the `pg_restore` time.
+Each import prints JSON per source database: `imported` versions added, `already_present`,
+`renumbered` existing history rows, `restored_records` (records only the dump had, now rows of
+their own marked source-deleted), `source_hash_mismatches` and `unrepresentable` (skipped; the
+command exits 1 and the loop stops, so keep that dump file and report the listed keys). A repeated
+import adds nothing. Expect about 30 seconds per million dump rows for the scan, plus the
+`pg_restore` time.
 
 ## Update images and cloudflared
 

@@ -200,15 +200,17 @@ def webhook_replay_pending() -> None:
 
 @app.command()
 def verify() -> None:
-    """Check raw uniqueness, payload hashes, version history, and checkpoint errors."""
+    """Check archive guards, payload hashes, version history, and checkpoint errors."""
 
     async def command():
         from app.parsers.common import payload_hash
-        from app.services.raw_history import verify_versions
+        from app.services.raw_history import verify_guards, verify_versions
 
         errors = []
         count = 0
         async with SessionLocal() as session:
+            # First: a missing or disabled guard means deletes could go through unnoticed.
+            errors.extend(await verify_guards(session))
             rows = await session.stream(
                 select(
                     RawHealthData.data_type,
@@ -277,34 +279,61 @@ def history(
         raise typer.Exit(1)
 
 
+FROM_DB_OPTION = typer.Option(
+    ...,
+    "--from-db",
+    help=(
+        "Restored archive: a database name on the live server, or a full URL. "
+        "Repeat for several dumps; they are imported newest first."
+    ),
+)
+
+
 @app.command()
 def import_versions(
-    from_db: str = typer.Option(
-        ...,
-        "--from-db",
-        help="Restored archive: a database name on the live server, or a full URL.",
-    ),
+    from_db: list[str] = FROM_DB_OPTION,
     batch_size: int = typer.Option(2_000, min=1, max=50_000),
     dry_run: bool = typer.Option(False, "--dry-run", help="Count only; write nothing."),
 ) -> None:
-    """Add payload versions that only survive in an old dump; current rows stay as they are."""
+    """Add payload versions (and whole records) that only survive in old dumps."""
+    from sqlalchemy.engine import make_url
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from app.services.raw_history import import_versions as run_import
-    from app.services.raw_history import source_database_url
+    from app.services.raw_history import newest_sighting, source_database_url
 
-    url = source_database_url(from_db, get_settings().database_url)
+    urls = [source_database_url(item, get_settings().database_url) for item in from_db]
 
     async def command():
-        source = create_async_engine(url)
+        engines = [create_async_engine(url) for url in urls]
         try:
-            return await run_import(SessionLocal, source, batch_size=batch_size, dry_run=dry_run)
+            # Newest first: each older sighting then lands at the old end of a record's
+            # timeline, so a payload that left and came back (A, B, A) stays three versions.
+            newest = [await newest_sighting(engine) for engine in engines]
+            order = sorted(
+                range(len(engines)),
+                key=lambda i: newest[i] or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+            results = []
+            for index in order:
+                stats = await run_import(
+                    SessionLocal, engines[index], batch_size=batch_size, dry_run=dry_run
+                )
+                results.append((make_url(urls[index]).database, stats))
+            return results
         finally:
-            await source.dispose()
+            for engine in engines:
+                await engine.dispose()
 
-    stats = run(command())
-    typer.echo(json.dumps({"dry_run": dry_run, **stats.as_dict()}, indent=2))
-    if stats.source_hash_mismatches:
+    results = run(command())
+    report = [{"database": name, **stats.as_dict()} for name, stats in results]
+    typer.echo(json.dumps({"dry_run": dry_run, "sources": report}, indent=2))
+    if any(stats.source_hash_mismatches or stats.unrepresentable for _, stats in results):
+        typer.echo(
+            "some dump rows were not imported (listed above); keep those dump files",
+            err=True,
+        )
         raise typer.Exit(1)
 
 

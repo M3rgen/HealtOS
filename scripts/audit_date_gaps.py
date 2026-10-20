@@ -81,7 +81,11 @@ async def main(args):
                     window_end = min(cursor + timedelta(days=spec.max_window_days or 7), stop)
                     async for page in iter_pages(runtime.google, spec, cursor, window_end):
                         async with SessionLocal.begin() as session:
-                            stats.add(await store_records(session, spec, page.data_points))
+                            stats.add(
+                                await store_records(
+                                    session, spec, page.data_points, source="gap-repair"
+                                )
+                            )
                     cursor = window_end
                 totals.add(stats)
                 print(

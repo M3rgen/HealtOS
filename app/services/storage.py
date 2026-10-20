@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
 
-from sqlalchemy import case, select
+from sqlalchemy import Text, and_, case, cast, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -126,9 +126,14 @@ async def store_records(
         elif existing_hash is None or replaced:
             normalized_values[normalized.model].append(normalized.values)
             stats.normalized += 1
+    # Concurrent writers (a CLI sync next to the server, backfill next to a webhook) lock
+    # rows in key order, so two overlapping pages wait for each other instead of
+    # deadlocking.
     for rows in rounds:
+        rows.sort(key=lambda row: row["google_data_point_id"])
         await _upsert_raw_many(session, rows)
     for model, values in normalized_values.items():
+        values.sort(key=lambda row: (row.get("data_type", ""), row["google_data_point_id"]))
         await _upsert_normalized_many(session, model, values)
     if records:
         event(
@@ -167,7 +172,7 @@ async def _upsert_normalized_many(session: AsyncSession, model, rows: list[dict]
     if not rows:
         return
     table = model.__table__
-    statement = _insert(session, table)
+    statement = dialect_insert(session, table)
     conflict_columns = ["google_data_point_id"]
     if "data_type" in rows[0]:
         conflict_columns.insert(0, "data_type")
@@ -184,11 +189,14 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
     if not rows:
         return
     table = RawHealthData.__table__
-    statement = _insert(session, table)
-    # The payload is overwritten in place; when its hash changes, the trigger of
-    # migration 20261020_0011 has already copied the replaced row into
+    statement = dialect_insert(session, table)
+    # The payload is overwritten in place; when its hash or stored text changes, the
+    # trigger of migration 20261020_0011 has already copied the replaced row into
     # raw_health_data_versions. When and how a payload arrived only changes with it.
-    unchanged = table.c.payload_hash == statement.excluded.payload_hash
+    unchanged = and_(
+        table.c.payload_hash == statement.excluded.payload_hash,
+        cast(table.c.raw_json, Text) == cast(statement.excluded.raw_json, Text),
+    )
     updates = {
         "source_start_time": statement.excluded.source_start_time,
         "source_end_time": statement.excluded.source_end_time,
@@ -213,7 +221,7 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
     await session.execute(statement, rows)
 
 
-def _insert(session: AsyncSession, table):
+def dialect_insert(session: AsyncSession, table):
     dialect = session.get_bind().dialect.name
     if dialect == "postgresql":
         return postgresql_insert(table)
