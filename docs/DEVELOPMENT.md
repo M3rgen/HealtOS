@@ -44,6 +44,8 @@ uv run --frozen --extra dev pytest -q
 uv run --frozen --extra dev python scripts/verify_configuration.py
 ```
 
+PostgreSQL-specific behaviour (migrations, upserts, time-zone boundaries, index plans) is covered by `tests/integration`, marked `integration`. These tests skip unless `DATABASE_URL` points at PostgreSQL; each one creates and drops its own `healthos_it_*` database, so the role needs `CREATEDB`. CI runs them separately with `pytest -m integration` and `HEALTHOS_REQUIRE_POSTGRES=1`, which turns the skip into a failure.
+
 CI also applies PostgreSQL migrations, checks schema drift, validates Compose, and builds the application image. `scripts/verify_compose.py` performs a broader smoke test in its own temporary Compose project; it creates and removes only its isolated test resources.
 
 Browser checks in `tests/browser` need Playwright with a browser installed and the appropriate local frontend URL. Some require a running backend; others intercept requests with synthetic fixtures. Never use a real archive for public screenshots. Validate desktop and mobile dimensions after interface changes: the main document must not scroll, and long content must remain reachable inside its panel.
