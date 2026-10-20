@@ -40,7 +40,11 @@ Seeding: a record without history rows *is* version 1, and the view numbers the 
 row `max(history version) + 1`. So the existing archive needs no copy: no row of
 `raw_health_data` is rewritten, nothing is stored twice, and the upgrade is catalog-only
 (nullable `ADD COLUMN` without a default, an empty table, functions, triggers, one view):
-well under a second, independent of table size, with no extra disk.
+well under a second, independent of table size, with no extra disk. It sets
+`lock_timeout` (30 s, `-x lock-timeout=...` to change): if another session holds one of
+its tables (the nightly pg_dump does, for the whole dump), it fails fast, changing nothing,
+with a message to retry, instead of queueing every reader behind its ACCESS EXCLUSIVE
+request.
 
 downgrade() drops only these new objects. It refuses while history rows exist, because
 dropping them would lose exactly the versions this revision keeps; pass
@@ -50,6 +54,8 @@ check is emitted as a `DO` block that raises in the generated script itself.
 The trigger and view SQL below is a frozen copy of app/models/raw_versions.py, which
 builds the same objects for `create_all`; tests/test_raw_versions.py compares them.
 """
+
+import re
 
 import sqlalchemy as sa
 from alembic import context, op
@@ -408,8 +414,44 @@ SQLITE_TRIGGERS = tuple((table, trigger) for trigger, (table, _) in _SQLITE_TRIG
 SQLITE_DDL = (*(sql for _, sql in _SQLITE_TRIGGERS.values()), VIEW_SQL)
 
 
+# How long the upgrade waits for each lock (raw_health_data, the webhook and manual tables)
+# before it gives up, changing nothing. Without it, a session holding one of them (the
+# nightly pg_dump holds ACCESS SHARE on every table for its whole run) would make the
+# ACCESS EXCLUSIVE request wait indefinitely, and every reader would queue behind it.
+# `alembic -x lock-timeout=2min upgrade head` overrides it.
+LOCK_TIMEOUT = "30s"
+_LOCK_NOT_AVAILABLE = "55P03"
+
+
+def _lock_timeout() -> str:
+    value = context.get_x_argument(as_dictionary=True).get("lock-timeout", LOCK_TIMEOUT)
+    if not re.fullmatch(r"[1-9][0-9]*(ms|s|min)?", value):
+        raise ValueError(f"lock-timeout must look like 30s, 500ms or 2min, not {value!r}")
+    return value
+
+
 def upgrade() -> None:
-    dialect = op.get_context().dialect.name
+    if op.get_context().dialect.name != "postgresql":
+        _upgrade("sqlite")
+        return
+    timeout = _lock_timeout()
+    op.execute(f"SET LOCAL lock_timeout = '{timeout}'")
+    try:
+        _upgrade("postgresql")
+    except sa.exc.DBAPIError as exc:
+        code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+        if code != _LOCK_NOT_AVAILABLE:
+            raise
+        raise RuntimeError(
+            f"20261020_0011 could not lock its tables within {timeout}: another session holds "
+            "them (most likely the nightly backup's pg_dump, from 03:30). Nothing was changed "
+            "and the database is still on 20261020_0010; retry when that session has finished "
+            "(see docs/RUNBOOK.md, 20261020_0011)."
+        ) from exc
+    op.execute("SET LOCAL lock_timeout TO DEFAULT")
+
+
+def _upgrade(dialect: str) -> None:
     op.create_table(
         "raw_api_responses",
         sa.Column("id", BIGINT, primary_key=True, autoincrement=True),

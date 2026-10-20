@@ -99,3 +99,36 @@ def test_fresh_upgrade_downgrade_and_reupgrade(database_url, alembic_config) -> 
         command.check(alembic_config)
     finally:
         engine.dispose()
+
+
+def test_0011_gives_up_on_a_held_lock_instead_of_blocking(
+    database_url, alembic_config, monkeypatch
+) -> None:
+    from argparse import Namespace
+
+    command.upgrade(alembic_config, "20261020_0010")
+    # Safety net for the test only: without the migration's own lock_timeout the upgrade
+    # would wait forever; this turns that into a failure after 20 s.
+    monkeypatch.setenv("PGOPTIONS", "-c statement_timeout=20000")
+    engine = create_engine(_sync_url(database_url))
+    blocker = engine.connect()
+    try:
+        # What pg_dump holds on every table for the length of the dump.
+        blocker.execute(text("LOCK TABLE raw_health_data IN ACCESS SHARE MODE"))
+        alembic_config.cmd_opts = Namespace(x=["lock-timeout=1s"])
+        with pytest.raises(RuntimeError, match="could not lock its tables within 1s.*retry"):
+            command.upgrade(alembic_config, "head")
+        blocker.rollback()
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "20261020_0010"
+            )
+            assert connection.scalar(text("SELECT to_regclass('raw_api_responses')")) is None
+        monkeypatch.delenv("PGOPTIONS")
+        alembic_config.cmd_opts = None
+        command.upgrade(alembic_config, "head")  # once the lock is free, it just works
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
+    finally:
+        blocker.close()
+        engine.dispose()

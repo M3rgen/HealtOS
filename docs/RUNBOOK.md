@@ -84,6 +84,20 @@ upgrade is catalog-only: measured 0.02 s on a synthetic 500,000-row, 393 MB `raw
 Google retries webhooks). From then on `raw_api_responses` grows by every page fetched (see the
 size query in the reference).
 
+**Do not deploy while the nightly backup runs** (the timer starts it at 03:30; it takes as long as
+the dump). `pg_dump` holds a lock on every table until it finishes, and the upgrade needs an
+`ACCESS EXCLUSIVE` lock on `raw_health_data` (and locks on the webhook and manual tables). The
+upgrade sets `lock_timeout = 30s`: if it cannot get a lock within 30 seconds it stops with
+`20261020_0011 could not lock its tables within 30s ... retry`, changes nothing (the database stays
+on `20261020_0010`), and readers were blocked for at most those 30 seconds instead of until the dump
+ends. The app container then exits and `restart: unless-stopped` retries the upgrade by itself;
+once the backup has finished one of those retries succeeds. To wait instead, check first:
+
+```sh
+systemctl is-active healthos-backup.service      # "inactive" (not "activating"): no backup running
+systemctl list-timers healthos-backup.timer      # next run not within the next minutes
+```
+
 ```sh
 make backup
 docker compose exec app alembic current          # expect 20261020_0010
@@ -97,10 +111,55 @@ api /health
 docker compose exec app health-mirror responses --limit 3   # pages are being kept
 ```
 
-`alembic downgrade 20261020_0010` refuses while history, response or event rows exist (it would drop them); after a
-backup, `alembic -x allow-version-loss=1 downgrade 20261020_0010` forces it. An offline script
-(`alembic downgrade --sql`) contains the same check as a `DO` block that raises when it runs.
-Prefer restoring the backup.
+#### Rolling back the application after `20261020_0011`
+
+Do **not** downgrade the schema. `alembic downgrade 20261020_0010` refuses as soon as
+`raw_api_responses` (or the history or event tables) holds a row, which is minutes after the first
+sync, by design: downgrading would drop exactly the data this revision keeps. (`-x
+allow-version-loss=1` would force it; never use it on the live archive. An offline `alembic
+downgrade --sql` script contains the same check as a `DO` block.) The previous image cannot simply
+be started either: its container command is `alembic upgrade head && uvicorn ...`, and its
+`alembic upgrade head` fails with `Can't locate revision identified by '20261020_0011'`, so the app
+never starts.
+
+Roll back by running the previous image **with only the uvicorn command** (no Alembic), against the
+0011 schema as it is:
+
+```sh
+cat > /tmp/healthos-no-migrate.yml <<'YAML'
+services:
+  app:
+    command: ["sh", "-c", "exec uvicorn app.main:app --host $${APP_HOST:-127.0.0.1} --port $${APP_PORT:-8000} --no-access-log"]
+YAML
+git checkout <previous commit>                   # the one running before the update
+docker compose -f docker-compose.yml -f /tmp/healthos-no-migrate.yml up -d --build app   # plus your usual -f overrides
+docker compose exec app alembic current          # still 20261020_0011: nothing was dropped
+api /health
+```
+
+The previous code works against the 0011 schema: the new columns are nullable, nothing it does is
+refused by the guards (it never deletes or truncates raw, webhook or manual rows), and the version
+trigger still keeps every replaced payload. Verified on 2026-10-20 (PostgreSQL 16) with the release
+before 0011 (commit `0b08a27`) on a database migrated to `20261020_0011`: its `alembic upgrade
+head` fails as described, `uvicorn` alone starts and serves `/health/live`, its PostgreSQL
+integration tests for storage, sync, dashboard and freshness pass (only its migration tests fail,
+because they expect `20261020_0010` as head), and its `health-mirror verify` passes. While it runs,
+Google responses are not stored in `raw_api_responses` and new payloads carry no `payload_source`
+or `response_id`, so roll forward soon: check out the fixed release and run a plain `docker compose
+up -d --build` (without the override; the 0011 migration is already applied, so Alembic has nothing
+to do). Keep using the override file for every restart until then; a plain `up` of the old code
+fails at Alembic.
+
+#### Guards and the database superuser
+
+Production's `health` role (`POSTGRES_USER` of the official image) is a **superuser** and owns
+every table. Triggers stop `DELETE`, `TRUNCATE`, `UPDATE` and `session_replication_role = replica`
+from any role, but no trigger can stop the owner's or a superuser's DDL: `DROP TABLE`, `ALTER TABLE
+... DISABLE TRIGGER`, `DROP TRIGGER`, `CREATE OR REPLACE FUNCTION`, or a trigger recreated with
+`WHEN (false)`. `health-mirror verify` detects every change to the guards (missing, disabled,
+redefined, extra triggers, replaced functions) and the backups recover dropped data. Follow-up (not
+done yet): run the app as a separate non-superuser role that does not own the tables, with only
+`SELECT`/`INSERT`/`UPDATE` grants, so the application itself could not issue that DDL.
 
 If `verify` reports a guard as `disabled` or `enabled (not ALWAYS)` (for example after a
 `pg_restore --disable-triggers` data-only restore), re-enable it with the `ALTER TABLE ... ENABLE
@@ -192,6 +251,25 @@ journalctl -p crit -t healthos-backup   # failures reported by healthos-backup-f
 
 Check the status file weekly: `result` must be `success` and `timestamp` from the last day. A
 `failure` carries the reason in `message`; a stale timestamp means the timer is not running.
+
+### Watch the disk
+
+Nothing here ever deletes data to save space: every Google response (`raw_api_responses`), every
+payload version and every backup dump is kept forever, so the disk only fills. There is no
+`health-mirror` command for disk usage; check monthly, and before imports or migrations:
+
+```sh
+df -h /var/lib/docker backups/                    # database volume; backups (or BACKUP_HOST_DIR)
+docker compose exec -T postgres psql -U health -d health -c "SELECT pg_size_pretty(pg_database_size('health'))"
+docker compose exec -T postgres psql -U health -d health -c \
+  "SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) FROM pg_class
+   WHERE relname IN ('raw_api_responses', 'raw_health_data', 'raw_health_data_versions')"
+du -sh backups/                                   # or BACKUP_HOST_DIR
+cat backups/last-backup-status.json               # size_bytes, free_bytes, required_free_bytes
+```
+
+When free space trends towards the backup guard (`required_free_bytes`, twice the newest dump),
+grow the disk or move old dumps as below; never delete data or responses to make room.
 
 ### Disk space for backups
 

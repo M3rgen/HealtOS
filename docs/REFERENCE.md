@@ -446,9 +446,12 @@ from the stored one, the old payload is **kept as a version**, never overwritten
   and any change of a record's identity (`id`, `data_type`, `google_data_point_id`,
   `first_seen_at`, `created_at`). Every protective trigger is `ENABLE ALWAYS`, so
   `session_replication_role = replica` does not bypass it either, and `health-mirror verify`
-  fails if one is missing, disabled, or its function body was replaced. What a trigger cannot
-  stop is a superuser's DDL (`DROP TABLE`, `ALTER TABLE ... DISABLE TRIGGER`); `verify` detects
-  the latter, and backups (see below) cover the former.
+  fails if one is missing, disabled, redefined (other events, timing, level, columns or `WHEN`,
+  e.g. `WHEN (false)`), joined by another trigger on a guarded table, or its function body was
+  replaced. What a trigger cannot stop is the table owner's or a superuser's DDL (`DROP TABLE`,
+  `ALTER TABLE ... DISABLE TRIGGER`), and production's `health` role is a superuser; `verify`
+  detects the latter, and backups (see below) cover the former (see
+  [the runbook](RUNBOOK.md#guards-and-the-database-superuser)).
 - Writers lock rows in key order (each page's rows are sorted before the UPSERT), so two
   overlapping pages written at the same time wait for each other instead of deadlocking.
 - `source_start_time`, `source_end_time` and `source_timezone` are derived from `raw_json` by the
