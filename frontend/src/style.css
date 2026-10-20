@@ -14,6 +14,12 @@ main{width:100%;margin:0;padding:20px 20px 30px}.overview-grid{display:grid;grid
 /* Keep WebGL's drawing buffer out of intrinsic flex sizing. */
 #body-model{position:relative;overflow:hidden;width:100%}
 #body-model canvas{position:absolute;inset:0;width:100%;height:100%}
+/* Loading state: the static silhouette until body.glb has rendered, then it fades out under the canvas. */
+#body-model .model-loading{position:absolute;inset:0;height:auto;pointer-events:none;transition:opacity .45s ease,visibility 0s linear .45s}
+#body-model .model-loading svg{height:min(280px,82%);width:auto;opacity:.55;animation:model-loading 1.6s ease-in-out infinite alternate}
+#body-model[data-model-loaded] .model-loading{opacity:0;visibility:hidden}
+#body-model[data-model-failed] .model-loading svg{animation:none}
+@keyframes model-loading{to{opacity:.3}}
 
 .button-icon{display:inline-flex;width:23px;height:23px;flex:none}
 .button-icon svg{width:100%;height:100%}

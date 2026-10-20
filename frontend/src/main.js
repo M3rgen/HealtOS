@@ -1,5 +1,4 @@
 import './style.css';
-import { createBody } from './body.js';
 import { renderIcons, iconMarkup } from './icons.js';
 import { setupChat } from './chat.js';
 import { setupMetricHistory } from './metric-history.js';
@@ -78,7 +77,18 @@ if (![...$('timezone').options].some(option => option.value === zoneChoice))
   $('timezone').add(new Option(zoneChoice, zoneChoice));
 $('timezone').value = zoneChoice;
 $('model-motion').checked = motion;
-const body = createBody($('body-model'), motion);
+// three.js and the body viewer load in their own chunk; the static silhouette in #body-model shows meanwhile.
+let body = null,
+  bodyMetrics = null;
+import('./body.js')
+  .then(({ createBody }) => {
+    body = createBody($('body-model'), $('model-motion').checked);
+    if (bodyMetrics) body.setBodyMetrics(bodyMetrics);
+    updateMotion();
+  })
+  .catch(() => {
+    $('body-model').dataset.modelFailed = 'true';
+  });
 const shortDate = value =>
   new Intl.DateTimeFormat('tr-TR', { timeZone: zone, day: 'numeric', month: 'short' }).format(new Date(value));
 const fullDate = value =>
@@ -247,12 +257,13 @@ function paintData() {
     })
     .join('');
   // Drive the 3D body's morphs from the latest profile measurements (missing values keep the basis).
-  body.setBodyMetrics({
+  bodyMetrics = {
     heightCm: data.profile.height?.value,
     weightKg: data.profile.weight?.value,
     bodyFatPct: data.profile.body_fat?.value,
     musclePct: data.profile.muscle?.value,
-  });
+  };
+  body?.setBodyMetrics(bodyMetrics);
   $('steps-label').textContent = first.partial ? 'Bugünkü adım' : 'O günkü adım';
   $('sleep-label').textContent = first.partial ? 'Dün geceki uyku' : 'O geceki uyku';
   $('steps-value').textContent = num(first.steps);
@@ -540,7 +551,7 @@ $('timezone').addEventListener('change', async () => {
   if (activePage === 'sports') await workouts.update();
 });
 function updateMotion() {
-  body.setMotion($('model-motion').checked);
+  body?.setMotion($('model-motion').checked);
 }
 $('model-motion').addEventListener('change', () => {
   writePreference('healtos.motion', String($('model-motion').checked));
