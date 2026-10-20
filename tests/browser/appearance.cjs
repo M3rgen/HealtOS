@@ -2,14 +2,12 @@
 // Appearance settings: preset selection persists across reloads, "Varsayılana dön"
 // restores defaults, uploads are validated, and an uploaded SVG is only ever shown
 // through a blob: URL (its markup and script never reach the DOM).
-// Run with Playwright resolvable (e.g. NODE_PATH=frontend/node_modules) and a Vite
-// dev server running: APPEARANCE_BASE_URL=http://127.0.0.1:5174 node tests/browser/appearance.cjs
+// Run with `cd frontend && npm run test:browser`, or against your own Vite server:
+// HEALTHOS_TEST_URL=http://127.0.0.1:5174 node tests/browser/appearance.cjs
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { chromium } = require('playwright');
+const { BASE, launch } = require('./lib.cjs');
 const fx = require(path.join(__dirname, '../../frontend/preview/fixtures.cjs'));
-
-const BASE = process.env.APPEARANCE_BASE_URL || 'http://127.0.0.1:5174';
 
 async function mock(page, problems) {
   const origin = new URL(BASE).origin;
@@ -29,7 +27,7 @@ async function mock(page, problems) {
 }
 
 (async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launch();
   try {
     for (const [width, height] of [[1280, 800], [390, 844]]) {
       const context = await browser.newContext({ viewport: { width, height } });

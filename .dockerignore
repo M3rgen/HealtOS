@@ -33,3 +33,4 @@ docs/design
 *.token
 deploy/cloudflare/config.yml
 deploy/cloudflare/*.json
+frontend/.test-output

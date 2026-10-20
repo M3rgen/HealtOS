@@ -14,6 +14,12 @@ export function setupChat(getTimezone) {
   const MAX_RETRIES = 5;
   let started = false, retries = 0;
 
+  // The bubble's layout box: its hover/press scale must not shift the panel or the drag origin.
+  function launcherBox() {
+    const left = launcher.offsetLeft, top = launcher.offsetTop;
+    return {left, top, right: left + launcher.offsetWidth, bottom: top + launcher.offsetHeight};
+  }
+
   function placeDialog() {
     if (dialog.hidden) return;
     const edge = 8, gap = 12;
@@ -21,7 +27,7 @@ export function setupChat(getTimezone) {
     const left = viewport?.offsetLeft ?? 0, top = viewport?.offsetTop ?? 0;
     const width = viewport?.width ?? document.documentElement.clientWidth;
     const height = viewport?.height ?? window.innerHeight;
-    const rect = launcher.getBoundingClientRect();
+    const rect = launcherBox();
     const above = rect.top - top - edge - gap;
     const below = top + height - edge - rect.bottom - gap;
     const useAbove = above >= 300 || above >= below;
@@ -51,7 +57,7 @@ export function setupChat(getTimezone) {
 
   launcher.addEventListener('pointerdown', (event) => {
     if (!event.isPrimary || event.button !== 0) return;
-    const rect = launcher.getBoundingClientRect();
+    const rect = launcherBox();
     drag = {id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, moved: false};
     suppressClick = false;
     launcher.setPointerCapture(event.pointerId);
@@ -78,7 +84,7 @@ export function setupChat(getTimezone) {
   function fitViewport() {
     if (movedLauncher || (!dialog.hidden && window.visualViewport?.height < window.innerHeight)) {
       movedLauncher = true;
-      const rect = launcher.getBoundingClientRect();
+      const rect = launcherBox();
       placeLauncher(rect.left, rect.top);
     } else placeDialog();
   }

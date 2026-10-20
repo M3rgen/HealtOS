@@ -56,3 +56,6 @@ oauth-token*
 
 # macOS
 .DS_Store
+
+# Browser check screenshots (tests/browser, npm run test:browser)
+frontend/.test-output/

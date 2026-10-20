@@ -1,12 +1,51 @@
-// Run with Playwright on NODE_PATH and the local site running.
+// Synthetic fixtures; no live account records.
+// Umay chat: streaming, Markdown rendering, unsafe HTML, presence, drag/resize, no page overflow.
+// The chat socket is replaced in the page, so no Codex bridge is needed. Targets the shared
+// HEALTHOS_TEST_URL (Vite) by default; set UMAY_BASE_URL to run it against the built app served
+// by the backend instead (for example http://127.0.0.1:8000, to exercise its real CSP). With
+// UMAY_BASE_URL set and nothing serving the app there, the check is skipped.
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
+const path = require('node:path');
+const { BASE, launch, shot, skip, run } = require('./lib.cjs');
+const fx = require(path.join(__dirname, '../../frontend/preview/fixtures.cjs'));
 
-(async () => {
-  const browser = await chromium.launch({headless: true, channel: 'msedge'});
+const TARGET = (process.env.UMAY_BASE_URL || BASE).replace(/\/$/, '');
+
+async function reachable(url) {
+  try {
+    const response = await fetch(url, {signal: AbortSignal.timeout(3000), redirect: 'manual'});
+    if (response.status !== 200) return `answered HTTP ${response.status}`;
+    return (await response.text()).includes('assistant-open') ? null : 'did not serve the HealthOS page';
+  } catch (error) {
+    return `is not reachable (${error.cause?.code ?? error.name})`;
+  }
+}
+
+// Dashboard data is always synthetic, even against a backend that has a real archive.
+async function mock(page) {
+  await page.route('**/*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin !== new URL(TARGET).origin) return route.abort();
+    const p = url.pathname;
+    if (p === '/health') return route.fulfill({json: fx.health});
+    if (p === '/api/dashboard') return route.fulfill({json: fx.dashboard(url.searchParams)});
+    if (p === '/sync/status') return route.fulfill({json: fx.syncStatus});
+    if (/^\/(api|sync|auth|google-health)\//.test(p)) return route.fulfill({status: 404, json: {}});
+    return route.continue();
+  });
+}
+
+run(async () => {
+  const problem = await reachable(TARGET);
+  if (problem) {
+    if (process.env.UMAY_BASE_URL) skip(`no backend: ${TARGET} ${problem}`);
+    throw new Error(`${TARGET} ${problem}`);
+  }
+  const browser = await launch();
   try {
     for (const width of [1280, 390, 320]) {
       const page = await browser.newPage({viewport: {width, height: 900}});
+      await mock(page);
       await page.addInitScript(() => {
         const OriginalSocket = window.WebSocket;
         window.WebSocket = class {
@@ -35,13 +74,19 @@ const { chromium } = require('playwright');
           close() {}
         };
       });
-      await page.goto(process.env.UMAY_BASE_URL || 'http://localhost:8000');
-      await page.waitForFunction(() => document.querySelector('#assistant-status').dataset.presence === 'online');
+      await page.goto(TARGET);
+      await page.waitForFunction(() => document.querySelectorAll('#history-rows tr').length === 7);
       assert.equal(await page.locator('#assistant-dialog').isVisible(), false);
       assert.equal(await page.evaluate(() => document.activeElement.id === 'assistant-input'), false);
+      // The chat socket opens only when Umay is first opened.
+      assert.equal(await page.evaluate(() => window.umayConnections ?? 0), 0);
       await page.locator('#assistant-open').click();
+      await page.waitForFunction(() => document.querySelector('#assistant-status').dataset.presence === 'online');
       await page.locator('#assistant-status').getByText('Aktif', {exact: true}).waitFor();
       async function checkGeometry() {
+        // Move off the bubble so its :hover scale does not shift the measured box.
+        await page.mouse.move(1, 1);
+        await page.waitForFunction(() => !document.getElementById('assistant-open').getAnimations().length);
         const geometry = await page.evaluate(() => {
           const panel = document.querySelector('#assistant-dialog').getBoundingClientRect();
           const bubble = document.querySelector('#assistant-open').getBoundingClientRect();
@@ -49,10 +94,11 @@ const { chromium } = require('playwright');
             fits: panel.left >= 0 && panel.top >= 0 && panel.right <= innerWidth && panel.bottom <= innerHeight,
             attached: Math.abs(bubble.top - panel.bottom - 12) < 1 || Math.abs(panel.top - bubble.bottom - 12) < 1,
             overflow: document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight,
+            panel: [panel.top, panel.bottom], bubble: [bubble.top, bubble.bottom],
           };
         });
         assert.equal(geometry.fits, true);
-        assert.equal(geometry.attached, true);
+        assert.equal(geometry.attached, true, JSON.stringify(geometry));
         assert.equal(geometry.overflow, false);
       }
       await checkGeometry();
@@ -87,7 +133,7 @@ const { chromium } = require('playwright');
       await page.locator('#assistant-send').click();
       assert.equal(await page.locator('#assistant-status').textContent(), 'Yazıyor');
       assert.equal(await page.locator('#assistant-typing').isVisible(), true);
-      await page.screenshot({path: `.test-tmp-umay-thinking-${width}.png`});
+      await page.screenshot({path: shot(`umay-thinking-${width}.png`)});
       await page.emulateMedia({reducedMotion: 'reduce'});
       assert.equal(await page.locator('#assistant-typing span').first().evaluate(el => getComputedStyle(el).animationName), 'none');
       await page.locator('.chat-assistant .chat-content').getByText('Son cümle.', {exact: false}).waitFor();
@@ -117,7 +163,7 @@ const { chromium } = require('playwright');
       assert.equal(result.overflow, false);
       assert.equal(await page.locator('#assistant-status').textContent(), 'Aktif');
       assert.equal(await page.locator('#assistant-typing').isVisible(), false);
-      await page.screenshot({path: `.test-tmp-umay-render-${width}.png`});
+      await page.screenshot({path: shot(`umay-render-${width}.png`)});
       await page.locator('#assistant-new').click();
       await page.locator('#assistant-status').getByText('Aktif', {exact: true}).waitFor();
       assert.equal(await page.locator('#assistant-typing').count(), 1);
@@ -137,4 +183,4 @@ const { chromium } = require('playwright');
   } finally {
     await browser.close();
   }
-})().catch(error => {console.error(error); process.exitCode = 1;});
+});

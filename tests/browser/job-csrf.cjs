@@ -1,9 +1,9 @@
 // Synthetic fixtures; no live account records.
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
+const { BASE, launch, run } = require('./lib.cjs');
 
-(async () => {
-  const browser = await chromium.launch({headless:true,channel:'msedge'});
+run(async () => {
+  const browser = await launch();
   try {
     for (const viewport of [{width:1280,height:720},{width:390,height:844}]) {
       const page = await browser.newPage({viewport});
@@ -22,7 +22,7 @@ const { chromium } = require('playwright');
         started++;
         await route.fulfill({status:202,json:{status:'accepted',data_types:['steps'],sequence:0}});
       });
-      await page.goto(process.env.HEALTHOS_TEST_URL || 'http://127.0.0.1:5174');
+      await page.goto(BASE);
       await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');
       await page.locator('#sync-button').click();
       await page.waitForFunction(()=>!document.querySelector('#sync-button').disabled);
@@ -36,4 +36,4 @@ const { chromium } = require('playwright');
     }
     console.log('PASS: desktop/mobile sync sends CSRF header and page does not overflow');
   } finally { await browser.close(); }
-})().catch(error=>{console.error(error);process.exit(1)});
+});

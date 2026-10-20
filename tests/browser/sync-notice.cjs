@@ -1,9 +1,9 @@
 // Synthetic fixtures; no live account records.
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
+const { BASE, launch, run } = require('./lib.cjs');
 
-(async () => {
-  const browser = await chromium.launch({headless:true,channel:'msedge'});
+run(async () => {
+  const browser = await launch();
   try {
     const page = await browser.newPage({viewport:{width:1280,height:720}});
     let rejectStart = false, failed = false, runs = 0;
@@ -19,7 +19,7 @@ const { chromium } = require('playwright');
     await page.route('**/sync/status', route => route.fulfill({json:[{data_type:'steps',
       status:failed?'failed':'completed',last_error:failed?'Google erişim izni reddedildi.':null,
       last_run:{sequence:runs,inserted:0,updated:0,failed}}]}));
-    await page.goto('http://127.0.0.1:5174');
+    await page.goto(BASE);
     await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');
     const button=page.locator('#sync-button'), notice=page.locator('#notice');
     const finished=()=>page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:20000});
@@ -48,4 +48,4 @@ const { chromium } = require('playwright');
     assert.equal(await page.evaluate(()=>document.documentElement.scrollHeight>innerHeight),false);
     console.log('PASS: finished sync reports its result, start/run errors show details, successful retry clears the error');
   } finally { await browser.close(); }
-})().catch(error=>{console.error(error);process.exit(1)});
+});

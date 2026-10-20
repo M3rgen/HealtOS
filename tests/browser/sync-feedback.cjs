@@ -1,8 +1,6 @@
 // Synthetic fixtures; no live account records.
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
-
-const URL = process.env.HEALTHOS_TEST_URL || 'http://127.0.0.1:5174';
+const { BASE, launch, run } = require('./lib.cjs');
 const TYPES = ['heart-rate', 'sleep', 'steps'];
 const SIZES = [{width:1280,height:800},{width:1440,height:900},{width:390,height:844},{width:320,height:700}];
 
@@ -41,7 +39,7 @@ async function openPage(browser, viewport, scenario) {
         {name:'Aria',device_type:'SCALE',last_sync_time:'2026-10-12T08:00:00Z',features:[]},
         {name:'Eski',device_type:'TRACKER',last_sync_time:null,features:[]}]}})
     : route.fulfill({status:503,json:{detail:'Google erişilemedi.'}}));
-  await page.goto(URL);
+  await page.goto(BASE);
   await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');
   return {page, state, context};
 }
@@ -50,8 +48,8 @@ const overflow = page => page.evaluate(()=>({x:document.documentElement.scrollWi
   y:document.documentElement.scrollHeight>innerHeight}));
 const done = page => page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:20000});
 
-(async () => {
-  const browser = await chromium.launch({headless:true,channel:'msedge'});
+run(async () => {
+  const browser = await launch();
   try {
     // 1. Busy state holds while polling and a second start is ignored.
     {
@@ -84,7 +82,7 @@ const done = page => page.waitForFunction(()=>!document.querySelector('#sync-but
       await page.locator('#sync-button').click();
       await done(page);
       assert.match(await page.locator('#notice').textContent(),
-        /^Eşitleme tamamlandı · Google[’']da yeni veri yok\. Saatin son eşitlemesi: (17 Eki )?15:02$/);
+        /^Eşitleme tamamlandı · Google[’']da yeni veri yok\. Saatinin son eşitlemesi: (17 Eki )?15:02$/);
       state.devices = 'fail';
       await page.locator('#sync-button').click();
       await done(page);
@@ -112,4 +110,4 @@ const done = page => page.waitForFunction(()=>!document.querySelector('#sync-but
     }
     console.log('PASS: sync shows busy state until completion, reports new records, no-new-data with Brussels device time, and failures without page scroll');
   } finally { await browser.close(); }
-})().catch(error=>{console.error(error);process.exit(1)});
+});

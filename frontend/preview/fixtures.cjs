@@ -107,7 +107,7 @@ function workouts(params) {
 }
 
 const chatAnswer = '**Merhaba!** Son 7 günün özeti:\n\n' +
-  '- Ortalama adım: **9.120**\n- Ortalama uyku: **7 sa 18 dk**\n- Dinlenik nabız istikrarlı (57–61 bpm).\n\n' +
+  '- Ortalama adım: **9.120**\n- Ortalama uyku: **7 sa 18 dk**\n- Dinlenme nabzı istikrarlı (57–61 bpm).\n\n' +
   '| Gün | Adım | Uyku |\n|---|---:|---:|\n| Pzt | 10.240 | 7 sa 40 dk |\n| Sal | 8.910 | 6 sa 55 dk |\n\n' +
   'Uyku düzenini korumak için yatış saatini sabit tutmayı deneyebilirsin.';
 
