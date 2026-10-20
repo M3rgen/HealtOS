@@ -21,7 +21,8 @@ from app.google_health.data_types import DataTypeSpec
 from app.models.raw_versions import RawApiResponse
 from app.models.state import RawHealthData
 from app.parsers import normalize
-from app.parsers.common import payload_hash, source_id, temporal
+from app.parsers.common import payload_hash, temporal
+from app.services.identity import add_aliases, resolve_ids
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +97,14 @@ async def store_records(
     origin = source or current_source()
     response_ids = await insert_responses(session, responses)
     response_id = response_ids[-1] if response_ids else None
+    # Records without a Google id are written onto the row that holds their identity
+    # (app/services/identity.py), whatever key that row was first stored under.
+    digests = [payload_hash(record) for record in records]
+    resolution = await resolve_ids(session, spec, records, digests, now)
     # Per record id, the distinct consecutive payloads of this page, in page order.
     by_id: dict[str, list[tuple]] = {}
     duplicates = 0
-    for record in records:
-        google_id = source_id(spec, record)
-        digest = payload_hash(record)
+    for record, google_id, digest in zip(records, resolution.ids, digests, strict=True):
         start = end = timezone = None
         if isinstance(record, dict):
             start, end, timezone = temporal(spec, record)
@@ -147,7 +150,9 @@ async def store_records(
         if normalized is None:
             stats.normalization_skipped += 1
         elif existing_hash is None or replaced:
-            normalized_values[normalized.model].append(normalized.values)
+            # Keyed like its raw row, which may be an older id of the same record.
+            values = {**normalized.values, "google_data_point_id": google_id}
+            normalized_values[normalized.model].append(values)
             stats.normalized += 1
     # Concurrent writers (a CLI sync next to the server, backfill next to a webhook) lock
     # rows in key order, so two overlapping pages wait for each other instead of
@@ -155,6 +160,7 @@ async def store_records(
     for rows in rounds:
         rows.sort(key=lambda row: row["google_data_point_id"])
         await _upsert_raw_many(session, rows)
+    await add_aliases(session, spec.name, resolution.new_aliases)
     for model, values in normalized_values.items():
         values.sort(key=lambda row: (row.get("data_type", ""), row["google_data_point_id"]))
         await _upsert_normalized_many(session, model, values)

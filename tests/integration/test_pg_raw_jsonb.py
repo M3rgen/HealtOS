@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from argparse import Namespace
 
 import pytest
 from alembic import command
@@ -186,7 +187,11 @@ async def test_raw_json_jsonb_round_trip_keeps_values_and_hashes(
         assert payload_hash(stored.raw_json) == stored.payload_hash
         expected["new-1"] = new
 
+        # Re-storing the steps record gave it a v2 alias (migration 20261021_0012), which a
+        # downgrade past 0012 would drop: it refuses unless told otherwise.
+        alembic_config.cmd_opts = Namespace(x=["allow-identity-loss=1"])
         command.downgrade(alembic_config, BEFORE)
+        alembic_config.cmd_opts = None
         assert _version(engine) == BEFORE
         assert set(_column_types(engine).values()) == {"json"}
         await _assert_app_reads_unchanged(database_url, expected)

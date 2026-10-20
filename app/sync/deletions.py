@@ -5,6 +5,12 @@ simply stops appearing. After a window has been fetched from its first page to i
 any archived record that the same filter must have matched, but which was not seen during
 that fetch, is marked with ``source_deleted_at``. Nothing is deleted or overwritten; if
 the record comes back, ``store_records`` clears the mark again.
+
+"Not seen" is decided per record identity, not per row: a row archived under an older id of
+a record (before a device rename, a package suffix change, a growing interval) is not marked
+while the row that holds the record's v2 identity now was seen in the same fetch
+(app.services.identity.present_identities). That makes marking correct before, during and
+after ``health-mirror identity-backfill``.
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ import logging
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -27,6 +33,7 @@ from app.google_health.data_types import (
     query_time,
 )
 from app.models.state import RawHealthData
+from app.services.identity import among, present_identities
 
 logger = logging.getLogger(__name__)
 
@@ -83,20 +90,35 @@ async def mark_source_deletions(
     if scope is None:
         return 0
     column, lower, upper = scope
-    result = await session.execute(
-        update(RawHealthData)
-        .where(
-            RawHealthData.data_type == spec.name,
-            RawHealthData.source_deleted_at.is_(None),
-            RawHealthData.last_seen_at < fetched_since,
-            column >= lower,
-            column < upper,
-        )
-        .values(source_deleted_at=datetime.now(UTC))
-        .execution_options(synchronize_session=False)
+    unseen = (
+        RawHealthData.data_type == spec.name,
+        RawHealthData.source_deleted_at.is_(None),
+        RawHealthData.last_seen_at < fetched_since,
+        column >= lower,
+        column < upper,
     )
-    # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as plain Result.
-    marked = cast(CursorResult[Any], result).rowcount or 0
+    candidates = (
+        (await session.execute(select(RawHealthData.id, RawHealthData.raw_json).where(*unseen)))
+        .tuples()
+        .all()
+    )
+    if not candidates:
+        return 0
+    present = await present_identities(session, spec, candidates, fetched_since)
+    missing = sorted(raw_id for raw_id, _ in candidates if raw_id not in present)
+    marked = 0
+    now = datetime.now(UTC)
+    for offset in range(0, len(missing), 5000):
+        result = await session.execute(
+            update(RawHealthData)
+            .where(*unseen, among(session, RawHealthData.id, missing[offset : offset + 5000]))
+            .values(source_deleted_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as Result.
+        marked += cast(CursorResult[Any], result).rowcount or 0
+    if present:
+        event(logger, "SOURCE_DELETIONS_KEPT_BY_IDENTITY", data_type=spec.name, count=len(present))
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked
