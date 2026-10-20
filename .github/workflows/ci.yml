@@ -28,6 +28,8 @@ jobs:
       APP_ENV: test
       DATABASE_URL: postgresql+asyncpg://health_test:ci-only-password@127.0.0.1:5432/health_test
       POSTGRES_PASSWORD: ci-only-password
+      # Fake, CI-only value: compose requires APP_UI_TOKEN; tests/conftest.py clears it.
+      APP_UI_TOKEN: ci-only-ui-token-not-a-secret-0123456789
       RECONCILIATION_ENABLED: "false"
       WATCHDOG_ENABLED: "false"
     steps:
