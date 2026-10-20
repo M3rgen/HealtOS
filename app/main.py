@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api import auth, backfill, codex, dashboard, google_health, health, login, sync, webhooks
-from app.core.auth import UITokenMiddleware
+from app.core.auth import SessionStore, UITokenMiddleware
 from app.core.config import get_settings
 from app.core.host_validation import HostValidationMiddleware
 from app.core.logging import configure_logging, event
@@ -107,8 +107,10 @@ def create_app() -> FastAPI:
     )
     application.state.settings = settings
     application.state.runtime = runtime
+    # Login sessions (in memory; a restart logs the browser out).
+    application.state.ui_sessions = ui_sessions = SessionStore()
     # Starlette runs the last-added middleware first: headers, host check, UI token.
-    application.add_middleware(UITokenMiddleware, token=settings.app_ui_token)
+    application.add_middleware(UITokenMiddleware, token=settings.app_ui_token, sessions=ui_sessions)
     application.add_middleware(
         HostValidationMiddleware,
         webhook_endpoint_uri=settings.google_health_webhook_endpoint_uri,

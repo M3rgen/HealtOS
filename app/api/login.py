@@ -1,4 +1,4 @@
-"""Self-contained login page that exchanges APP_UI_TOKEN for a session cookie."""
+"""Self-contained login page that exchanges APP_UI_TOKEN for a session cookie, and logout."""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ from app.core.auth import (
     COOKIE_MAX_AGE,
     COOKIE_NAME,
     LOGIN_PATH,
-    cookie_value,
+    LOGOUT_PATH,
+    SessionStore,
     request_authenticated,
     safe_next,
     same_origin_form,
+    session_cookies,
     token_matches,
 )
 
@@ -87,7 +89,7 @@ def page(next_path: str, error: str | None = None, status_code: int = 200) -> HT
 <button type="submit">Giriş yap</button>
 </form>
 <p class="hint">Anahtar, sunucudaki <code>APP_UI_TOKEN</code> değeridir.
-Bu tarayıcı seni 30 gün hatırlar.</p>
+Bu tarayıcı, sunucu yeniden başlatılmadıkça seni 30 gün hatırlar.</p>
 </main>
 </body>
 </html>
@@ -103,12 +105,16 @@ def _token(request: Request) -> str | None:
     return request.app.state.settings.app_ui_token
 
 
+def _sessions(request: Request) -> SessionStore:
+    return request.app.state.ui_sessions
+
+
 @router.get(LOGIN_PATH)
 async def login_page(
     request: Request, next_path: str | None = Query(None, alias="next")
 ) -> Response:
     target = safe_next(next_path)
-    if request_authenticated(_token(request), request.headers):
+    if request_authenticated(_token(request), request.headers, _sessions(request)):
         return RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
     return page(target)
 
@@ -135,11 +141,24 @@ async def login(request: Request) -> Response:
     response = RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
     response.set_cookie(
         COOKIE_NAME,
-        cookie_value(token),
+        _sessions(request).issue(),
         max_age=COOKIE_MAX_AGE,
         path="/",
         httponly=True,
         samesite="strict",
         secure=False,
     )
+    return response
+
+
+@router.post(LOGOUT_PATH)
+async def logout(request: Request) -> Response:
+    """Revoke the browser's session and clear its cookie (exempt from the token check)."""
+    if not same_origin_form(request.headers, request.url.scheme):
+        return Response("Cross-origin logout refused", status_code=403)
+    sessions = _sessions(request)
+    for session_id in session_cookies(request.headers):
+        sessions.revoke(session_id)
+    response = RedirectResponse(LOGIN_PATH, status_code=303, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="strict", secure=False)
     return response

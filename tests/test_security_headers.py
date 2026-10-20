@@ -66,6 +66,7 @@ async def test_dashboard_policy(application):
         ("localhost:18080", "ws://localhost:18080"),  # SSH tunnel on another local port
         ("127.0.0.1:8000", "ws://127.0.0.1:8000"),
         ("LOCALHOST", "ws://localhost"),
+        ("healthos.localhost:8000", "ws://healthos.localhost:8000"),
     ],
 )
 async def test_websocket_source_follows_the_loopback_host(application, host, expected):

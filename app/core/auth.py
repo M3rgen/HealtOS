@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import hmac
 import secrets
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from urllib.parse import urlencode, urlsplit
 
 from starlette.datastructures import Headers
@@ -18,6 +17,7 @@ from app.core.host_validation import WEBHOOK_PATH, hostname
 COOKIE_NAME = "healthos_ui"
 COOKIE_MAX_AGE = 30 * 24 * 3600
 LOGIN_PATH = "/login"
+LOGOUT_PATH = "/logout"
 # Requests that must work without the UI token. The OAuth callback arrives as a
 # cross-site redirect (SameSite=Strict cookies are withheld) and is guarded by the
 # HMAC-signed state that only the authenticated /auth/google/start can mint.
@@ -29,15 +29,60 @@ EXEMPT = frozenset(
         ("GET", LOGIN_PATH),
         ("HEAD", LOGIN_PATH),
         ("POST", LOGIN_PATH),
+        # Only ever removes a session; CSRF-checked like the login form.
+        ("POST", LOGOUT_PATH),
         ("GET", "/auth/google/callback"),
     }
 )
 
 
-def cookie_value(token: str) -> str:
-    """Session cookie derived from the token, so the raw token never sits in the jar."""
-    digest = hmac.new(token.encode(), b"healthos-ui-cookie-v1", hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+def _digest(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode()).hexdigest()
+
+
+class SessionStore:
+    """Login sessions: a random id per login, kept in memory with an absolute expiry.
+
+    The cookie carries only that id, never anything derived from APP_UI_TOKEN, so a
+    copied cookie stops working on logout, expiry or restart. Only a SHA-256 of each id
+    is stored. Sessions do not survive a restart; for a single-user app that just means
+    logging in again. The store is bounded; the oldest session is dropped first.
+    """
+
+    MAX_SESSIONS = 64
+
+    def __init__(
+        self, ttl_seconds: float = COOKIE_MAX_AGE, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self.ttl = ttl_seconds
+        self.clock = clock
+        self._expiry: dict[str, float] = {}
+
+    def issue(self) -> str:
+        now = self.clock()
+        for key in [key for key, expiry in self._expiry.items() if expiry <= now]:
+            del self._expiry[key]
+        while len(self._expiry) >= self.MAX_SESSIONS:
+            del self._expiry[min(self._expiry, key=self._expiry.__getitem__)]
+        session_id = secrets.token_urlsafe(32)
+        self._expiry[_digest(session_id)] = now + self.ttl
+        return session_id
+
+    def valid(self, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        key = _digest(session_id)
+        expiry = self._expiry.get(key)
+        if expiry is None:
+            return False
+        if expiry <= self.clock():
+            del self._expiry[key]
+            return False
+        return True
+
+    def revoke(self, session_id: str | None) -> None:
+        if session_id:
+            self._expiry.pop(_digest(session_id), None)
 
 
 def token_matches(token: str, candidate: str | None) -> bool:
@@ -51,7 +96,19 @@ def _cookies(header: str) -> Iterable[tuple[str, str]]:
             yield name, value
 
 
-def request_authenticated(token: str | None, headers: Headers) -> bool:
+def session_cookies(headers: Headers) -> list[str]:
+    return [
+        value
+        for header in headers.getlist("cookie")
+        for name, value in _cookies(header)
+        if name == COOKIE_NAME
+    ]
+
+
+def request_authenticated(
+    token: str | None, headers: Headers, sessions: SessionStore | None
+) -> bool:
+    """Bearer APP_UI_TOKEN, or a login cookie naming a live session in ``sessions``."""
     if not token:
         return True
     authorization = headers.getlist("authorization")
@@ -59,12 +116,7 @@ def request_authenticated(token: str | None, headers: Headers) -> bool:
         scheme, _, credentials = authorization[0].partition(" ")
         if scheme.lower() == "bearer" and token_matches(token, credentials.strip()):
             return True
-    expected = cookie_value(token)
-    return any(
-        name == COOKIE_NAME and token_matches(expected, value)
-        for header in headers.getlist("cookie")
-        for name, value in _cookies(header)
-    )
+    return sessions is not None and any(sessions.valid(value) for value in session_cookies(headers))
 
 
 def safe_next(value: str | None) -> str:
@@ -117,9 +169,10 @@ def _wants_html(scope: Scope, headers: Headers) -> bool:
 class UITokenMiddleware:
     """Require APP_UI_TOKEN (bearer header or login cookie) for every private route."""
 
-    def __init__(self, app: ASGIApp, token: str | None) -> None:
+    def __init__(self, app: ASGIApp, token: str | None, sessions: SessionStore) -> None:
         self.app = app
         self.token = token
+        self.sessions = sessions
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not self.token or scope["type"] not in {"http", "websocket"}:
@@ -127,7 +180,7 @@ class UITokenMiddleware:
             return
         headers = Headers(scope=scope)
         exempt = scope["type"] == "http" and (scope["method"], scope["path"]) in EXEMPT
-        if exempt or request_authenticated(self.token, headers):
+        if exempt or request_authenticated(self.token, headers, self.sessions):
             await self.app(scope, receive, send)
             return
         if scope["type"] == "websocket":

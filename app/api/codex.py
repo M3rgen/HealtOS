@@ -287,7 +287,11 @@ async def relay(websocket: WebSocket, rpc: CodexRPC, thread_id: str) -> None:
 async def chat(websocket: WebSocket) -> None:
     if not same_origin(
         websocket.headers.get("origin"), websocket.headers.get("host")
-    ) or not request_authenticated(websocket.app.state.settings.app_ui_token, websocket.headers):
+    ) or not request_authenticated(
+        websocket.app.state.settings.app_ui_token,
+        websocket.headers,
+        getattr(websocket.app.state, "ui_sessions", None),
+    ):
         await websocket.close(code=1008)
         return
     await websocket.accept()

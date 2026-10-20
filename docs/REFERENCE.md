@@ -345,7 +345,9 @@ curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/google-healt
 Run `health-mirror` inside the container (`docker compose exec app health-mirror …`) or in the
 native environment. Every HTTP route except `/health/live`, `/login`, the OAuth callback and the
 webhook needs the UI token: `Authorization: Bearer <APP_UI_TOKEN>`, or the login cookie in a
-browser.
+browser. The cookie names a random session issued at login and held in memory for at most 30 days;
+`POST /logout` (same-origin form, the Sistem panel's **Çıkış yap**) revokes it, and an app restart
+ends all sessions. See [DEPLOYMENT.md](DEPLOYMENT.md) for opening the UI as `healthos.localhost`.
 
 Use this to confirm the account is linked, Fitbit data is visible, and the configured scopes cover the intended types. Then verify a small persisted sync before starting the full backup.
 
