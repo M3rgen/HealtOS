@@ -417,7 +417,7 @@ $('measurement-form').addEventListener('submit', async event => {
   try {
     await request('/api/dashboard/measurements', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-HealthOS-Request': '1' },
       body: JSON.stringify({
         metric: $('measurement-metric').value,
         value: $('measurement-value').value,
