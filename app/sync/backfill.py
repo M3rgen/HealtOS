@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, time, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
@@ -16,6 +16,12 @@ from app.models.state import BackfillJob, JobStatus
 from app.services.storage import store_records
 
 logger = logging.getLogger(__name__)
+
+# A window that keeps failing (e.g. a 403 for one range) must not stall a whole data
+# type: after this many failures it is tried only after every other window ...
+DEPRIORITIZE_AFTER_RETRIES = 5
+# ... and after this many it is parked as `abandoned` and shown in /backfill/status.
+ABANDON_AFTER_RETRIES = 10
 
 
 def time_windows(start: datetime, end: datetime, days: int):
@@ -63,7 +69,7 @@ class BackfillService:
                     .select_from(BackfillJob)
                     .where(
                         BackfillJob.data_type == data_type,
-                        BackfillJob.status != JobStatus.completed,
+                        BackfillJob.status.not_in([JobStatus.completed, JobStatus.abandoned]),
                     )
                 )
             if first_boundary is not None and first_boundary.tzinfo is None:
@@ -148,7 +154,13 @@ class BackfillService:
                             [JobStatus.pending, JobStatus.failed, JobStatus.running]
                         )
                     )
-                    .order_by(BackfillJob.window_start.desc())
+                    .order_by(
+                        case(
+                            (BackfillJob.retry_count >= DEPRIORITIZE_AFTER_RETRIES, 1),
+                            else_=0,
+                        ),
+                        BackfillJob.window_start.desc(),
+                    )
                     .limit(1)
                     .where(BackfillJob.data_type == data_type)
                 )
@@ -190,7 +202,18 @@ class BackfillService:
         except Exception as exc:
             async with self.sessions.begin() as session:
                 job = await session.get(BackfillJob, job_id)
-                job.status = JobStatus.failed
                 job.retry_count += 1
+                abandoned = job.retry_count >= ABANDON_AFTER_RETRIES
+                job.status = JobStatus.abandoned if abandoned else JobStatus.failed
                 job.last_error = str(exc)[:2000]
+                retries = job.retry_count
+            if abandoned:
+                event(
+                    logger,
+                    "BACKFILL_WINDOW_ABANDONED",
+                    data_type=spec.name,
+                    window_start=str(start),
+                    retry_count=retries,
+                    error_type=type(exc).__name__,
+                )
             raise

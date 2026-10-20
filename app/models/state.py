@@ -30,6 +30,8 @@ class JobStatus(StrEnum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    # Backfill windows that failed too often; skipped until reset by hand.
+    abandoned = "abandoned"
 
 
 class RawHealthData(TimestampMixin, Base):
