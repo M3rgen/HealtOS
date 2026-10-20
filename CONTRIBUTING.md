@@ -7,8 +7,37 @@ Focused fixes, documentation improvements, and reproducible bug reports are welc
 1. Fork the repository and create a branch.
 2. Follow the [development setup](docs/DEVELOPMENT.md).
 3. Make the smallest change that solves the problem and add relevant verification.
-4. Run lint, format checks, tests, and the configuration verifier. Build the frontend for UI changes.
+4. Run the checks below. Build the frontend for UI changes.
 5. Open a pull request explaining the before/after behavior and checks you ran.
+
+## Checks
+
+```sh
+make verify          # ruff check + format check, configuration and documentation-link verifier, pytest, pyright
+make test-browser    # browser checks: cd frontend && npm run test:browser
+```
+
+`make verify` is what CI runs, using `uv run --frozen --extra dev`. It needs no database or network.
+The browser checks in `tests/browser` use Playwright with synthetic fixtures; install Chromium once
+with `cd frontend && npx playwright install chromium`. Run them for every interface change, at
+desktop and mobile sizes. `make compose-smoke` exercises the full Docker stack in an isolated
+project when you change Compose, the Dockerfile, migrations, or the backup scripts.
+
+`scripts/verify_configuration.py` also fails on a broken relative link or heading anchor in
+`README.md`, `AGENTS.md`, `CONTRIBUTING.md`, or `docs/`, so fix links in the same change that moves
+a file or renames a heading.
+
+## Commit hygiene
+
+Keep commits small and focused, with a message that says what changed and why. Before every commit,
+check the staged diff for private data:
+
+```sh
+git diff --cached | grep -iE "192\.168|10\.[0-9]+\.[0-9]+\.[0-9]+|/Users/|/home/|A[I]za|y[a]29|BEGIN .*PRIVATE KEY"
+```
+
+The command must print nothing. Add your own user name, hostnames, and e-mail address to the pattern.
+Use placeholders such as `<vm-host>`, `example.com`, and `/opt/healthos` in documentation.
 
 ## Interface requirements
 
