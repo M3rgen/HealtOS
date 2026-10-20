@@ -410,6 +410,9 @@ never marked.
   the deleted session is inside both the query and the marked range. Outside webhooks, a
   scheduled window only marks sessions that started at least 12 hours after its start and 14 hours
   before its end; the rest is covered by the daily 7-day reconciliation.
+- A record whose time was moved upstream out of the window that is re-fetched looks deleted from
+  that window and is marked until a fetch covering its new time returns it again (and unmarks it).
+  For a move of more than 7 days that is the weekly 90-day reconciliation.
 
 ## Webhooks
 
