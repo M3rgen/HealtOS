@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from enum import StrEnum
+
+from app.core.timeutil import as_utc
+
+
+def query_time(value: datetime) -> datetime:
+    """The instant a request bound actually names: UTC, truncated to whole seconds.
+
+    Request bounds are sent with second precision, so ``10:00:00.5`` asks Google for
+    ``10:00:00``. Anything that reasons about what a request covered (deletion marking)
+    must use these bounds, not the finer datetimes the caller passed in.
+    """
+    return as_utc(value).replace(microsecond=0)
+
+
+def query_iso(value: datetime) -> str:
+    """RFC 3339 form of ``query_time`` as written into filters and rollup ranges."""
+    return query_time(value).isoformat().replace("+00:00", "Z")
 
 
 class RecordKind(StrEnum):

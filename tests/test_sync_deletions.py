@@ -4,7 +4,7 @@ from sqlalchemy import func, select
 
 from app.core.config import Settings
 from app.google_health.client import Page
-from app.google_health.data_types import REGISTRY
+from app.google_health.data_types import REGISTRY, query_iso
 from app.models.state import JobStatus, RawHealthData, SyncState
 from app.services.dashboard import dashboard_data
 from app.sync.deletions import deletion_scope
@@ -138,3 +138,38 @@ async def test_rollup_refetch_never_marks(sessions):
             select(func.count()).where(RawHealthData.source_deleted_at.is_not(None))
         )
     assert marked == 0
+
+
+def steps_at(name, start_iso, count=100):
+    point = steps(name, 0, count)
+    point["steps"]["interval"] = {"startTime": start_iso, "endTime": start_iso}
+    return point
+
+
+async def test_sub_second_window_end_marks_only_what_google_was_asked_for(sessions):
+    """Google receives whole seconds; marking must not reach into the dropped fraction."""
+    client = QueueClient()
+    service = IncrementalSync(Settings(), sessions, client, {"steps": REGISTRY["steps"]})
+    a = steps_at("a", "2026-08-01T10:00:00Z")
+    # Inside [00:00:00, 00:00:00.5): the query below asks Google for `< 00:00:00Z` only.
+    edge = steps_at("edge", "2026-08-02T00:00:00.200Z")
+    client.responses = [Page([a, edge], None)]
+    await service.run("steps", WINDOW_START, WINDOW_END + timedelta(seconds=1))
+
+    client.responses = [Page([a], None)]
+    stats = await service.run("steps", WINDOW_START, WINDOW_END + timedelta(milliseconds=500))
+
+    assert stats.source_deleted == 0
+    _, deleted, *_ = await snapshot(sessions)
+    assert deleted == set()
+
+
+def test_deletion_scope_uses_the_bounds_sent_to_google():
+    start = datetime(2026, 8, 1, 6, 0, 0, 700_000, tzinfo=UTC)
+    end = datetime(2026, 8, 1, 10, 0, 0, 500_000, tzinfo=UTC)
+    _, lower, upper = deletion_scope(REGISTRY["heart-rate"], start, end)
+    assert (lower, upper) == (start.replace(microsecond=0), end.replace(microsecond=0))
+    assert REGISTRY["heart-rate"].filter_for(query_iso(start), query_iso(end)) == (
+        'heart_rate.sample_time.physical_time >= "2026-08-01T06:00:00Z" AND '
+        'heart_rate.sample_time.physical_time < "2026-08-01T10:00:00Z"'
+    )

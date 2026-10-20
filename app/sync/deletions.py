@@ -18,8 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from app.core.logging import event
-from app.core.timeutil import as_utc
-from app.google_health.data_types import AccessMethod, DataTypeSpec, RecordKind
+from app.google_health.data_types import AccessMethod, DataTypeSpec, RecordKind, query_time
 from app.models.state import RawHealthData
 
 logger = logging.getLogger(__name__)
@@ -36,17 +35,19 @@ def deletion_scope(
 ) -> tuple[InstrumentedAttribute, datetime, datetime] | None:
     """Return (stored column, lower, upper) that the list filter for the window covers.
 
-    Mirrors ``DataTypeSpec.filter_for``. ``None`` means deletions cannot be inferred:
-    unfiltered catalogs, and rollup/reconcile responses, which are derived aggregates
-    rather than individually deletable source records.
+    Mirrors ``DataTypeSpec.filter_for`` on the bounds the client actually sends
+    (``query_time``: UTC, whole seconds), never on finer caller datetimes. ``None``
+    means deletions cannot be inferred: unfiltered catalogs, and rollup/reconcile
+    responses, which are derived aggregates rather than individually deletable source
+    records.
     """
     if not spec.time_filtered or spec.access_method != AccessMethod.list:
         return None
-    start, end = as_utc(start), as_utc(end)
+    start, end = query_time(start), query_time(end)
     if spec.kind == RecordKind.daily:
         start_date = date.fromisoformat(start.isoformat()[:10])
         end_date = date.fromisoformat(end.isoformat()[:10])
-        if end_date <= start_date or end.isoformat(timespec="seconds")[11:19] != "00:00:00":
+        if end_date <= start_date or end.isoformat()[11:19] != "00:00:00":
             end_date += timedelta(days=1)
         lower = datetime.combine(start_date, time.min, UTC)
         upper = datetime.combine(end_date, time.min, UTC)
