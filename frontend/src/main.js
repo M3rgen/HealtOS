@@ -8,6 +8,7 @@ import { setupHistoryPanel } from './history-panel.js';
 import { setupWorkouts } from './workouts.js';
 import { setupAppearance } from './appearance.js';
 import { request, handleUnauthorized } from './api.js';
+import { describeSyncError } from './sync-errors.js';
 
 renderIcons();
 setupAppearance();
@@ -99,9 +100,11 @@ function today() {
 function civilDate(value) {
   return new Date(`${value}T12:00:00Z`);
 }
-function notice(message, error = false, source = 'general') {
+// `detail` (raw error codes) goes into the tooltip for debugging; the text stays readable.
+function notice(message, error = false, source = 'general', detail = '') {
   $('notice').hidden = false;
   $('notice').textContent = message;
+  $('notice').title = detail;
   $('notice').classList.toggle('error', error);
   $('notice').dataset.source = source;
 }
@@ -112,7 +115,14 @@ function clearSyncNotice(includeStart = false) {
   ) {
     $('notice').hidden = true;
     $('notice').textContent = '';
+    $('notice').title = '';
   }
+}
+function rawErrors(pairs) {
+  return pairs
+    .filter(([, code]) => code)
+    .map(([type, code]) => `${type}: ${code}`)
+    .join('\n');
 }
 function query() {
   return new URLSearchParams({ days: 7, timezone: zone, ...(selectedDate ? { end_date: selectedDate } : {}) });
@@ -318,9 +328,10 @@ async function refresh() {
           const failed = rows.filter(row => row.status === 'failed' || row.last_error);
           if (failed.length)
             notice(
-              `Eşitleme hatası: ${failed.map(row => `${row.data_type}: ${row.last_error || 'Eşitleme tamamlanamadı.'}`).join(' · ')}`,
+              `Eşitleme hatası: ${failed.map(row => `${row.data_type}: ${describeSyncError(row.last_error)}`).join(' · ')}`,
               true,
               'sync',
+              rawErrors(failed.map(row => [row.data_type, row.last_error])),
             );
         } catch {
           notice('Eşitlemede hata oluştu. Hata ayrıntıları alınamadı; Sistem bölümünü kontrol et.', true, 'sync');
@@ -360,7 +371,7 @@ async function loadSystem() {
       ? rows
           .map(
             row =>
-              `<tr><td>${escape(row.data_type)}</td><td>${row.last_successful_sync ? `${escape(shortDate(row.last_successful_sync))} ${escape(timeOf(row.last_successful_sync))}` : '—'}</td><td>${escape({ completed: 'Tamamlandı', running: 'Çalışıyor', pending: 'Bekliyor', failed: 'Başarısız' }[row.status] ?? row.status)}</td><td>${num(row.records_downloaded)}</td></tr>`,
+              `<tr><td>${escape(row.data_type)}</td><td>${row.last_successful_sync ? `${escape(shortDate(row.last_successful_sync))} ${escape(timeOf(row.last_successful_sync))}` : '—'}</td><td>${escape({ completed: 'Tamamlandı', running: 'Çalışıyor', pending: 'Bekliyor', failed: 'Başarısız', abandoned: 'Vazgeçildi' }[row.status] ?? row.status)}</td><td>${num(row.records_downloaded)}</td></tr>`,
           )
           .join('')
       : '<tr><td colspan="4">Henüz eşitleme yapılmadı.</td></tr>';
@@ -496,11 +507,16 @@ $('sync-button').addEventListener('click', async () => {
       : failed
         ? `Eşitleme ${num(failed)}/${num(runs.length)} veri türünde başarısız oldu · ${runs
             .filter(run => run.failed)
-            .map(run => `${run.type}: ${run.error || 'Eşitleme tamamlanamadı.'}`)
+            .map(run => `${run.type}: ${describeSyncError(run.error)}`)
             .join(' · ')}${counts ? ` · ${counts}` : ''}`
         : `Eşitleme tamamlandı · ${counts || `Google’da yeni veri yok.${await watchSync()}`}`;
     await refresh();
-    notice(message, Boolean(failed), failed ? 'sync' : 'sync-result');
+    notice(
+      message,
+      Boolean(failed),
+      failed ? 'sync' : 'sync-result',
+      rawErrors((runs ?? []).filter(run => run.failed).map(run => [run.type, run.error])),
+    );
     if (!failed)
       setTimeout(() => {
         if ($('notice').textContent === message) clearSyncNotice(true);
