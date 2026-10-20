@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # batch first verified longer ago than this cannot restart its processing; retries of
 # old batches go through process_pending (the replay CLI) instead.
 SIGNED_REPLAY_MAX_AGE = timedelta(hours=24)
+INTERRUPTED_ERROR = "Recovered interrupted webhook processing attempt"
 
 
 @dataclass(frozen=True)
@@ -404,6 +405,24 @@ class WebhookBatchProcessor:
             batch.last_error = "; ".join(error for error in errors if error)[:2000] or None
             batch.processed_at = None if incomplete else datetime.now(UTC)
 
+    async def recover_running(self) -> int:
+        """Fail elements left `running` by a process that died mid-attempt.
+
+        A `running` element is never claimed again, so without this its batch stays
+        unprocessed forever. Called at startup (before any webhook is accepted) and by
+        process_pending; failed elements are retried by the next delivery or replay.
+        """
+        async with self.sessions.begin() as session:
+            result = await session.execute(
+                update(WebhookNotification)
+                .where(WebhookNotification.status == "running")
+                .values(status="failed", last_error=INTERRUPTED_ERROR)
+            )
+        recovered = result.rowcount or 0
+        if recovered:
+            event(logger, "WEBHOOK_ELEMENTS_RECOVERED", count=recovered)
+        return recovered
+
     async def process_pending(self, *, recover_running: bool = True) -> ProcessingStats:
         """Hydrate legacy batches, retry failed work, and preserve completed elements."""
 
@@ -416,15 +435,7 @@ class WebhookBatchProcessor:
             if batch_hash not in prepared_batches:
                 await self.prepare_existing_batch(batch_hash)
         if recover_running:
-            async with self.sessions.begin() as session:
-                await session.execute(
-                    update(WebhookNotification)
-                    .where(WebhookNotification.status == "running")
-                    .values(
-                        status="failed",
-                        last_error="Recovered interrupted webhook processing attempt",
-                    )
-                )
+            await self.recover_running()
         async with self.sessions() as session:
             pending = (
                 await session.scalars(

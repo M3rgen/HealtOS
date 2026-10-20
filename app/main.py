@@ -49,6 +49,8 @@ def create_app() -> FastAPI:
         event(logger, "DATABASE_READY")
         # A crash leaves SyncState.status=running, which blocks watchdog recovery.
         await runtime.incremental.recover_interrupted()
+        # Likewise a webhook element left `running` is never claimed again.
+        await runtime.webhook_processor.recover_running()
         scheduler = None
         scheduler_needed = settings.reconciliation_enabled or settings.watchdog_enabled
         if scheduler_needed and settings.app_env != "test":
