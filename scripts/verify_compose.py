@@ -53,7 +53,7 @@ UI_SMOKE_SCRIPT = "\n".join(
         "def get(path):",
         "    return urllib.request.urlopen(urllib.request.Request(base + path, headers=auth))",
         "html = get('/').read().decode()",
-        "assert 'HealtOS' in html",
+        "assert '<title>HealthOS' in html, html[:200]",
         'assets = re.findall(r\'(?:src|href)="(/assets/[^"]+)"\', html)',
         "assert len(assets) >= 2",
         "assert all(get(path).status == 200 for path in assets)",
