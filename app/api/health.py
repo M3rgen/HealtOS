@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 @router.get("/health/live")
+@router.head("/health/live", include_in_schema=False)
 async def live() -> dict:
     """Process liveness for container healthchecks; never touches the database."""
     return {"status": "ok", "service": "personal-health-mirror"}

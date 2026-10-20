@@ -28,6 +28,9 @@ EXEMPT = frozenset(
         ("HEAD", "/health/live"),
         ("GET", LOGIN_PATH),
         ("HEAD", LOGIN_PATH),
+        # The router redirects these to LOGIN_PATH (redirect_slashes).
+        ("GET", LOGIN_PATH + "/"),
+        ("HEAD", LOGIN_PATH + "/"),
         ("POST", LOGIN_PATH),
         # Only ever removes a session; CSRF-checked like the login form.
         ("POST", LOGOUT_PATH),

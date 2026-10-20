@@ -452,3 +452,32 @@ def test_session_store_is_bounded():
     sessions = [store.issue() for _ in range(auth.SessionStore.MAX_SESSIONS + 5)]
     assert not store.valid(sessions[0])
     assert store.valid(sessions[-1])
+
+
+@pytest.mark.parametrize("path", ["/login", "/health/live"])
+async def test_exempt_pages_answer_head(application, path):
+    async with client(application) as http:
+        response = await http.head(path)
+    assert response.status_code == 200
+
+
+async def test_login_with_trailing_slash_redirects_to_the_login_page(application):
+    async with client(application) as http:
+        response = await http.get("/login/?next=/sync")
+    assert response.status_code in {307, 308}
+    assert response.headers["location"].endswith("/login?next=/sync")
+
+
+async def test_failed_login_is_slowed_down(application, monkeypatch):
+    from app.api import login
+
+    delays = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr(login.asyncio, "sleep", fake_sleep)
+    async with client(application) as http:
+        await http.post("/login", data={"token": "nope", "next": "/"})
+        await http.post("/login", data={"token": TOKEN, "next": "/"})
+    assert delays == [login.FAILED_LOGIN_DELAY_SECONDS]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 from html import escape
@@ -25,6 +26,9 @@ from app.core.auth import (
 
 router = APIRouter(include_in_schema=False)
 MAX_FORM_BYTES = 8 * 1024
+# A small constant pause on a wrong token; the token's length makes guessing hopeless
+# anyway, this only keeps a script from hammering the form at full speed.
+FAILED_LOGIN_DELAY_SECONDS = 0.5
 
 STYLE = (
     ":root{color-scheme:dark;--page:#181814;--surface:#20201c;--inset:#242420;--line:#373731;"
@@ -109,7 +113,7 @@ def _sessions(request: Request) -> SessionStore:
     return request.app.state.ui_sessions
 
 
-@router.get(LOGIN_PATH)
+@router.api_route(LOGIN_PATH, methods=["GET", "HEAD"])
 async def login_page(
     request: Request, next_path: str | None = Query(None, alias="next")
 ) -> Response:
@@ -137,6 +141,7 @@ async def login(request: Request) -> Response:
     if not token:
         return RedirectResponse(target, status_code=303)
     if not token_matches(token, (form.get("token") or [""])[0]):
+        await asyncio.sleep(FAILED_LOGIN_DELAY_SECONDS)
         return page(target, "token", 401)
     response = RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
     response.set_cookie(
