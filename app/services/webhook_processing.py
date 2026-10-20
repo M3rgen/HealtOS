@@ -14,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.logging import event
+from app.core.provenance import provenance
 from app.core.timeutil import as_utc
 from app.models.state import (
     JobStatus,
@@ -24,7 +25,6 @@ from app.models.state import (
     WebhookNotification,
 )
 from app.parsers.common import parse_datetime, payload_hash
-from app.services.storage import recording_source
 from app.sync.incremental import IncrementalSync, stale_running_cutoff
 
 logger = logging.getLogger(__name__)
@@ -361,7 +361,7 @@ class WebhookBatchProcessor:
                     .where(WebhookNotification.element_hash == element_hash)
                     .values(sync_attempt_count=WebhookNotification.sync_attempt_count + 1)
                 )
-            with recording_source("webhook"):
+            with provenance(source="webhook", context_id=f"webhook:{element_hash}"):
                 await self.incremental.run(data_type, window_start, window_end)
             async with self.sessions.begin() as session:
                 await session.execute(

@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.core.provenance import provenance
 from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
 from app.models.state import BackfillJob, JobStatus
-from app.services.storage import store_records
+from app.services.storage import store_page
 from app.sync.errors import error_summary
 
 logger = logging.getLogger(__name__)
@@ -208,12 +209,17 @@ class BackfillService:
             start, end, token = job.window_start, job.window_end, job.page_token
         event(logger, "BACKFILL_WINDOW_STARTED", data_type=spec.name, window_start=str(start))
         try:
-            async for page in iter_pages(self.client, spec, start, end, token):
-                async with self.sessions.begin() as session:
-                    await store_records(session, spec, page.data_points, source="backfill")
-                    job = await session.get(BackfillJob, job_id)
-                    job.page_token = page.next_page_token
-                    job.records_downloaded += len(page.data_points)
+            with provenance(source="backfill", context_id=f"backfill:{job_id}"):
+                async for page in iter_pages(self.client, spec, start, end, token):
+                    try:
+                        async with self.sessions.begin() as session:
+                            await store_page(session, spec, page, source="backfill")
+                            job = await session.get(BackfillJob, job_id)
+                            job.page_token = page.next_page_token
+                            job.records_downloaded += len(page.data_points)
+                    except Exception:
+                        await self.client.keep(page.responses)
+                        raise
             async with self.sessions.begin() as session:
                 job = await session.get(BackfillJob, job_id)
                 job.status = JobStatus.completed

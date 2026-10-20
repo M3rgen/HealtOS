@@ -16,6 +16,10 @@ class Tokens:
 class Client:
     def __init__(self):
         self.tokens = Tokens()
+        self.kept = []
+
+    async def keep(self, responses):
+        self.kept.extend(responses)
 
     async def list_data_points(self, spec, start, end, page_size=None):
         assert start < end

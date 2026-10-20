@@ -9,12 +9,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.core.provenance import current_context_id, new_context_id, provenance
 from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
 from app.models.state import JobStatus, SyncState
-from app.services.storage import StoreStats, store_records
+from app.services.storage import StoreStats, store_page
 from app.sync.checkpoints import incremental_start
 from app.sync.deletions import mark_source_deletions
 from app.sync.errors import error_code, error_summary
@@ -91,8 +92,18 @@ class IncrementalSync:
         A saved page token belongs to the previously requested window. That window is
         completed as a first round, and the window requested by this call always runs
         afterwards as its own round, so a caller (e.g. a webhook element) only sees
-        success once its own range was fetched.
+        success once its own range was fetched. Responses are tagged with the caller's
+        run id (webhook element, reconciliation) or a new ``sync:<uuid>``.
         """
+        with provenance(context_id=current_context_id() or new_context_id("sync")):
+            return await self._run(data_type, requested_start, requested_end)
+
+    async def _run(
+        self,
+        data_type: str,
+        requested_start: datetime | None,
+        requested_end: datetime | None,
+    ) -> StoreStats:
         if data_type not in self.specs:
             raise ValueError(f"Unsupported data type: {data_type}")
         async with self._locks.setdefault(data_type, asyncio.Lock()):
@@ -182,13 +193,18 @@ class IncrementalSync:
         # then can records that stopped appearing be marked as deleted at the source.
         fetched_since = datetime.now(UTC) if page_token is None else None
         async for page in iter_pages(self.client, spec, start, end, page_token):
-            async with self.sessions.begin() as session:
-                total.add(await store_records(session, spec, page.data_points))
-                state = await session.get(SyncState, data_type)
-                state.last_page_token = page.next_page_token
-                state.records_downloaded += len(page.data_points)
-                # Heartbeat per page, so recovery never fails a live run (STALE_RUNNING_AFTER).
-                state.updated_at = datetime.now(UTC)
+            try:
+                async with self.sessions.begin() as session:
+                    total.add(await store_page(session, spec, page))
+                    state = await session.get(SyncState, data_type)
+                    state.last_page_token = page.next_page_token
+                    state.records_downloaded += len(page.data_points)
+                    # Heartbeat per page, so recovery never fails a live run.
+                    state.updated_at = datetime.now(UTC)
+            except Exception:
+                # The page's records rolled back; what Google sent is still kept.
+                await self.client.keep(page.responses)
+                raise
         async with self.sessions.begin() as session:
             state = await session.get(SyncState, data_type)
             previous_success = state.last_successful_sync

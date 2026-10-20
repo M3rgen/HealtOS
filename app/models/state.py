@@ -72,6 +72,11 @@ class RawHealthData(TimestampMixin, Base):
     # record are in raw_health_data_versions (app/models/raw_versions.py).
     payload_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     payload_source: Mapped[str | None] = mapped_column(String(32))
+    # The Google response (raw_api_responses) the current payload was first read from;
+    # NULL for payloads stored before it was recorded, and for archive imports.
+    response_id: Mapped[int | None] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), ForeignKey("raw_api_responses.id")
+    )
 
 
 class SyncState(TimestampMixin, Base):

@@ -9,7 +9,9 @@ A fully self-hosted, subscription-free, read-only archive of health and fitness 
 `RAW FIRST → NORMALIZE SECOND → ANALYZE LATER`
 
 - Google Health remains the source of truth. This application only makes read requests to user data endpoints.
-- Raw responses are retained in `raw_health_data`; unknown fields are never dropped from the archive.
+- Every HTTP response body Google sends is kept byte for byte in `raw_api_responses`, and every
+  record parsed from it in `raw_health_data`; unknown fields are never dropped from the archive
+  (see [What is preserved where](#what-is-preserved-where)).
 - A Google resource name is the primary source identifier. Where a response lacks one, a deterministic identity is derived from type, time coordinates, and data source.
 - Payload hashes distinguish unchanged records from source corrections. A correction never
   overwrites the old payload: every version is kept in `raw_health_data_versions` (see
@@ -527,6 +529,80 @@ sighting then always lands at the old end of a timeline); `--from-db` may be rep
 command sorts the dumps that way itself. `--from-db` takes a database name on the live server or a
 full SQLAlchemy URL. Procedure: [RUNBOOK](RUNBOOK.md#import-payload-versions-from-archive-dumps).
 
+## What is preserved where
+
+Nothing received from Google, and nothing entered by hand, is deleted or overwritten. Storage cost
+is not a concern; every guard below is a database trigger, so it holds for every code path, the
+CLI and hand-written SQL alike (`health-mirror verify` checks that the guards are in place).
+
+| What | Where | Guarantee |
+|---|---|---|
+| Exact HTTP response bodies from the Google Health API | `raw_api_responses` | append-only (no `UPDATE`/`DELETE`/`TRUNCATE`); SHA-256 checked by `verify` |
+| Current payload of every record | `raw_health_data` | no `DELETE`/`TRUNCATE`/identity change; a changed payload (hash or text) is kept as a version first |
+| Every earlier payload | `raw_health_data_versions` | append-only (renumbering only during an archive import) |
+| Source-deletion marks set and cleared | `raw_health_data_events` | append-only, written by trigger |
+| Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
+
+### Verbatim Google responses
+
+`raw_health_data.raw_json` is the *parsed* record (jsonb normalizes spacing, key order and some
+number spellings). What Google actually sent is kept separately: every HTTP response the client
+receives from the Google Health API, one row per exchange, in **`raw_api_responses`**:
+
+- `body`: the entity body exactly as received (the client asks for `Accept-Encoding: identity`,
+  so these are the bytes on the wire; PostgreSQL's TOAST compresses the column losslessly on
+  disk), `body_sha256` and `body_size` over exactly those bytes, `complete = false` and `error`
+  (e.g. `ReadTimeout`) when the connection broke mid-body: what arrived is still stored.
+- The request: `method`, `path`, `query` (the query string as sent, including `pageToken`, a
+  pagination cursor) and `request_body` (the JSON of rollUp requests). Request headers are never
+  stored, so neither is the access token; a credential-like query parameter would be dropped.
+- `status_code` and the response headers `content-type`, `content-encoding`, `content-length`,
+  `date`, `retry-after`; `attempt` (0 for the first exchange, retries and token refreshes count
+  up), `fetched_at`.
+- Provenance: `source` (`sync`, `webhook`, `reconciliation`, `backfill`, `gap-repair`, `probe`,
+  `identity`, `devices`), `context_id` (`sync:<uuid>` per run, `webhook:<element hash>` (the
+  `webhook_notifications` row), `reconciliation:<uuid>`, `backfill:<job id>`, `probe:<uuid>`) and
+  `data_type`.
+
+Error responses (4xx/5xx, including the 503s that are retried) and the probe's, identity and
+paired-device responses are stored too. A data page is stored **in the same transaction as its
+records**: a crash keeps both or neither, and each new or changed payload in `raw_health_data`
+and `raw_health_data_versions` carries `response_id`, the page it was first read from
+(`raw_health_data_history` shows it). If storing the records fails, the responses are still kept
+in a transaction of their own. Not stored: requests that never got a response (connection
+refused, timeout before headers), OAuth token exchanges with Google's OAuth server (they carry
+credentials), and webhook calls that fail authentication or the signature check (untrusted).
+
+Measured cost: about 4–9 ms more per 1,000-record page (≈ 6–15 %) for inserting the page body in
+the same transaction; on disk, the bodies roughly match the raw records themselves, plus every
+re-fetch of an overlap window or reconciliation adds its page again (check with
+`SELECT pg_size_pretty(pg_total_relation_size('raw_api_responses'))`).
+
+```sh
+health-mirror responses --data-type heart-rate --since 2026-10-20 --limit 5   # metadata, newest first
+health-mirror responses --context webhook:<element hash>
+health-mirror export-response 12345 --output page.json   # the exact bytes; metadata on stderr
+sha256sum page.json                                      # equals body_sha256
+```
+
+`export-response` refuses (exit 1) when the stored bytes no longer match their SHA-256.
+
+### Source deletion events
+
+`source_deleted_at` on a record is its current state. Every change of it is also appended, by
+trigger, to **`raw_health_data_events`**: `source-deleted` (marked, with the mark's time, also when
+an archive import restores a record as deleted) and `source-returned` (with the fetch that saw it
+again and `previous_deleted_at`, the mark being cleared). A record that disappears and comes back
+therefore keeps its whole timeline; `health-mirror history` lists the events next to the
+versions.
+
+### Derived tables
+
+Normalized tables (`heart_rate`, `steps`, `sleep_sessions`, `scalar_metrics`, …) and the
+`analytics_*` views are **derived** from the current raw payloads and can be rebuilt from
+`raw_health_data` at any time, so their UPSERTs overwrite in place and that is acceptable: no
+received data lives only there.
+
 ## Webhooks
 
 Configure a Google Health subscriber with:
@@ -785,7 +861,8 @@ original function body (a disabled or replaced guard would let deletes through u
 recalculates every raw payload hash and every history payload hash, checks that each record has
 exactly one current row, that its version numbers run 1..n without gaps, that history rows match
 their record's key, and that no version repeats its neighbour's payload, and reports sync errors.
-It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
+It then recomputes the SHA-256 of every stored Google response body and of every signed webhook
+body, and checks that every `response_id` points to a stored response. It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
 
 ## Troubleshooting
 

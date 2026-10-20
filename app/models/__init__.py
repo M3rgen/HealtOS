@@ -16,7 +16,7 @@ from app.models.health import (
     Weight,
 )
 from app.models.manual import ManualMeasurement, ManualWorkout
-from app.models.raw_versions import RawHealthDataVersion
+from app.models.raw_versions import RawApiResponse, RawHealthDataEvent, RawHealthDataVersion
 from app.models.settings import AppearanceSettings
 from app.models.state import (
     BackfillJob,
@@ -44,7 +44,9 @@ __all__ = [
     "OxygenSaturation",
     "RespiratoryRate",
     "RestingHeartRate",
+    "RawApiResponse",
     "RawHealthData",
+    "RawHealthDataEvent",
     "RawHealthDataVersion",
     "ReliabilityState",
     "ScalarMetric",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+from app.core.provenance import new_context_id, provenance
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.parsers.common import temporal
@@ -25,6 +26,7 @@ class DiscoveryService:
         end = datetime.now(UTC)
         start = end - timedelta(days=days)
         semaphore = asyncio.Semaphore(self.concurrency)
+        run = new_context_id("probe")
 
         async def one(spec: DataTypeSpec) -> dict:
             async with semaphore:
@@ -34,7 +36,12 @@ class DiscoveryService:
                         if spec.max_window_days
                         else start
                     )
-                    page = await self.client.list_data_points(spec, probe_start, end, page_size=1)
+                    with provenance(source="probe", context_id=run):
+                        page = await self.client.list_data_points(
+                            spec, probe_start, end, page_size=1
+                        )
+                    # No record is archived from a probe, but what Google sent is kept.
+                    await self.client.keep(page.responses)
                     sample = page.data_points[0] if page.data_points else None
                     sample_start = sample_end = None
                     keys: list[str] = []
@@ -62,7 +69,8 @@ class DiscoveryService:
         return await asyncio.gather(*(one(spec) for spec in self.specs.values()))
 
     async def devices(self) -> list[dict]:
-        payload = await self.client.list_paired_devices()
+        with provenance(source="devices"):
+            payload = await self.client.list_paired_devices()
         devices = payload.get("pairedDevices", [])
         if not isinstance(devices, list):
             return []

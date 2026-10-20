@@ -13,10 +13,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from app.core.config import get_settings
+from app.core.provenance import new_context_id, provenance
 from app.db.session import SessionLocal
 from app.google_health.pagination import iter_pages
 from app.services.runtime import build_runtime
-from app.services.storage import StoreStats, store_records
+from app.services.storage import StoreStats, store_page
 
 AUDIT_SQL = """
 WITH daily AS (
@@ -64,6 +65,7 @@ async def main(args):
     if not args.repair:
         return
     runtime = build_runtime(get_settings(), SessionLocal)
+    run = new_context_id("gap-repair")
     totals = StoreStats()
     failures = []
     try:
@@ -79,13 +81,12 @@ async def main(args):
                 cursor = start
                 while cursor < stop:
                     window_end = min(cursor + timedelta(days=spec.max_window_days or 7), stop)
-                    async for page in iter_pages(runtime.google, spec, cursor, window_end):
-                        async with SessionLocal.begin() as session:
-                            stats.add(
-                                await store_records(
-                                    session, spec, page.data_points, source="gap-repair"
+                    with provenance(source="gap-repair", context_id=run):
+                        async for page in iter_pages(runtime.google, spec, cursor, window_end):
+                            async with SessionLocal.begin() as session:
+                                stats.add(
+                                    await store_page(session, spec, page, source="gap-repair")
                                 )
-                            )
                     cursor = window_end
                 totals.add(stats)
                 print(

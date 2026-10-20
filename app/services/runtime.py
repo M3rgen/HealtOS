@@ -14,6 +14,7 @@ from app.google_health.webhook import WebhookSignatureVerifier
 from app.services.credentials import CredentialStore
 from app.services.discovery import DiscoveryService
 from app.services.pipeline_health import PipelineHealthService
+from app.services.responses import DatabaseResponseArchive
 from app.services.watchdog import PipelineWatchdog
 from app.services.webhook_processing import WebhookBatchProcessor
 from app.sync.backfill import BackfillService
@@ -77,7 +78,7 @@ def build_runtime(settings: Settings, sessions: async_sessionmaker) -> Runtime:
         credentials.load_refresh_token,
         credentials.save_refresh_token,
     )
-    google = GoogleHealthClient(settings, tokens)
+    google = GoogleHealthClient(settings, tokens, archive=DatabaseResponseArchive(sessions))
     discovery_specs = supported_data_types(settings.extra_data_types, settings.enabled_data_types)
     mirror_specs = mirror_data_types(settings.extra_data_types, settings.enabled_data_types)
     incremental = IncrementalSync(settings, sessions, google, mirror_specs)

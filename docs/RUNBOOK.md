@@ -69,15 +69,20 @@ rebuild, and report the listed row keys. `alembic downgrade 20261020_0009` conve
 with every value kept, but the stored text is jsonb's spelling, not the original; restore the
 backup if the original text is needed.
 
-### `20261020_0011` (raw payload versions and delete guards)
+### `20261020_0011` (raw versions, verbatim responses, delete guards)
 
-Adds `raw_health_data_versions`, two nullable columns on `raw_health_data`, the version and guard
-triggers (no `DELETE`/`TRUNCATE`/identity change on `raw_health_data`, append-only history) and the
-`raw_health_data_history` view (see [Raw record versions](REFERENCE.md#raw-record-versions)). It
-copies no rows: existing records become version 1 implicitly, so the upgrade is catalog-only and
-takes well under a second regardless of table size, needs no extra disk, and holds its exclusive
-lock on `raw_health_data` only for that moment. The app restarts as for any update (a few seconds;
-Google retries webhooks).
+Adds `raw_health_data_versions`, `raw_api_responses` (exact Google response bodies),
+`raw_health_data_events` (source-deletion timeline), three nullable columns on `raw_health_data`
+(`payload_received_at`, `payload_source`, `response_id` with a `NOT VALID` foreign key), the
+version, event and guard triggers (no `DELETE`/`TRUNCATE`/identity change on `raw_health_data`,
+append-only history, responses and events) and the `raw_health_data_history` view (see
+[What is preserved where](REFERENCE.md#what-is-preserved-where)). It copies and rewrites no rows:
+existing records become version 1 implicitly, and the foreign key is added `NOT VALID`, so the
+upgrade is catalog-only: measured 0.02 s on a synthetic 500,000-row, 393 MB `raw_health_data`
+(PostgreSQL 16), independent of table size; no extra disk; the exclusive lock on
+`raw_health_data` lasts only that moment. The app restarts as for any update (a few seconds;
+Google retries webhooks). From then on `raw_api_responses` grows by every page fetched (see the
+size query in the reference).
 
 ```sh
 make backup
@@ -88,9 +93,11 @@ docker compose logs app | grep 20261020_0011     # "Running upgrade 20261020_001
 docker compose exec app alembic current          # expect 20261020_0011 (head)
 docker compose exec app health-mirror verify     # exit 0: guards in place, hashes match
 api /health
+# After the next scheduled sync (or `docker compose exec app health-mirror sync heart-rate`):
+docker compose exec app health-mirror responses --limit 3   # pages are being kept
 ```
 
-`alembic downgrade 20261020_0010` refuses while history rows exist (it would drop them); after a
+`alembic downgrade 20261020_0010` refuses while history, response or event rows exist (it would drop them); after a
 backup, `alembic -x allow-version-loss=1 downgrade 20261020_0010` forces it. An offline script
 (`alembic downgrade --sql`) contains the same check as a `DO` block that raises when it runs.
 Prefer restoring the backup.
@@ -131,6 +138,23 @@ their own marked source-deleted), `source_hash_mismatches` and `unrepresentable`
 command exits 1 and the loop stops, so keep that dump file and report the listed keys). A repeated
 import adds nothing. Expect about 30 seconds per million dump rows for the scan, plus the
 `pg_restore` time.
+
+## Audit what Google sent
+
+Every Google response is in `raw_api_responses` (see
+[Verbatim Google responses](REFERENCE.md#verbatim-google-responses)). To check a record against
+the exact page it came from:
+
+```sh
+docker compose exec app health-mirror history --data-type steps --id 'users/me/dataTypes/steps/dataPoints/…' --no-payload
+# each version shows response_id; export that page byte for byte:
+docker compose exec -T app health-mirror export-response <response_id> > page.json
+sha256sum page.json            # equals body_sha256 in the metadata printed on stderr
+docker compose exec app health-mirror responses --context webhook:<element hash>   # all pages of one run
+```
+
+`health-mirror verify` recomputes every stored body's SHA-256; run it after restores and in the
+backup drill.
 
 ## Update images and cloudflared
 

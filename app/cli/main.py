@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import typer
 from sqlalchemy import func, select
@@ -200,11 +202,12 @@ def webhook_replay_pending() -> None:
 
 @app.command()
 def verify() -> None:
-    """Check archive guards, payload hashes, version history, and checkpoint errors."""
+    """Check archive guards, payload and body hashes, version history, and sync errors."""
 
     async def command():
         from app.parsers.common import payload_hash
         from app.services.raw_history import verify_guards, verify_versions
+        from app.services.responses import verify_responses
 
         errors = []
         count = 0
@@ -225,13 +228,18 @@ def verify() -> None:
                     errors.append(f"payload hash mismatch: {data_type}/{google_data_point_id}")
             versions, version_errors = await verify_versions(session)
             errors.extend(version_errors)
+            responses, response_errors = await verify_responses(session)
+            errors.extend(response_errors)
             failed = (
                 await session.scalars(select(SyncState).where(SyncState.last_error.is_not(None)))
             ).all()
-        return count, versions, errors, failed
+        return count, versions, responses, errors, failed
 
-    count, versions, errors, failed = run(command())
-    typer.echo(f"Verified {count} raw records and {versions} earlier versions")
+    count, versions, responses, errors, failed = run(command())
+    typer.echo(
+        f"Verified {count} raw records, {versions} earlier versions "
+        f"and {responses} stored Google responses"
+    )
     for error in errors:
         typer.echo(error, err=True)
     for state in failed:
@@ -337,9 +345,74 @@ def import_versions(
         raise typer.Exit(1)
 
 
+FETCHED_SINCE_OPTION = typer.Option(
+    None, "--since", formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"], help="Fetched at/after (UTC)."
+)
+OUTPUT_OPTION = typer.Option(
+    None, "--output", "-o", help="Write the body here instead of standard output."
+)
+
+
+@app.command()
+def responses(
+    data_type: str | None = typer.Option(None, "--data-type"),
+    context_id: str | None = typer.Option(
+        None, "--context", help="A run id, e.g. webhook:<element hash> or backfill:<job id>."
+    ),
+    since: datetime | None = FETCHED_SINCE_OPTION,
+    limit: int = typer.Option(20, min=1, max=10_000),
+) -> None:
+    """List stored Google responses (newest first, metadata only) as JSON."""
+    from app.services.responses import list_responses
+
+    async def command():
+        async with SessionLocal() as session:
+            return await list_responses(
+                session,
+                data_type=data_type,
+                context_id=context_id,
+                since=since.replace(tzinfo=UTC) if since else None,
+                limit=limit,
+            )
+
+    typer.echo(json.dumps(run(command()), indent=2, ensure_ascii=False))
+
+
+@app.command()
+def export_response(
+    response_id: int = typer.Argument(..., help="raw_api_responses.id"),
+    output: Path | None = OUTPUT_OPTION,
+) -> None:
+    """Write one stored Google response body byte for byte (metadata goes to stderr)."""
+    import hashlib
+
+    from app.services.responses import describe, load_response
+
+    async def command():
+        async with SessionLocal() as session:
+            return await load_response(session, response_id)
+
+    response = run(command())
+    if response is None:
+        typer.echo(f"no stored response {response_id}", err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(describe(response), ensure_ascii=False), err=True)
+    if hashlib.sha256(response.body).hexdigest() != response.body_sha256:
+        typer.echo("the stored body no longer matches its SHA-256", err=True)
+        raise typer.Exit(1)
+    if output is not None:
+        output.write_bytes(response.body)
+    else:
+        sys.stdout.buffer.write(response.body)
+        sys.stdout.buffer.flush()
+
+
 @app.command()
 def probe(days: int = typer.Option(30, min=1, max=365)) -> None:
-    """Probe accessible Google Health types without storing or starting a backfill."""
+    """Probe accessible Google Health types without archiving records or a backfill.
+
+    The probe's Google responses are kept in raw_api_responses (source "probe").
+    """
     runtime = build_runtime(get_settings(), SessionLocal)
 
     async def command():

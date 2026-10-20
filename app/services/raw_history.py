@@ -47,6 +47,7 @@ from app.models.raw_versions import (
     PROTECTIVE_TRIGGERS,
     RENUMBER_SETTING,
     SQLITE_TRIGGERS,
+    RawHealthDataEvent,
     RawHealthDataVersion,
 )
 from app.models.state import RawHealthData, RawJSON
@@ -76,6 +77,7 @@ history_view = Table(
     Column("source_start_time", DateTime(timezone=True)),
     Column("source_end_time", DateTime(timezone=True)),
     Column("source_deleted_at", DateTime(timezone=True)),
+    Column("response_id", Integer),
 )
 
 
@@ -140,12 +142,32 @@ async def record_history(
             "last_seen_at": _iso(row["last_seen_at"]),
             "source": row["source"],
             "payload_hash": row["payload_hash"],
+            "response_id": row["response_id"],
         }
         if row["source_deleted_at"] is not None:
             version["source_deleted_at"] = _iso(row["source_deleted_at"])
         if include_payload:
             version["payload"] = row["raw_json"]
         record["versions"].append(version)
+    events = await session.execute(
+        select(
+            RawHealthDataEvent.google_data_point_id,
+            RawHealthDataEvent.event,
+            RawHealthDataEvent.occurred_at,
+            RawHealthDataEvent.previous_deleted_at,
+        )
+        .where(
+            RawHealthDataEvent.data_type == data_type,
+            RawHealthDataEvent.google_data_point_id.in_(keys),
+        )
+        .order_by(RawHealthDataEvent.id)
+    )
+    for google_id, kind, occurred, previous in events.tuples():
+        if google_id in records:
+            item = {"event": kind, "at": _iso(occurred)}
+            if previous is not None:
+                item["previous_deleted_at"] = _iso(previous)
+            records[google_id].setdefault("events", []).append(item)
     return [records[key] for key in keys if key in records]
 
 

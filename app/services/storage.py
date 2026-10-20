@@ -4,18 +4,21 @@ import logging
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
+from typing import cast as cast_type
 
-from sqlalchemy import Text, and_, case, cast, select
+from sqlalchemy import Table, Text, and_, case, cast, insert, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import event
+from app.core.provenance import current_source, provenance
+from app.google_health.capture import CapturedResponse
 from app.google_health.data_types import DataTypeSpec
+from app.models.raw_versions import RawApiResponse
 from app.models.state import RawHealthData
 from app.parsers import normalize
 from app.parsers.common import payload_hash, source_id, temporal
@@ -40,19 +43,32 @@ class StoreStats:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
-# The write path that delivered the records being stored (raw_health_data.payload_source,
-# raw_health_data_versions.source). Callers that run the incremental sync on behalf of
-# something else (webhooks, reconciliation) set it around the call; see recording_source.
-_source: ContextVar[str] = ContextVar("raw_payload_source", default="sync")
-
-
 @contextmanager
 def recording_source(source: str) -> Iterator[None]:
-    token = _source.set(source)
-    try:
+    """The write path for records stored (and responses fetched) in the enclosed work."""
+    with provenance(source=source):
         yield
-    finally:
-        _source.reset(token)
+
+
+async def insert_responses(
+    session: AsyncSession, responses: Sequence[CapturedResponse]
+) -> list[int]:
+    """Append Google responses to raw_api_responses; returns their ids in order."""
+    if not responses:
+        return []
+    table = cast_type(Table, RawApiResponse.__table__)
+    statement = insert(table).returning(table.c.id, sort_by_parameter_order=True)
+    result = await session.execute(statement, [response.row() for response in responses])
+    return list(result.scalars().all())
+
+
+async def store_page(
+    session: AsyncSession, spec: DataTypeSpec, page, *, source: str | None = None
+) -> StoreStats:
+    """Store a fetched page: its Google responses and its records, in one transaction."""
+    return await store_records(
+        session, spec, page.data_points, source=source, responses=page.responses
+    )
 
 
 async def store_records(
@@ -61,6 +77,7 @@ async def store_records(
     records: Sequence[object],
     *,
     source: str | None = None,
+    responses: Sequence[CapturedResponse] = (),
 ) -> StoreStats:
     """Archive one page of records; a changed payload keeps the previous one as a version.
 
@@ -69,10 +86,16 @@ async def store_records(
     the same statement. A record that appears more than once in ``records`` with
     different payloads is written once per distinct payload, in order, so each becomes
     its own version (consecutive identical copies collapse into one).
+
+    ``responses`` are the HTTP exchanges the records were read from: they are appended to
+    ``raw_api_responses`` first, in this same transaction, and each new payload is linked
+    to the last of them (``response_id``), so a crash keeps both or neither.
     """
     stats = StoreStats()
     now = datetime.now(UTC)
-    origin = source or _source.get()
+    origin = source or current_source()
+    response_ids = await insert_responses(session, responses)
+    response_id = response_ids[-1] if response_ids else None
     # Per record id, the distinct consecutive payloads of this page, in page order.
     by_id: dict[str, list[tuple]] = {}
     duplicates = 0
@@ -109,7 +132,7 @@ async def store_records(
         for position, item in enumerate(sequence):
             if position == len(rounds):
                 rounds.append([])
-            rounds[position].append(_raw_row(spec, item, now, origin))
+            rounds[position].append(_raw_row(spec, item, now, origin, response_id))
         existing_hash = existing_hashes.get(google_id)
         hashes = [existing_hash, *(item[2] for item in sequence)]
         replaced = sum(old is not None and old != new for old, new in pairwise(hashes))
@@ -150,7 +173,9 @@ async def store_records(
     return stats
 
 
-def _raw_row(spec: DataTypeSpec, item: tuple, now: datetime, origin: str) -> dict:
+def _raw_row(
+    spec: DataTypeSpec, item: tuple, now: datetime, origin: str, response_id: int | None
+) -> dict:
     record, google_id, digest, start, end, timezone = item
     return {
         "google_data_point_id": google_id,
@@ -165,6 +190,7 @@ def _raw_row(spec: DataTypeSpec, item: tuple, now: datetime, origin: str) -> dic
         "source_deleted_at": None,
         "payload_received_at": now,
         "payload_source": origin,
+        "response_id": response_id,
     }
 
 
@@ -212,6 +238,7 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
         "payload_source": case(
             (unchanged, table.c.payload_source), else_=statement.excluded.payload_source
         ),
+        "response_id": case((unchanged, table.c.response_id), else_=statement.excluded.response_id),
         "updated_at": datetime.now(UTC),
     }
     statement = statement.on_conflict_do_update(

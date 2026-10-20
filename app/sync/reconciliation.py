@@ -7,8 +7,9 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.logging import event
+from app.core.provenance import new_context_id, provenance
 from app.services.pipeline_health import update_reliability_state
-from app.services.storage import StoreStats, recording_source
+from app.services.storage import StoreStats
 from app.sync.incremental import IncrementalSync
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class ReconciliationService:
 
     async def run(self, days: int) -> dict:
         async with self._lock:
-            with recording_source("reconciliation"):
+            with provenance(source="reconciliation", context_id=new_context_id("reconciliation")):
                 return await self._run(days)
 
     async def _run(self, days: int) -> dict:

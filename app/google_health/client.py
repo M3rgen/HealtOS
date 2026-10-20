@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 import httpx
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.core.provenance import current_context_id, current_source, provenance
+from app.google_health.capture import CapturedResponse, ResponseArchive, kept_headers, safe_query
 from app.google_health.data_types import AccessMethod, DataTypeSpec, query_iso
 from app.google_health.oauth import TokenProvider
 
@@ -29,6 +33,10 @@ class InvalidPageTokenError(GoogleHealthError):
 class Page:
     data_points: list[dict]
     next_page_token: str | None
+    # Every HTTP exchange behind this page (retries included), oldest first; the last one
+    # is the response the data points were read from. Stored with the records
+    # (app.services.storage.store_page), in the same transaction.
+    responses: tuple[CapturedResponse, ...] = ()
 
 
 class GoogleHealthClient:
@@ -38,11 +46,15 @@ class GoogleHealthClient:
         tokens: TokenProvider,
         http: httpx.AsyncClient | None = None,
         sleep=asyncio.sleep,
+        archive: ResponseArchive | None = None,
     ):
         self.settings = settings
         self.tokens = tokens
         self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(60, connect=20))
         self.sleep = sleep
+        # Where responses go that no page transaction stores (failures, identity, devices,
+        # probes); None (tests) drops them.
+        self.archive = archive
         self._request_lock = asyncio.Lock()
         self._last_request_started = 0.0
 
@@ -70,9 +82,10 @@ class GoogleHealthClient:
             }
             if page_token:
                 body["pageToken"] = page_token
-            payload = await self._request(
+            payload, responses = await self._request(
                 "POST",
                 f"/users/me/dataTypes/{spec.name}/dataPoints:rollUp",
+                data_type=spec.name,
                 json=body,
             )
             points = payload.get("rollupDataPoints", [])
@@ -85,43 +98,104 @@ class GoogleHealthClient:
             if page_token:
                 params["pageToken"] = page_token
             suffix = ":reconcile" if spec.access_method == AccessMethod.reconcile else ""
-            payload = await self._request(
+            payload, responses = await self._request(
                 "GET",
                 f"/users/me/dataTypes/{spec.name}/dataPoints{suffix}",
+                data_type=spec.name,
                 params=params,
             )
             points = payload.get("dataPoints", [])
         if not isinstance(points, list):
+            await self.keep(responses)
             raise GoogleHealthError("Google Health response has an invalid data point list")
         token = payload.get("nextPageToken") or None
-        return Page(points, token)
+        return Page(points, token, tuple(responses))
 
     async def get_identity(self, access_token: str | None = None) -> dict:
-        return await self._request("GET", "/users/me/identity", access_token=access_token)
+        with provenance(source="identity"):
+            payload, responses = await self._request(
+                "GET", "/users/me/identity", access_token=access_token
+            )
+        await self.keep(responses)
+        return payload
 
     async def list_paired_devices(self) -> dict:
-        return await self._request("GET", "/users/me/pairedDevices")
+        payload, responses = await self._request("GET", "/users/me/pairedDevices")
+        await self.keep(responses)
+        return payload
+
+    async def keep(self, responses: Sequence[CapturedResponse]) -> None:
+        """Store responses outside a page transaction (failures, probes, identity)."""
+        if not responses or self.archive is None:
+            return
+        try:
+            await self.archive.keep(responses)
+        except Exception:
+            logger.exception(
+                "Google Health responses could not be archived",
+                extra={"event": "RESPONSE_ARCHIVE_FAILED", "count": len(responses)},
+            )
 
     async def _request(
-        self, method: str, path: str, *, access_token: str | None = None, **kwargs
-    ) -> dict:
+        self,
+        method: str,
+        path: str,
+        *,
+        access_token: str | None = None,
+        data_type: str | None = None,
+        **kwargs,
+    ) -> tuple[dict, list[CapturedResponse]]:
+        """The decoded JSON object and every response received on the way to it.
+
+        On failure the responses received so far are archived before the error propagates.
+        """
+        captured: list[CapturedResponse] = []
+        try:
+            return await self._exchange(method, path, access_token, data_type, captured, kwargs)
+        except Exception:
+            await self.keep(captured)
+            raise
+
+    async def _exchange(
+        self,
+        method: str,
+        path: str,
+        access_token: str | None,
+        data_type: str | None,
+        captured: list[CapturedResponse],
+        kwargs: dict,
+    ) -> tuple[dict, list[CapturedResponse]]:
         await self._pace_request()
         refreshed = False
         last_status: int | None = None
         attempt = 0
         while True:
             token = access_token if access_token is not None else await self.tokens.get()
+            request = self.http.build_request(
+                method,
+                f"{self.settings.google_health_base_url}{path}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    # Uncompressed, so the stored body is the bytes on the wire.
+                    "Accept-Encoding": "identity",
+                },
+                **kwargs,
+            )
+            response: httpx.Response | None = None
+            body = b""
             try:
-                response = await self.http.request(
-                    method,
-                    f"{self.settings.google_health_base_url}{path}",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/json",
-                    },
-                    **kwargs,
-                )
+                response = await self.http.send(request, stream=True)
             except httpx.TransportError as exc:
+                failure: Exception | None = exc
+            else:
+                # Every response is kept, also an error status or a body cut off midway.
+                body, failure = await _read_body(response)
+                captured.append(
+                    _capture(request, response, body, failure, len(captured), data_type)
+                )
+            if failure is not None or response is None:
+                exc = failure
                 if attempt >= self.settings.google_api_max_retries:
                     raise GoogleHealthError(
                         "Google Health API connection failed after retries"
@@ -147,19 +221,18 @@ class GoogleHealthClient:
                 await self.sleep(delay)
                 continue
             if response.is_error:
-                if response.status_code == 400 and _has_error_code(response, "INVALID_PAGE_TOKEN"):
+                if response.status_code == 400 and _has_error_code(body, "INVALID_PAGE_TOKEN"):
                     raise InvalidPageTokenError("Google Health pagination token expired")
                 raise GoogleHealthError(
-                    "Google Health API returned HTTP "
-                    f"{response.status_code}: {_safe_error(response)}"
+                    f"Google Health API returned HTTP {response.status_code}: {_safe_error(body)}"
                 )
             try:
-                payload = response.json()
+                payload = json.loads(body)
             except ValueError as exc:
                 raise GoogleHealthError("Google Health API returned invalid JSON") from exc
             if not isinstance(payload, dict):
                 raise GoogleHealthError("Google Health API returned a non-object JSON response")
-            return payload
+            return payload, captured
         raise GoogleHealthError(
             f"Google Health API request failed after retries (HTTP {last_status})"
         )
@@ -211,20 +284,64 @@ def _backoff(attempt: int) -> float:
     return min(60.0, (2**attempt) + random.random())
 
 
-def _safe_error(response: httpx.Response) -> str:
+async def _read_body(response: httpx.Response) -> tuple[bytes, Exception | None]:
+    """The body as received; a connection that fails mid-body still yields what arrived."""
+    chunks: list[bytes] = []
+    failure: Exception | None = None
     try:
-        payload = response.json()
-        error = payload.get("error", {})
-        return str(error.get("status") or error.get("message") or "request rejected")[:300]
+        async for chunk in response.aiter_bytes():
+            chunks.append(chunk)
+    except (httpx.TransportError, httpx.DecodingError) as exc:
+        failure = exc
+    finally:
+        await response.aclose()
+    return b"".join(chunks), failure
+
+
+def _capture(
+    request: httpx.Request,
+    response: httpx.Response,
+    body: bytes,
+    failure: Exception | None,
+    attempt: int,
+    data_type: str | None,
+) -> CapturedResponse:
+    content = request.content
+    return CapturedResponse(
+        fetched_at=datetime.now(UTC),
+        source=current_source(),
+        context_id=current_context_id(),
+        data_type=data_type,
+        method=request.method,
+        path=request.url.path,
+        query=safe_query(request.url.query),
+        request_body=content or None,
+        attempt=attempt,
+        status_code=response.status_code,
+        headers=kept_headers(response.headers),
+        body=body,
+        complete=failure is None,
+        error=type(failure).__name__ if failure is not None else None,
+    )
+
+
+def _json(body: bytes) -> object:
+    try:
+        return json.loads(body)
     except ValueError:
+        return None
+
+
+def _safe_error(body: bytes) -> str:
+    payload = _json(body)
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    if not isinstance(error, dict):
         return "request rejected"
+    return str(error.get("status") or error.get("message") or "request rejected")[:300]
 
 
-def _has_error_code(response: httpx.Response, expected: str) -> bool:
-    try:
-        payload = response.json()
-    except ValueError:
-        return False
+def _has_error_code(body: bytes, expected: str) -> bool:
+    payload = _json(body)
 
     def contains(value: object) -> bool:
         if isinstance(value, str):
