@@ -78,6 +78,17 @@ def test_ui_smoke_script_compiles_and_authenticates():
     assert COMPOSE["services"]["app"]["environment"]["APP_UI_TOKEN"].startswith("${APP_UI_TOKEN:?")
 
 
+def test_ui_smoke_title_check_matches_the_served_page():
+    # The repo is HealtOS, the product HealthOS; the smoke test must look for the latter.
+    import re
+
+    from scripts.verify_compose import UI_SMOKE_SCRIPT
+
+    expected = re.search(r"assert '(<title>[^']+)' in html", UI_SMOKE_SCRIPT)
+    page = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    assert expected and expected.group(1) in page
+
+
 def _run_smoke_scripts_against_fake_app(monkeypatch, token: str):
     """Execute the in-container smoke scripts with urllib answered like UITokenMiddleware."""
     import io
@@ -100,7 +111,7 @@ def _run_smoke_scripts_against_fake_app(monkeypatch, token: str):
     def payload(method: str, path: str, data: bytes | None) -> Response:
         if path == "/":
             return Response(
-                b'<title>HealtOS</title><script src="/assets/a.js"></script>'
+                b'<title>HealthOS</title><script src="/assets/a.js"></script>'
                 b'<link href="/assets/a.css">'
             )
         if path.startswith("/assets/") or path == "/health/live":
