@@ -1,5 +1,10 @@
+import logging
+from datetime import UTC, datetime
+
+from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
+
 from app.core.config import Settings
-from app.services.scheduler import build_scheduler
+from app.services.scheduler import build_scheduler, log_missed_job
 
 
 def test_daily_and_weekly_reconciliation_schedule_is_configurable():
@@ -67,3 +72,57 @@ def test_freshness_summary_refreshes_in_hourly_slots():
 
     assert job.max_instances == 1
     assert "minute='0'" in str(job.trigger)
+
+
+def test_every_job_tolerates_late_starts_and_coalesces_missed_runs():
+    class Reconciliation:
+        async def run(self, days):
+            return days
+
+    class Watchdog:
+        async def periodic_check(self):
+            return None
+
+    class Health:
+        async def refresh_freshness(self):
+            return None
+
+    scheduler = build_scheduler(
+        Settings(reconciliation_enabled=True, watchdog_enabled=True),
+        Reconciliation(),
+        Watchdog(),
+        Health(),
+    )
+    jobs = scheduler.get_jobs()
+
+    assert {job.id for job in jobs} == {
+        "daily-reconciliation",
+        "weekly-reconciliation",
+        "pipeline-watchdog",
+        "pipeline-freshness-refresh",
+    }
+    for job in jobs:
+        assert job.misfire_grace_time == 3600
+        assert job.coalesce is True
+        assert job.max_instances == 1
+    assert any(
+        callback is log_missed_job and mask & EVENT_JOB_MISSED
+        for callback, mask in scheduler._listeners
+    )
+
+
+def test_missed_job_is_logged_at_info(caplog, monkeypatch):
+    # Alembic's fileConfig in the migration tests disables already-created loggers.
+    monkeypatch.setattr(logging.getLogger("app.services.scheduler"), "disabled", False)
+    with caplog.at_level(logging.INFO, logger="app.services.scheduler"):
+        log_missed_job(
+            JobExecutionEvent(
+                EVENT_JOB_MISSED,
+                "daily-reconciliation",
+                "default",
+                datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+    [record] = [item for item in caplog.records if item.message == "SCHEDULER_JOB_MISSED"]
+    assert record.levelno == logging.INFO
+    assert record.job_id == "daily-reconciliation"
