@@ -18,16 +18,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from app.core.logging import event
-from app.google_health.data_types import AccessMethod, DataTypeSpec, RecordKind, query_time
+from app.google_health.data_types import (
+    CIVIL_AFTER,
+    CIVIL_BEFORE,
+    AccessMethod,
+    DataTypeSpec,
+    RecordKind,
+    query_time,
+)
 from app.models.state import RawHealthData
 
 logger = logging.getLogger(__name__)
-
-# Session filters compare civil (local wall-clock) start times with the window bounds,
-# while the archive stores UTC. UTC offsets range from -12:00 to +14:00, so only records
-# this far inside the window are certain to have matched the filter.
-_CIVIL_BEFORE = timedelta(hours=12)
-_CIVIL_AFTER = timedelta(hours=14)
 
 
 def deletion_scope(
@@ -55,7 +56,8 @@ def deletion_scope(
     if spec.name == "sleep":
         return RawHealthData.source_end_time, start, end
     if spec.kind == RecordKind.session and spec.name != "electrocardiogram":
-        lower, upper = start + _CIVIL_BEFORE, end - _CIVIL_AFTER
+        # Civil start times: only records this far inside are certain to have matched.
+        lower, upper = start + CIVIL_BEFORE, end - CIVIL_AFTER
         if lower >= upper:
             return None
         return RawHealthData.source_start_time, lower, upper

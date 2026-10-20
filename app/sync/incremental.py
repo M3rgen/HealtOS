@@ -192,8 +192,10 @@ class IncrementalSync:
         async with self.sessions.begin() as session:
             state = await session.get(SyncState, data_type)
             previous_success = state.last_successful_sync
+            # A widened webhook window may end in the future; the watermark never does.
+            reached = min(end, datetime.now(UTC))
             state.last_successful_sync = (
-                max(as_utc(previous_success), end) if previous_success else end
+                max(as_utc(previous_success), reached) if previous_success else reached
             )
             state.last_page_token = None
             if fetched_since is not None:

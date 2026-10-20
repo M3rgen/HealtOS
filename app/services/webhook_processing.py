@@ -340,6 +340,8 @@ class WebhookBatchProcessor:
         spec = self.incremental.specs[data_type]
         windows: list[tuple[datetime | None, datetime | None]] = []
         if start and end:
+            # Widen session windows so the filter (and deletion marking) covers the record.
+            start, end = spec.covering_window(start, end)
             cursor = start
             while cursor < end:
                 window_end = (

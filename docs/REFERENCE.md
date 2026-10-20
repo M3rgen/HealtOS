@@ -394,6 +394,23 @@ curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/sync/status
 
 Default overlaps are 60 minutes for heart rate, 12 hours for steps/activity streams, 72 hours for sleep/temperature derivations, seven days for daily metrics, and 24 hours otherwise. UPSERT makes every replay safe.
 
+### Source deletions
+
+Google's list responses carry no tombstones; a deleted record simply stops appearing. When a window
+was fetched from its first page to its last (an incremental run, a webhook re-fetch, or a
+reconciliation), archived records that the same filter must have matched but that were not returned
+get `source_deleted_at`. Nothing is deleted; dashboards and Umay skip marked records, and a record
+that comes back is unmarked. The marked range is derived from exactly the bounds sent to Google
+(UTC, whole seconds); rollup and reconcile types (aggregates) and catalogs without a time filter are
+never marked.
+
+- Session filters use civil start times (sleep: physical end time, exclusive). A webhook re-fetch
+  of one sleep or exercise session therefore widens its window (sleep: one second past the
+  session's end; other sessions: 12 hours before and 14 hours after, the range of UTC offsets) so
+  the deleted session is inside both the query and the marked range. Outside webhooks, a
+  scheduled window only marks sessions that started at least 12 hours after its start and 14 hours
+  before its end; the rest is covered by the daily 7-day reconciliation.
+
 ## Webhooks
 
 Configure a Google Health subscriber with:

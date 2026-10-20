@@ -1,12 +1,15 @@
 from datetime import UTC, date, datetime, timedelta
 
+import pytest
 from sqlalchemy import func, select
 
 from app.core.config import Settings
+from app.core.timeutil import as_utc
 from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY, query_iso
-from app.models.state import JobStatus, RawHealthData, SyncState
+from app.models.state import JobStatus, RawHealthData, SyncState, WebhookNotification
 from app.services.dashboard import dashboard_data
+from app.services.webhook_processing import WebhookBatchProcessor
 from app.sync.deletions import deletion_scope
 from app.sync.incremental import IncrementalSync
 
@@ -173,3 +176,90 @@ def test_deletion_scope_uses_the_bounds_sent_to_google():
         'heart_rate.sample_time.physical_time >= "2026-08-01T06:00:00Z" AND '
         'heart_rate.sample_time.physical_time < "2026-08-01T10:00:00Z"'
     )
+
+
+def session_record(data_type, name, start_iso, end_iso):
+    return {
+        "name": f"users/1/dataTypes/{data_type}/dataPoints/{name}",
+        data_type: {
+            "interval": {"startTime": start_iso, "endTime": end_iso, "startUtcOffset": "10800s"}
+        },
+    }
+
+
+class RecordingClient(QueueClient):
+    def __init__(self):
+        super().__init__()
+        self.windows = []
+
+    async def list_data_points(self, spec, start, end, page_token=None):
+        self.windows.append((start, end))
+        return await super().list_data_points(spec, start, end, page_token)
+
+
+async def webhook_delete(sessions, service, data_type, start_iso, end_iso):
+    processor = WebhookBatchProcessor(sessions, service, set(service.specs))
+    async with sessions.begin() as session:
+        session.add(
+            WebhookNotification(
+                element_hash=f"delete-{data_type}",
+                raw_json={},
+                is_valid=True,
+                data_type=data_type,
+                health_user_id="user-1",
+                operation="DELETE",
+                intervals=[{"physicalTimeInterval": {"startTime": start_iso, "endTime": end_iso}}],
+            )
+        )
+    assert await processor._process_element(f"delete-{data_type}") == "completed"
+
+
+@pytest.mark.parametrize(
+    "data_type, start_iso, end_iso",
+    [
+        # The filter is end_time < end: a session ending exactly at the notified end.
+        ("sleep", "2026-08-01T22:00:00Z", "2026-08-02T06:00:00Z"),
+        # The filter is on civil start time: a short UTC+3 workout.
+        ("exercise", "2026-08-01T10:00:00Z", "2026-08-01T11:00:00Z"),
+    ],
+)
+async def test_webhook_delete_of_one_session_marks_it(sessions, data_type, start_iso, end_iso):
+    client = RecordingClient()
+    service = IncrementalSync(Settings(), sessions, client, {data_type: REGISTRY[data_type]})
+    record = session_record(data_type, "gone", start_iso, end_iso)
+    client.responses = [Page([record], None)]
+    await service.run(data_type, WINDOW_START, WINDOW_START + timedelta(days=3))
+
+    client.responses = [Page([], None)]
+    await webhook_delete(sessions, service, data_type, start_iso, end_iso)
+
+    async with sessions() as session:
+        row = await session.scalar(select(RawHealthData))
+        state = await session.get(SyncState, data_type)
+    assert row.source_deleted_at is not None
+    # The query sent to Google covered the session for any UTC offset, so the mark is safe.
+    start, end = client.windows[-1]
+    begin, finish = datetime.fromisoformat(start_iso), datetime.fromisoformat(end_iso)
+    if data_type == "sleep":
+        assert start <= finish < end
+    else:
+        assert start <= begin - timedelta(hours=12) and end >= begin + timedelta(hours=14)
+    assert as_utc(state.last_successful_sync) <= datetime.now(UTC)
+
+
+async def test_widened_webhook_window_never_moves_the_watermark_past_now(sessions):
+    client = RecordingClient()
+    service = IncrementalSync(Settings(), sessions, client, {"exercise": REGISTRY["exercise"]})
+    begin = datetime.now(UTC).replace(microsecond=0) - timedelta(hours=1)
+    client.responses = [Page([], None)]
+    await webhook_delete(
+        sessions,
+        service,
+        "exercise",
+        begin.isoformat().replace("+00:00", "Z"),
+        (begin + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
+    )
+    async with sessions() as session:
+        state = await session.get(SyncState, "exercise")
+    assert client.windows[-1][1] > datetime.now(UTC)  # civil start times run ahead of UTC
+    assert as_utc(state.last_successful_sync) <= datetime.now(UTC)
