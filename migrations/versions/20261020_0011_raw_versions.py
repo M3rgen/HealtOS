@@ -31,7 +31,8 @@ payload was gone; nothing in the database stopped a `DELETE` either. From this r
   `source_deleted_at` (append-only, by trigger).
 * Every protective trigger is `ENABLE ALWAYS`: it also fires with
   `session_replication_role = replica`. `health-mirror verify` fails when one is missing,
-  disabled, or its function no longer has the body below.
+  disabled, recreated with other events, timing or `WHEN`, or its function no longer has
+  the body below.
 * The view `raw_health_data_history` lists every version of every record (history rows
   plus the current row) with version number, `valid_from`/`valid_to` and `is_current`.
 

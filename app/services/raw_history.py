@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
@@ -44,9 +45,10 @@ from app.core.timeutil import as_utc
 from app.models.raw_versions import (
     FUNCTION_BODIES,
     HISTORY_VIEW,
+    PG_TRIGGER_SQL,
     PROTECTIVE_TRIGGERS,
     RENUMBER_SETTING,
-    SQLITE_TRIGGERS,
+    SQLITE_TRIGGER_SQL,
     RawHealthDataEvent,
     RawHealthDataVersion,
 )
@@ -207,45 +209,90 @@ _REPEAT_SQL = text(
 )
 
 _PG_TRIGGERS_SQL = text(
-    "SELECT c.relname, t.tgname, t.tgenabled, p.proname, p.prosrc "
+    "SELECT c.relname, t.tgname, t.tgenabled, p.proname, p.prosrc, pg_get_triggerdef(t.oid) "
     "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
     "JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc p ON p.oid = t.tgfoid "
     "WHERE NOT t.tgisinternal AND n.nspname = current_schema()"
 )
+_STAND_IN_TRIGGERS_SQL = text(
+    "SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid) "
+    "FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+    "WHERE NOT t.tgisinternal AND c.relnamespace = pg_my_temp_schema()"
+)
 _ENABLED = {"O": "enabled (not ALWAYS)", "D": "disabled", "R": "replica-only", "A": "always"}
+_STAND_IN = "healthos_verify_"
+# pg_get_triggerdef names the table schema-qualified right after the events.
+_RELATION = re.compile(r" ON \S+ ")
+
+
+def _canonical(definition: str, table: str) -> str:
+    return " ".join(_RELATION.sub(f" ON {table} ", definition, count=1).split())
+
+
+async def _expected_pg_definitions(session: AsyncSession) -> dict[tuple[str, str], str]:
+    """What this server makes of each expected ``CREATE TRIGGER``, as pg_get_triggerdef.
+
+    The statements are run against empty temporary copies of the guarded tables inside a
+    savepoint that is rolled back, so the comparison uses the server's own deparsing (no
+    hand-written expectation that a PostgreSQL release could spell differently).
+    """
+    expected: dict[tuple[str, str], str] = {}
+    tables = sorted({table for table, _ in PG_TRIGGER_SQL.values()})
+    savepoint = await session.begin_nested()
+    try:
+        for table in tables:
+            await session.execute(text(f"CREATE TEMP TABLE {_STAND_IN}{table} (LIKE {table})"))
+        for table, sql in PG_TRIGGER_SQL.values():
+            stand_in = sql.replace(f" ON {table} ", f" ON pg_temp.{_STAND_IN}{table} ", 1)
+            await session.execute(text(stand_in))
+        for relname, trigger, definition in (
+            await session.execute(_STAND_IN_TRIGGERS_SQL)
+        ).tuples():
+            table = relname.removeprefix(_STAND_IN)
+            expected[(table, trigger)] = _canonical(definition, table)
+    finally:
+        await savepoint.rollback()
+    return expected
 
 
 async def verify_guards(session: AsyncSession) -> list[str]:
-    """Every protective trigger exists, always fires, and runs its expected function body.
+    """Every protective trigger exists, always fires, and is exactly the one created.
 
     A trigger that is missing, disabled (``ALTER TABLE ... DISABLE TRIGGER``), demoted to
-    ordinary ``ENABLE`` (then ``session_replication_role = replica`` skips it), or whose
-    function was replaced would let a delete or overwrite through unnoticed.
+    ordinary ``ENABLE`` (then ``session_replication_role = replica`` skips it), recreated
+    with other events, timing or a narrower ``WHEN`` (``WHEN (false)``), or whose function
+    was replaced would let a delete or overwrite through unnoticed. Any other trigger on a
+    guarded table is reported too.
     """
     errors: list[str] = []
     if session.get_bind().dialect.name != "postgresql":
-        names = set(
-            (
+        stored = {
+            (table, trigger): sql
+            for table, trigger, sql in (
                 await session.execute(
-                    text("SELECT tbl_name, name FROM sqlite_master WHERE type = 'trigger'")
+                    text("SELECT tbl_name, name, sql FROM sqlite_master WHERE type = 'trigger'")
                 )
             ).tuples()
-        )
-        for table, trigger in SQLITE_TRIGGERS:
-            if (table, trigger) not in names:
+        }
+        for trigger, (table, sql) in SQLITE_TRIGGER_SQL.items():
+            if (table, trigger) not in stored:
                 errors.append(f"protective trigger missing: {table}.{trigger}")
+            elif " ".join(stored[(table, trigger)].split()) != " ".join(sql.split()):
+                errors.append(f"protective trigger {table}.{trigger} was redefined")
         return errors
+    expected = await _expected_pg_definitions(session)
     found = {
-        (table, trigger): (enabled, function, body)
-        for table, trigger, enabled, function, body in (
+        (table, trigger): (enabled, function, body, definition)
+        for table, trigger, enabled, function, body, definition in (
             await session.execute(_PG_TRIGGERS_SQL)
         ).tuples()
     }
+    guarded = {table for table, _, _ in PROTECTIVE_TRIGGERS}
     for table, trigger, function in PROTECTIVE_TRIGGERS:
         if (table, trigger) not in found:
             errors.append(f"protective trigger missing: {table}.{trigger}")
             continue
-        enabled, actual_function, body = found[(table, trigger)]
+        enabled, actual_function, body, definition = found[(table, trigger)]
         if isinstance(enabled, bytes):
             enabled = enabled.decode()
         if enabled != "A":
@@ -253,10 +300,19 @@ async def verify_guards(session: AsyncSession) -> list[str]:
                 f"protective trigger {table}.{trigger} is {_ENABLED.get(enabled, enabled)}; "
                 f"run ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}"
             )
+        if _canonical(definition, table) != expected.get((table, trigger)):
+            errors.append(
+                f"protective trigger {table}.{trigger} was redefined: {definition}; "
+                f"expected {expected.get((table, trigger))}"
+            )
         if actual_function != function:
             errors.append(f"protective trigger {table}.{trigger} calls {actual_function}()")
         elif body != FUNCTION_BODIES[function]:
             errors.append(f"protective function {function}() was changed")
+    known = {(table, trigger) for table, trigger, _ in PROTECTIVE_TRIGGERS}
+    for (table, trigger), (_, _, _, definition) in sorted(found.items()):
+        if table in guarded and (table, trigger) not in known:
+            errors.append(f"unexpected trigger on guarded table {table}: {definition}")
     return errors
 
 

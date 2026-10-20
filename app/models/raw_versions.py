@@ -24,7 +24,9 @@ current row of a record with ``n`` history rows is version ``n + 1``.
 
 On PostgreSQL every protective trigger is ``ENABLE ALWAYS``, so it also fires under
 ``session_replication_role = replica``; ``health-mirror verify`` fails when one is
-missing, disabled or its function body differs from :data:`FUNCTION_BODIES`.
+missing, disabled, defined differently from :data:`PG_TRIGGER_SQL` (events, timing,
+level, ``WHEN``, columns, function) or its function body differs from
+:data:`FUNCTION_BODIES`, and when any other trigger sits on a guarded table.
 
 The trigger and view SQL is duplicated, frozen, in migration ``20261020_0011``; the copies
 below build the same objects for ``Base.metadata.create_all`` (SQLite tests).
@@ -368,6 +370,12 @@ for _table, (_columns, _pg_extra, _) in PAYLOAD_TABLES.items():
 PROTECTIVE_TRIGGERS = tuple(
     (table, trigger, function) for trigger, (table, _, function) in _PG_TRIGGERS.items()
 )
+# trigger -> (table, CREATE TRIGGER statement): health-mirror verify compares what the
+# server reports for each trigger with what it makes of exactly this statement.
+PG_TRIGGER_SQL = {
+    trigger: (table, f"CREATE TRIGGER {trigger}\n{definition}\nEXECUTE FUNCTION {function}()")
+    for trigger, (table, definition, function) in _PG_TRIGGERS.items()
+}
 
 VIEW_SQL = f"""CREATE VIEW {HISTORY_VIEW} AS
 SELECT v.data_type, v.google_data_point_id, v.raw_id, v.version, (1 = 0) AS is_current,
@@ -396,10 +404,7 @@ POSTGRESQL_DDL = (
         f"CREATE FUNCTION {name}() RETURNS trigger\nLANGUAGE plpgsql AS $${body}$$"
         for name, body in FUNCTION_BODIES.items()
     ),
-    *(
-        f"CREATE TRIGGER {trigger}\n{definition}\nEXECUTE FUNCTION {function}()"
-        for trigger, (_, definition, function) in _PG_TRIGGERS.items()
-    ),
+    *(sql for _, sql in PG_TRIGGER_SQL.values()),
     *(
         f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}"
         for table, trigger, _ in PROTECTIVE_TRIGGERS
@@ -514,6 +519,8 @@ END""",
     )
 
 SQLITE_TRIGGERS = tuple((table, trigger) for trigger, (table, _) in _SQLITE_TRIGGERS.items())
+# trigger -> (table, full SQL); verify compares the stored SQL with it.
+SQLITE_TRIGGER_SQL = dict(_SQLITE_TRIGGERS)
 SQLITE_DDL = (*(sql for _, sql in _SQLITE_TRIGGERS.values()), VIEW_SQL)
 
 # Built once every table exists (the functions and views span several tables).

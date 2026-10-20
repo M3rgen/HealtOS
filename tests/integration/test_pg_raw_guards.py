@@ -188,6 +188,84 @@ def test_verify_fails_when_a_guard_is_missing_disabled_or_replaced(
         asyncio.run(engine.dispose())
 
 
+# 5b. `verify` compared only name, enabled state and function body: a guard recreated
+#     with `WHEN (false)`, other events or other timing stayed green.
+async def test_verify_fails_when_a_guard_is_neutralised(pg_sessions) -> None:
+    from app.models.raw_versions import PG_TRIGGER_SQL
+    from app.services.raw_history import verify_guards
+
+    def recreate(trigger: str, sql: str) -> list[str]:
+        table = PG_TRIGGER_SQL[trigger][0]
+        return [
+            f"DROP TRIGGER {trigger} ON {table}",
+            sql,
+            f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}",
+        ]
+
+    async def guards() -> list[str]:
+        async with pg_sessions() as session:
+            return await verify_guards(session)
+
+    assert await guards() == []
+    no_delete = "raw_health_data_no_delete"
+    frozen = "webhook_events_frozen_payload"
+    tampering = {
+        "WHEN (false)": (
+            no_delete,
+            "CREATE TRIGGER raw_health_data_no_delete BEFORE DELETE ON raw_health_data "
+            "FOR EACH ROW WHEN (false) EXECUTE FUNCTION healthos_refuse_change()",
+        ),
+        "narrower WHEN": (
+            "raw_health_data_keep_version",
+            "CREATE TRIGGER raw_health_data_keep_version BEFORE UPDATE ON raw_health_data "
+            "FOR EACH ROW WHEN (OLD.payload_hash IS DISTINCT FROM NEW.payload_hash) "
+            "EXECUTE FUNCTION raw_health_data_keep_version()",
+        ),
+        "other events": (
+            no_delete,
+            "CREATE TRIGGER raw_health_data_no_delete BEFORE INSERT ON raw_health_data "
+            "FOR EACH ROW EXECUTE FUNCTION healthos_refuse_change()",
+        ),
+        "other timing": (
+            no_delete,
+            "CREATE TRIGGER raw_health_data_no_delete AFTER DELETE ON raw_health_data "
+            "FOR EACH ROW EXECUTE FUNCTION healthos_refuse_change()",
+        ),
+        "statement level": (
+            no_delete,
+            "CREATE TRIGGER raw_health_data_no_delete BEFORE DELETE ON raw_health_data "
+            "FOR EACH STATEMENT EXECUTE FUNCTION healthos_refuse_change()",
+        ),
+        "UPDATE OF a column": (
+            frozen,
+            "CREATE TRIGGER webhook_events_frozen_payload BEFORE UPDATE OF payload_hash "
+            "ON webhook_events FOR EACH ROW EXECUTE FUNCTION healthos_refuse_change()",
+        ),
+    }
+    for label, (trigger, sql) in tampering.items():
+        table = PG_TRIGGER_SQL[trigger][0]
+        await execute(pg_sessions, *recreate(trigger, sql))
+        errors = await guards()
+        assert any(f"protective trigger {table}.{trigger} was redefined" in e for e in errors), (
+            label,
+            errors,
+        )
+        await execute(pg_sessions, *recreate(trigger, PG_TRIGGER_SQL[trigger][1]))
+        assert await guards() == [], label
+    # An extra trigger on a guarded table (e.g. one that rewrites NEW first) is reported.
+    await execute(
+        pg_sessions,
+        "CREATE TRIGGER a_first BEFORE UPDATE ON raw_health_data FOR EACH ROW "
+        "EXECUTE FUNCTION raw_health_data_keep_version()",
+    )
+    assert any("unexpected trigger on guarded table raw_health_data" in e for e in await guards())
+    # Nothing verify created is left behind.
+    async with pg_sessions() as session:
+        assert not await session.scalar(
+            text("SELECT count(*) FROM pg_class WHERE relname LIKE 'healthos_verify_%'")
+        )
+
+
 @pytest.fixture
 def archive_url(database_url):
     """A second database shaped like a pre-0010 dump: raw_json is `json`."""

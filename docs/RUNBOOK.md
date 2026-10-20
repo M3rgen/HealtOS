@@ -104,8 +104,10 @@ Prefer restoring the backup.
 
 If `verify` reports a guard as `disabled` or `enabled (not ALWAYS)` (for example after a
 `pg_restore --disable-triggers` data-only restore), re-enable it with the `ALTER TABLE ... ENABLE
-ALWAYS TRIGGER ...` statement it prints. A *missing* trigger or a *changed* function means the
-schema was altered by hand: restore from a backup rather than patching it.
+ALWAYS TRIGGER ...` statement it prints. A *missing* trigger, a *redefined* one (`was redefined`:
+other events, timing, level, columns or `WHEN` than migration 0011 created, e.g. `WHEN (false)`),
+an *unexpected trigger on a guarded table* or a *changed* function means the schema was altered by
+hand: restore from a backup rather than patching it.
 
 ## Import payload versions from archive dumps
 

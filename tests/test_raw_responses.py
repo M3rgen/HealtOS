@@ -322,3 +322,22 @@ def test_cli_exports_bytes_and_verify_catches_tampering(tmp_path, monkeypatch) -
     )
     assert runner.invoke(cli.app, ["export-response", "1"]).exit_code == 1
     asyncio.run(engine.dispose())
+
+
+async def test_verify_reports_a_redefined_sqlite_guard(sessions) -> None:
+    from app.services.raw_history import verify_guards
+
+    async with sessions() as session:
+        assert await verify_guards(session) == []
+    async with sessions.begin() as session:
+        await session.execute(text("DROP TRIGGER raw_api_responses_no_delete"))
+        await session.execute(
+            text(
+                "CREATE TRIGGER raw_api_responses_no_delete BEFORE DELETE ON raw_api_responses "
+                "WHEN 0 BEGIN SELECT RAISE(ABORT, 'refused'); END"
+            )
+        )
+    async with sessions() as session:
+        assert await verify_guards(session) == [
+            "protective trigger raw_api_responses.raw_api_responses_no_delete was redefined"
+        ]
