@@ -77,7 +77,7 @@ class GoogleHealthClient:
             )
             points = payload.get("rollupDataPoints", [])
         else:
-            params = {"pageSize": effective_page_size}
+            params: dict[str, str | int] = {"pageSize": effective_page_size}
             if filter_expression := spec.filter_for(_iso(start), _iso(end)):
                 params["filter"] = filter_expression
             if spec.access_method == AccessMethod.reconcile:

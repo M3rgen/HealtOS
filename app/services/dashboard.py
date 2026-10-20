@@ -66,7 +66,7 @@ async def dashboard_data(
         }
         for i in range(days)
     }
-    step_hours = [None] * 24
+    step_hours: list[float | None] = [None] * 24
 
     def valid_source(model, data_type: str):
         raw = select(RawHealthData.id).where(
@@ -175,7 +175,7 @@ async def dashboard_data(
     for item in daily:
         payload = payload_for(specs[item.data_type], item.raw_json)
         day = parse_date(payload.get("date"))
-        if day in rows:
+        if day is not None and day in rows:
             key, fields = metrics[item.data_type]
             value = first_number(payload, fields)
             if value is not None:

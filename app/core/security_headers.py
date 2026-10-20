@@ -48,7 +48,7 @@ DOCS_POLICY = "; ".join(
 def app_policy(host: str | None) -> str:
     connect = "connect-src 'self' blob:"
     name = hostname(host) if host else None
-    if name in LOCAL_HOSTS and not name.startswith("["):  # CSP has no IPv6 host-source
+    if host and name in LOCAL_HOSTS and not name.startswith("["):  # CSP has no IPv6 host-source
         connect += f" ws://{host.lower()}"
     return "; ".join((*APP_POLICY, connect))
 

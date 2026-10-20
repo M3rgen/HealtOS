@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -35,7 +36,7 @@ class StoreStats:
 
 
 async def store_records(
-    session: AsyncSession, spec: DataTypeSpec, records: list[object]
+    session: AsyncSession, spec: DataTypeSpec, records: Sequence[object]
 ) -> StoreStats:
     stats = StoreStats()
     now = datetime.now(UTC)
@@ -65,7 +66,7 @@ async def store_records(
                 RawHealthData.google_data_point_id.in_(google_ids[offset : offset + 5000]),
             )
         )
-        existing_hashes.update(rows.all())
+        existing_hashes.update(rows.tuples().all())
 
     raw_values = []
     normalized_values = defaultdict(list)

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, date, datetime, time, timedelta
+from typing import Any, cast
 
-from sqlalchemy import update
+from sqlalchemy import CursorResult, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -91,7 +92,8 @@ async def mark_source_deletions(
         .values(source_deleted_at=datetime.now(UTC))
         .execution_options(synchronize_session=False)
     )
-    marked = result.rowcount or 0
+    # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as plain Result.
+    marked = cast(CursorResult[Any], result).rowcount or 0
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked

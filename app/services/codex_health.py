@@ -39,6 +39,12 @@ class ArchiveQuery(BaseModel):
             raise ValueError("records sorgusunda data_type gerekli.")
         return self
 
+    def date_range(self) -> tuple[date, date]:
+        """The validated (start_date, end_date) of a daily or records query."""
+        if self.start_date is None or self.end_date is None:
+            raise ValueError("start_date ve end_date gerekli.")
+        return self.start_date, self.end_date
+
 
 HEALTH_TOOL = {
     "type": "function",
@@ -93,17 +99,18 @@ async def read_health(arguments: dict) -> dict:
                     "Tarihler kaynak zamanı.",
                 }
             )
+        start_date, end_date = query.date_range()
         if query.action == "daily":
             result = await dashboard_data(
                 session,
-                query.end_date,
-                (query.end_date - query.start_date).days + 1,
+                end_date,
+                (end_date - start_date).days + 1,
                 query.timezone,
             )
             return jsonable_encoder(result)
         zone = ZoneInfo(query.timezone)
-        start = datetime.combine(query.start_date, time.min, zone).astimezone(UTC)
-        stop = datetime.combine(query.end_date + timedelta(days=1), time.min, zone).astimezone(UTC)
+        start = datetime.combine(start_date, time.min, zone).astimezone(UTC)
+        stop = datetime.combine(end_date + timedelta(days=1), time.min, zone).astimezone(UTC)
         result = await session.scalars(
             select(RawHealthData)
             .where(

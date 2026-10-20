@@ -55,6 +55,8 @@ jobs:
           uv run --frozen --extra dev alembic current
       - name: Repository secret and placeholder policy
         run: uv run --frozen --extra dev python scripts/verify_configuration.py
+      - name: Type check
+        run: uv run --frozen --extra dev pyright
       - name: Compose model
         env:
           APP_ENV_FILE: .env.example
