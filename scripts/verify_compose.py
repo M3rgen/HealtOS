@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 PROJECT_NAME = f"health-mirror-smoke-{os.getpid()}"
-EXPECTED_REVISION = "20261017_0007"
+EXPECTED_REVISION = "20261020_0008"
 HOST_PORT = "18080"
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP_DIR = ROOT / f".compose-smoke-backups-{os.getpid()}"
@@ -20,6 +20,42 @@ BACKUP_DIR = ROOT / f".compose-smoke-backups-{os.getpid()}"
 SMOKE_ENV_FILE = ROOT / f".env.compose-smoke-{os.getpid()}"
 SMOKE_KEY_FILE = ROOT / f".env.compose-smoke-backup-key-{os.getpid()}"
 BASH = shutil.which("bash")
+
+
+# Runs inside the app container; APP_UI_TOKEN comes from the Compose environment.
+UI_SMOKE_SCRIPT = "\n".join(
+    [
+        "import json, os, re, urllib.error, urllib.request",
+        "base = 'http://127.0.0.1:8000'",
+        "auth = {'Authorization': 'Bearer ' + os.environ['APP_UI_TOKEN']}",
+        "def get(path):",
+        "    return urllib.request.urlopen(urllib.request.Request(base + path, headers=auth))",
+        "html = get('/').read().decode()",
+        "assert 'HealtOS' in html",
+        'assets = re.findall(r\'(?:src|href)="(/assets/[^"]+)"\', html)',
+        "assert len(assets) >= 2",
+        "assert all(get(path).status == 200 for path in assets)",
+        "try:",
+        "    urllib.request.urlopen(base + '/api/dashboard')",
+        "    raise SystemExit('/api/dashboard answered without a bearer token')",
+        "except urllib.error.HTTPError as error:",
+        "    assert error.code == 401, error.code",
+        "data = json.load(get('/api/dashboard'))",
+        "assert len(data['days']) == 7 and data['days'][0]['steps'] is None",
+        "body = json.dumps({'metric': 'muscle', 'value': 42.5,",
+        "                   'measured_at': '2026-09-29T09:00:00Z'}).encode()",
+        "headers = {**auth, 'Content-Type': 'application/json', 'X-HealthOS-Request': '1'}",
+        "request = urllib.request.Request(base + '/api/dashboard/measurements', data=body,",
+        "                                 headers=headers, method='POST')",
+        "assert urllib.request.urlopen(request).status == 201",
+        "saved = json.load(get('/api/dashboard/measurements'))",
+        "assert len(saved) == 1 and saved[0]['source'] == 'Manuel'",
+        "data = json.load(get('/api/dashboard'))",
+        "assert data['profile']['muscle']['value'] == 42.5",
+        "csv = get('/api/dashboard/export.csv').read()",
+        "assert b'sleep_seconds' in csv and b'UTC' in csv",
+    ]
+)
 
 
 def backup_key_env() -> dict[str, str]:
@@ -137,6 +173,8 @@ def main() -> int:
         {
             "APP_ENV_FILE": SMOKE_ENV_FILE.name,
             "APP_PORT": HOST_PORT,
+            # Throwaway UI bearer token for the isolated stack (required in production).
+            "APP_UI_TOKEN": secrets.token_urlsafe(32),
             "BACKUP_HOST_DIR": BACKUP_DIR.name,
             "PATH": docker_bin + os.pathsep + env.get("PATH", ""),
             "POSTGRES_PASSWORD": "local-smoke-test-only",
@@ -188,28 +226,7 @@ def main() -> int:
             "app",
             "python",
             "-c",
-            (
-                "import json,re,urllib.request; "
-                "base='http://127.0.0.1:8000'; "
-                "html=urllib.request.urlopen(base+'/').read().decode(); "
-                "assert 'HealtOS' in html; "
-                'assets=re.findall(r\'(?:src|href)="(/assets/[^"]+)"\',html); '
-                "assert len(assets)>=2; "
-                "assert all(urllib.request.urlopen(base+p).status==200 for p in assets); "
-                "data=json.load(urllib.request.urlopen(base+'/api/dashboard')); "
-                "assert len(data['days'])==7 and data['days'][0]['steps'] is None; "
-                "body=json.dumps({'metric':'muscle','value':42.5,"
-                "'measured_at':'2026-09-29T09:00:00Z'}).encode(); "
-                "request=urllib.request.Request(base+'/api/dashboard/measurements',data=body,"
-                "headers={'Content-Type':'application/json'},method='POST'); "
-                "assert urllib.request.urlopen(request).status==201; "
-                "saved=json.load(urllib.request.urlopen(base+'/api/dashboard/measurements')); "
-                "assert len(saved)==1 and saved[0]['source']=='Manuel'; "
-                "data=json.load(urllib.request.urlopen(base+'/api/dashboard')); "
-                "assert data['profile']['muscle']['value']==42.5; "
-                "csv=urllib.request.urlopen(base+'/api/dashboard/export.csv').read(); "
-                "assert b'sleep_seconds' in csv and b'UTC' in csv"
-            ),
+            UI_SMOKE_SCRIPT,
             env=env,
         )
         app_uid = compose("exec", "-T", "app", "id", "-u", env=env, capture=True).stdout.strip()

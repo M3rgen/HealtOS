@@ -265,7 +265,7 @@ python scripts/verify_compose.py
 
 The script uses a uniquely named Compose project prefixed `health-mirror-smoke-`, a temporary env
 file derived from `.env.example` with synthetic non-placeholder values (the app runs with
-`APP_ENV=production`), a temporary password, backup directory and throwaway backup key, and host
+`APP_ENV=production`), a temporary password, UI bearer token, backup directory and throwaway backup key, and host
 port `18080`. It builds the production image, waits for PostgreSQL and FastAPI, exercises `/health`
 and the installed CLI, takes an encrypted backup with `scripts/backup.sh` (age if installed,
 otherwise gpg), restores it with `scripts/restore.sh` into a second database and checks the row

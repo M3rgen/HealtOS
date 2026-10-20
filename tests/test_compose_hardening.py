@@ -68,3 +68,11 @@ def test_alembic_ini_holds_no_database_url():
     parser = configparser.ConfigParser()
     parser.read(ROOT / "alembic.ini", encoding="utf-8")
     assert parser["alembic"]["sqlalchemy.url"] == ""
+
+
+def test_ui_smoke_script_compiles_and_authenticates():
+    from scripts.verify_compose import UI_SMOKE_SCRIPT
+
+    compile(UI_SMOKE_SCRIPT, "ui_smoke", "exec")
+    assert "Bearer " in UI_SMOKE_SCRIPT and "'X-HealthOS-Request': '1'" in UI_SMOKE_SCRIPT
+    assert COMPOSE["services"]["app"]["environment"]["APP_UI_TOKEN"].startswith("${APP_UI_TOKEN:?")
