@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
@@ -17,6 +17,8 @@ from app.services.storage import StoreStats, store_records
 from app.sync.checkpoints import incremental_start
 
 logger = logging.getLogger(__name__)
+
+INTERRUPTED_ERROR = "process restarted"
 
 
 class IncrementalSync:
@@ -35,6 +37,23 @@ class IncrementalSync:
         # In-memory per-run outcomes so clients can tell when a run they started has finished.
         self.sequence = 0
         self.last_runs: dict[str, dict] = {}
+
+    async def recover_interrupted(self) -> int:
+        """Fail sync states left `running` by a process that died mid-run.
+
+        Called once at startup, before any new run can start. The saved page token is
+        kept, so the next run resumes the interrupted window.
+        """
+        async with self.sessions.begin() as session:
+            result = await session.execute(
+                update(SyncState)
+                .where(SyncState.status == JobStatus.running)
+                .values(status=JobStatus.failed, last_error=INTERRUPTED_ERROR)
+            )
+        recovered = result.rowcount or 0
+        if recovered:
+            event(logger, "SYNC_STATE_RECOVERED", count=recovered)
+        return recovered
 
     def _finish(self, data_type: str, stats: StoreStats, failed: bool) -> None:
         self.sequence += 1
