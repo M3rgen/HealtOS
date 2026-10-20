@@ -23,6 +23,11 @@ from app.sync.incremental import IncrementalSync
 
 logger = logging.getLogger(__name__)
 
+# A captured signed body stays cryptographically valid forever. A live re-delivery of a
+# batch first verified longer ago than this cannot restart its processing; retries of
+# old batches go through process_pending (the replay CLI) instead.
+SIGNED_REPLAY_MAX_AGE = timedelta(hours=24)
+
 
 @dataclass(frozen=True)
 class IngestResult:
@@ -119,6 +124,14 @@ class WebhookBatchProcessor:
             batch = await session.get(WebhookEvent, batch_hash)
             if batch is None:
                 raise RuntimeError("Webhook batch could not be persisted")
+            if not inserted and raw_body is not None and _stale(batch.signature_verified_at, now):
+                event(logger, "WEBHOOK_REPLAY_IGNORED", batch_hash=batch_hash)
+                return IngestResult(
+                    batch_hash=batch_hash,
+                    element_count=len(elements),
+                    inserted=False,
+                    should_process=False,
+                )
             existing_items = await session.scalar(
                 select(func.count())
                 .select_from(WebhookBatchItem)
@@ -396,6 +409,14 @@ class WebhookBatchProcessor:
             total.failed_elements += result.failed_elements
             total.rejected_elements += result.rejected_elements
         return total
+
+
+def _stale(verified_at: datetime | None, now: datetime) -> bool:
+    if verified_at is None:
+        return True
+    if verified_at.tzinfo is None:
+        verified_at = verified_at.replace(tzinfo=UTC)
+    return now - verified_at > SIGNED_REPLAY_MAX_AGE
 
 
 def _notification_data(item: object) -> dict | None:
