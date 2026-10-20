@@ -10,6 +10,7 @@ pytestmark = pytest.mark.integration
 
 FRESHNESS_INDEX = "ix_raw_health_data_type_freshness"
 AD_HOC_INDEX = "ix_raw_health_data_type_effective_time"
+HEAD = "20261020_0009"
 
 
 def _sync_url(database_url: str) -> str:
@@ -48,7 +49,7 @@ def test_fresh_upgrade_downgrade_and_reupgrade(database_url, alembic_config) -> 
 
         command.upgrade(alembic_config, "head")
         version, statuses, index = _state(engine)
-        assert version == "20261020_0008"
+        assert version == HEAD
         assert "abandoned" in statuses
         assert index is not None
         assert "COALESCE(source_end_time, source_start_time)" in index
@@ -75,7 +76,7 @@ def test_fresh_upgrade_downgrade_and_reupgrade(database_url, alembic_config) -> 
                     "'abandoned', 0, 10, now(), now())"
                 )
             )
-        command.downgrade(alembic_config, "-1")
+        command.downgrade(alembic_config, "20261017_0007")
         version, statuses, index = _state(engine)
         assert version == "20261017_0007"
         assert index is not None
@@ -84,15 +85,15 @@ def test_fresh_upgrade_downgrade_and_reupgrade(database_url, alembic_config) -> 
         assert job_status == "failed"
 
         command.upgrade(alembic_config, "head")
-        assert _state(engine)[0] == "20261020_0008"
+        assert _state(engine)[0] == HEAD
 
-        # Two steps back drops the freshness index concurrently; head restores it.
-        command.downgrade(alembic_config, "-2")
+        # Back past 0007 drops the freshness index concurrently; head restores it.
+        command.downgrade(alembic_config, "20261001_0006")
         version, _, index = _state(engine)
         assert (version, index) == ("20261001_0006", None)
         command.upgrade(alembic_config, "head")
         version, statuses, index = _state(engine)
-        assert version == "20261020_0008"
+        assert version == HEAD
         assert "abandoned" in statuses
         assert index is not None
         command.check(alembic_config)
