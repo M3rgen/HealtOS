@@ -20,6 +20,7 @@ from app.services.pipeline_health import (
     PipelineStatus,
     update_reliability_state,
 )
+from app.sync.incremental import stale_running_cutoff
 from app.sync.reconciliation import ReconciliationService
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,7 @@ class PipelineWatchdog:
                 if await self._cooldown_active(now):
                     event(logger, "WATCHDOG_RECOVERY_SKIPPED", trigger=trigger, reason="cooldown")
                     return RecoveryOutcome("cooldown", trigger)
-                if await self._sync_running():
+                if await self._sync_running(now):
                     event(
                         logger, "WATCHDOG_RECOVERY_SKIPPED", trigger=trigger, reason="sync_running"
                     )
@@ -161,12 +162,16 @@ class PipelineWatchdog:
         attempted = as_utc(state.last_recovery_attempt_at)
         return now - attempted < timedelta(minutes=self.settings.recovery_cooldown_minutes)
 
-    async def _sync_running(self) -> bool:
+    async def _sync_running(self, now: datetime) -> bool:
+        # A `running` row without a recent heartbeat is a dead run, not a live one.
         async with self.sessions() as session:
             count = await session.scalar(
                 select(func.count())
                 .select_from(SyncState)
-                .where(SyncState.status == JobStatus.running)
+                .where(
+                    SyncState.status == JobStatus.running,
+                    SyncState.updated_at >= stale_running_cutoff(now),
+                )
             )
         return bool(count)
 

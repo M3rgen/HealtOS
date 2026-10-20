@@ -552,6 +552,12 @@ After a host interruption the expected recovery sequence is:
    Cloudflare returns 502 and Google retries.
 5. The optional Umay bridge is a host process without a service unit; start it again by hand.
 
+A sync state or webhook element left `running` by a process that died is failed (and so becomes
+retryable) at startup, but only once nothing has touched it for 15 minutes: a running fetch refreshes
+its sync state on every page, so a fresher row may be a `health-mirror sync` or webhook replay still
+working in another container. Rows that were fresh at startup are re-checked once the 15 minutes
+have passed, and the watchdog likewise ignores `running` rows without a recent heartbeat.
+
 If Docker itself is down, no in-container watchdog can notice. That host-level condition is visible
 as a Cloudflare 502 on the webhook and must be handled by host monitoring.
 
