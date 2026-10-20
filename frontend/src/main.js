@@ -7,7 +7,7 @@ import { setupCalendar } from './calendar.js';
 import { setupHistoryPanel } from './history-panel.js';
 import { setupWorkouts } from './workouts.js';
 import { setupAppearance } from './appearance.js';
-import { request } from './api.js';
+import { request, handleUnauthorized } from './api.js';
 
 renderIcons();
 setupAppearance();
@@ -293,7 +293,10 @@ async function refresh() {
   try {
     const results = await Promise.allSettled([
       request(`/api/dashboard?${query()}`),
-      fetch('/health', { cache: 'no-store', signal: AbortSignal.timeout(15000) }).then(r => r.json()),
+      fetch('/health', { cache: 'no-store', signal: AbortSignal.timeout(15000) }).then(r => {
+        if (handleUnauthorized(r)) throw new Error('unauthorized');
+        return r.json();
+      }),
     ]);
     if (results[0].status === 'fulfilled') {
       data = results[0].value;

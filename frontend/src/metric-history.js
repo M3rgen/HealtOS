@@ -1,3 +1,5 @@
+import { handleUnauthorized } from './api.js';
+
 const metrics = {
   steps: {title: 'Adım geçmişi', average: 'Günlük ortalama', color: 'var(--step-chart)'},
   sleep: {title: 'Uyku geçmişi', average: 'Ortalama uyku', color: 'var(--sleep-light)'},
@@ -113,6 +115,7 @@ export function setupMetricHistory(getTimezone) {
     try {
       const query = new URLSearchParams({metric, page, timezone: getTimezone()});
       const response = await fetch(`/api/dashboard/history?${query}`, {cache: 'no-store', signal: AbortSignal.any([pending.signal, AbortSignal.timeout(20000)])});
+      if (handleUnauthorized(response)) return;
       if (!response.ok) throw new Error('Geçmiş alınamadı. Tekrar dene.');
       const result = await response.json();
       if (controller !== pending || !dialog.open) return;
