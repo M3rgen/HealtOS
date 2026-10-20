@@ -158,12 +158,14 @@ docker compose exec app health-mirror backfill  # also lists abandoned windows a
 ```
 
 `last_error` holds a short error class and code (for example a 403 for one range). Fix the cause
-first; there is no reset command, so requeue the windows with SQL and run the backfill again:
+first, then requeue the abandoned windows with a fresh retry count and run the backfill again in
+one step (leave out `--data-type` to requeue every type's abandoned windows):
 
 ```sh
-docker compose exec -T postgres psql -U health -d health -c \
-  "UPDATE backfill_jobs SET status = 'pending', retry_count = 0 WHERE status = 'abandoned' AND data_type = 'steps'"
-docker compose exec app health-mirror backfill --data-type steps
+docker compose exec app health-mirror backfill --reset-abandoned --data-type steps
 ```
+
+A requeued window resumes from its saved page token; if it keeps failing it is abandoned again
+after ten more attempts.
 
 If Google simply has no accessible data for that range, leaving the window abandoned is harmless.

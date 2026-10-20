@@ -55,12 +55,22 @@ def status() -> None:
 
 
 @app.command()
-def backfill(data_type: str | None = typer.Option(None, "--data-type")) -> None:
+def backfill(
+    data_type: str | None = typer.Option(None, "--data-type"),
+    reset_abandoned: bool = typer.Option(
+        False,
+        "--reset-abandoned",
+        help="Requeue abandoned windows (of --data-type, or all) with a fresh retry count first.",
+    ),
+) -> None:
     """Start or resume the historical backfill and wait for completion."""
     runtime = build_runtime(get_settings(), SessionLocal)
 
     async def command():
         try:
+            if reset_abandoned:
+                reset = await runtime.backfill.reset_abandoned([data_type] if data_type else None)
+                typer.echo(f"Requeued {reset} abandoned backfill window(s)")
             completed = await runtime.backfill.run([data_type] if data_type else None)
             async with SessionLocal() as session:
                 query = select(BackfillJob).where(

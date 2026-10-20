@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, time, timedelta
+from typing import Any, cast
 
-from sqlalchemy import case, func, select
+from sqlalchemy import CursorResult, case, func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
@@ -119,6 +120,27 @@ class BackfillService:
                             )
                             created += 1
         return created
+
+    async def reset_abandoned(self, data_types: list[str] | None = None) -> int:
+        """Requeue abandoned windows (all, or of the given types) as fresh failures.
+
+        For use once the cause is fixed: retry_count restarts at zero, so the window is
+        tried in normal order again. A saved page token and last_error are kept; the
+        next attempt resumes the window and replaces the error.
+        """
+        query = update(BackfillJob).where(BackfillJob.status == JobStatus.abandoned)
+        if data_types:
+            query = query.where(BackfillJob.data_type.in_(data_types))
+        async with self.sessions.begin() as session:
+            result = await session.execute(
+                query.values(status=JobStatus.failed, retry_count=0).execution_options(
+                    synchronize_session=False
+                )
+            )
+        reset = cast(CursorResult[Any], result).rowcount or 0
+        if reset:
+            event(logger, "BACKFILL_ABANDONED_RESET", data_types=data_types or "all", count=reset)
+        return reset
 
     async def run(self, data_types: list[str] | None = None) -> int:
         async with self._run_lock:

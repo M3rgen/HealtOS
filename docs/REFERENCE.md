@@ -371,6 +371,7 @@ curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/backfill/sta
 ```bash
 health-mirror backfill --data-type steps
 health-mirror backfill
+health-mirror backfill --reset-abandoned   # requeue abandoned windows, then run
 ```
 
 The default attempts history from 2010 in 31-day windows. Empty windows are valid and become completed checkpoints. Recent windows run first. On interruption, rerunning resumes the saved window and `pageToken`; completed windows are skipped. A window that keeps failing is moved behind the others after five failures and marked `abandoned` after ten, so it cannot stall its data type; see the [runbook](RUNBOOK.md#abandoned-backfill-windows). Use a conservative start date to maximize completeness—the official API permits queries back to the earliest recorded data.
