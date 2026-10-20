@@ -11,6 +11,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from websockets.asyncio.client import connect
 
+from app.core.auth import request_authenticated
 from app.services.codex_chat import EFFORT, MODEL, CodexRPC
 from app.services.codex_health import read_health
 
@@ -267,7 +268,9 @@ async def relay(websocket: WebSocket, rpc: CodexRPC, thread_id: str):
 
 @router.websocket("/chat")
 async def chat(websocket: WebSocket):
-    if not same_origin(websocket.headers.get("origin"), websocket.headers.get("host")):
+    if not same_origin(
+        websocket.headers.get("origin"), websocket.headers.get("host")
+    ) or not request_authenticated(websocket.app.state.settings.app_ui_token, websocket.headers):
         await websocket.close(code=1008)
         return
     await websocket.accept()

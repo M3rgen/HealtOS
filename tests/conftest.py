@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
+
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
 from app.db.base import Base
+
+# A developer .env with APP_UI_TOKEN must not put the shared test app behind the login;
+# auth tests pass the token explicitly.
+os.environ["APP_UI_TOKEN"] = ""
 
 
 @pytest_asyncio.fixture
