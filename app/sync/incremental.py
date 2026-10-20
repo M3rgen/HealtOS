@@ -32,6 +32,18 @@ class IncrementalSync:
         self.client = client
         self.specs = specs
         self._locks: dict[str, asyncio.Lock] = {}
+        # In-memory per-run outcomes so clients can tell when a run they started has finished.
+        self.sequence = 0
+        self.last_runs: dict[str, dict] = {}
+
+    def _finish(self, data_type: str, stats: StoreStats, failed: bool) -> None:
+        self.sequence += 1
+        self.last_runs[data_type] = {
+            "sequence": self.sequence,
+            "inserted": stats.inserted,
+            "updated": stats.updated,
+            "failed": failed,
+        }
 
     async def run(
         self,
@@ -94,6 +106,7 @@ class IncrementalSync:
                     state.last_page_token = None
                     state.status = JobStatus.completed
                     state.last_error = None
+                self._finish(data_type, total, failed=False)
                 event(
                     logger,
                     "SYNC_COMPLETED",
@@ -106,6 +119,7 @@ class IncrementalSync:
                     state = await session.get(SyncState, data_type)
                     state.status = JobStatus.failed
                     state.last_error = str(exc)[:2000]
+                self._finish(data_type, total, failed=True)
                 event(
                     logger,
                     "SYNC_FAILED",

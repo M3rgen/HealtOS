@@ -46,3 +46,24 @@ def test_watchdog_schedule_is_bounded_and_non_overlapping():
 
     assert job.max_instances == 1
     assert "0:10:00" in str(job.trigger)
+
+
+def test_freshness_summary_refreshes_in_hourly_slots():
+    class Reconciliation:
+        async def run(self, days):
+            return days
+
+    class Health:
+        async def refresh_freshness(self):
+            return None
+
+    scheduler = build_scheduler(
+        Settings(reconciliation_enabled=False, watchdog_enabled=True),
+        Reconciliation(),
+        None,
+        Health(),
+    )
+    job = scheduler.get_job("pipeline-freshness-refresh")
+
+    assert job.max_instances == 1
+    assert "minute='0'" in str(job.trigger)

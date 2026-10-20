@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
@@ -41,6 +43,7 @@ class PipelineSnapshot:
     stale_streams: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     oldest_frequent_sync: datetime | None = None
+    data_freshness_checked_at: datetime | None = None
 
     def as_dict(
         self,
@@ -61,6 +64,7 @@ class PipelineSnapshot:
             "oldest_frequent_sync": _iso(self.oldest_frequent_sync),
             "last_reconciliation": _iso(self.last_reconciliation),
             "latest_health_write": _iso(self.latest_health_write),
+            "data_freshness_checked_at": _iso(self.data_freshness_checked_at),
             "pending_notifications": self.pending_notifications,
             "failed_notifications": self.failed_notifications,
             "failed_syncs": self.failed_syncs,
@@ -72,8 +76,29 @@ class PipelineSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class FreshnessSummary:
+    """Latest per-stream data time and last raw write, computed from raw_health_data."""
+
+    data_freshness: dict[str, datetime | None]
+    latest_health_write: datetime | None
+    checked_at: datetime
+    computed_monotonic: float
+
+
+def effective_time_expression():
+    """Data time of a raw record; matches ix_raw_health_data_type_freshness."""
+    return func.coalesce(RawHealthData.source_end_time, RawHealthData.source_start_time)
+
+
 class PipelineHealthService:
-    """Derive pipeline health exclusively from persisted local state."""
+    """Derive pipeline health exclusively from persisted local state.
+
+    Small state tables (sync_state, webhook tables, reliability_state) are read on every
+    call. The raw_health_data freshness summary is the only part that touches the large
+    table; it is cached and recomputed at most once per refresh interval (hourly by
+    default, plus an hourly scheduler job), so frequent /health polling never scans it.
+    """
 
     def __init__(
         self,
@@ -84,6 +109,61 @@ class PipelineHealthService:
         self.settings = settings
         self.sessions = sessions
         self.frequent_data_types = frequent_data_types
+        self._freshness: FreshnessSummary | None = None
+        self._freshness_lock = asyncio.Lock()
+
+    @property
+    def cached_freshness(self) -> FreshnessSummary | None:
+        return self._freshness
+
+    async def refresh_freshness(self, *, now: datetime | None = None) -> FreshnessSummary:
+        """Recompute the raw_health_data freshness summary (hourly job / cache miss)."""
+        async with self._freshness_lock:
+            async with self.sessions() as session:
+                return await self._compute_freshness(session, _aware(now or datetime.now(UTC)))
+
+    async def _freshness_summary(self, session: AsyncSession, now: datetime) -> FreshnessSummary:
+        max_age = self.settings.pipeline_freshness_refresh_seconds
+        cached = self._freshness
+        if cached is not None and time.monotonic() - cached.computed_monotonic < max_age:
+            return cached
+        async with self._freshness_lock:
+            cached = self._freshness
+            if cached is not None and time.monotonic() - cached.computed_monotonic < max_age:
+                return cached
+            return await self._compute_freshness(session, now)
+
+    async def _compute_freshness(self, session: AsyncSession, now: datetime) -> FreshnessSummary:
+        # One index-backed "ORDER BY ... DESC LIMIT 1" probe per frequent stream
+        # (ix_raw_health_data_type_freshness) instead of GROUP BY over the whole table.
+        effective = effective_time_expression()
+        names = sorted(self.frequent_data_types)
+        data_freshness: dict[str, datetime | None] = {}
+        if names:
+            probes = [
+                select(effective)
+                .where(RawHealthData.data_type == name, effective.is_not(None))
+                .order_by(effective.desc())
+                .limit(1)
+                .scalar_subquery()
+                .label(f"t{index}")
+                for index, name in enumerate(names)
+            ]
+            row = (await session.execute(select(*probes))).one()
+            data_freshness = {
+                name: _aware(value)
+                for name, value in zip(names, row, strict=True)
+                if value is not None
+            }
+        latest_health_write = await session.scalar(select(func.max(RawHealthData.updated_at)))
+        summary = FreshnessSummary(
+            data_freshness=data_freshness,
+            latest_health_write=_aware(latest_health_write),
+            checked_at=now,
+            computed_monotonic=time.monotonic(),
+        )
+        self._freshness = summary
+        return summary
 
     async def inspect(
         self,
@@ -134,29 +214,10 @@ class PipelineHealthService:
                 )
             )
         ).all()
-        data_rows = (
-            await session.execute(
-                select(
-                    RawHealthData.data_type,
-                    func.max(
-                        case(
-                            (
-                                RawHealthData.source_end_time.is_not(None),
-                                RawHealthData.source_end_time,
-                            ),
-                            else_=RawHealthData.source_start_time,
-                        )
-                    ),
-                )
-                .where(RawHealthData.data_type.in_(self.frequent_data_types))
-                .group_by(RawHealthData.data_type)
-            )
-        ).all()
-        latest_health_write = await session.scalar(select(func.max(RawHealthData.updated_at)))
+        freshness = await self._freshness_summary(session, now)
         reliability = await session.get(ReliabilityState, 1)
 
         sync_by_type = {name: _aware(value) for name, value in sync_rows}
-        data_freshness = {name: _aware(value) for name, value in data_rows}
         stale_after = timedelta(minutes=self.settings.pipeline_stale_threshold_minutes)
         stale_streams = tuple(
             sorted(
@@ -210,17 +271,18 @@ class PipelineHealthService:
             last_webhook_processed=_aware(webhook[1]),
             last_sync_success=_aware(sync_summary[0]),
             latest_frequent_sync=latest_frequent_sync,
-            latest_health_write=_aware(latest_health_write),
+            latest_health_write=freshness.latest_health_write,
             last_reconciliation=(
                 _aware(reliability.last_reconciliation_success_at) if reliability else None
             ),
             pending_notifications=pending,
             failed_notifications=failed_notifications,
             failed_syncs=failed_syncs,
-            data_freshness=data_freshness,
+            data_freshness=dict(freshness.data_freshness),
             stale_streams=stale_streams,
             reasons=tuple(reasons),
             oldest_frequent_sync=oldest_frequent_sync,
+            data_freshness_checked_at=freshness.checked_at,
         )
 
 

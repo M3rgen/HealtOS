@@ -6,7 +6,7 @@ const { chromium } = require('playwright');
   const browser = await chromium.launch({headless:true,channel:'msedge'});
   try {
     const page = await browser.newPage({viewport:{width:1280,height:720}});
-    let rejectStart = false, failed = false;
+    let rejectStart = false, failed = false, runs = 0;
     await page.route('**/health', route => route.fulfill({json:{status:'healthy',database:'healthy',
       scheduler:'running',configuration:'healthy',failed_syncs:failed?1:0}}));
     await page.route('**/api/dashboard?**', route => route.fulfill({json:{profile:{},
@@ -15,15 +15,17 @@ const { chromium } = require('playwright');
       charts:{steps:Array(24).fill(10),heart_rate:Array(24).fill(70)}}}));
     await page.route('**/sync/all', route => route.fulfill(rejectStart
       ? {status:500,json:{detail:'Google bağlantısı kurulamadı.'}}
-      : {status:202,json:{status:'accepted',data_types:['steps']}}));
+      : {status:202,json:{status:'accepted',data_types:['steps'],sequence:runs++}}));
     await page.route('**/sync/status', route => route.fulfill({json:[{data_type:'steps',
-      status:failed?'failed':'completed',last_error:failed?'Google erişim izni reddedildi.':null}]}));
+      status:failed?'failed':'completed',last_error:failed?'Google erişim izni reddedildi.':null,
+      last_run:{sequence:runs,inserted:0,updated:0,failed}}]}));
     await page.goto('http://127.0.0.1:5174');
     await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');
     const button=page.locator('#sync-button'), notice=page.locator('#notice');
+    const finished=()=>page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:20000});
     await button.click();
-    await page.waitForFunction(()=>!document.querySelector('#sync-button').disabled);
-    assert.equal(await notice.isVisible(),false,'Accepted sync must not leave a success banner');
+    await finished();
+    assert.match(await notice.textContent(),/^Eşitleme tamamlandı/,'Finished sync must report its result');
     rejectStart=true;
     await button.click();
     await notice.waitFor({state:'visible'});
@@ -31,13 +33,19 @@ const { chromium } = require('playwright');
     rejectStart=false;
     await button.click();
     await notice.waitFor({state:'hidden'});
+    await finished();
     failed=true;
-    await notice.waitFor({state:'visible',timeout:10000});
+    await button.click();
+    await finished();
     assert.match(await notice.textContent(),/Google erişim izni reddedildi/);
+    assert.equal(await notice.evaluate(el=>el.classList.contains('error')),true);
     failed=false;
     await button.click();
     await notice.waitFor({state:'hidden'});
+    await finished();
+    assert.match(await notice.textContent(),/^Eşitleme tamamlandı/);
+    assert.equal(await notice.evaluate(el=>el.classList.contains('error')),false);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollHeight>innerHeight),false);
-    console.log('PASS: success stays quiet, start/background errors show details, successful retry clears the error');
+    console.log('PASS: finished sync reports its result, start/run errors show details, successful retry clears the error');
   } finally { await browser.close(); }
 })().catch(error=>{console.error(error);process.exit(1)});

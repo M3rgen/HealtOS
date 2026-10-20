@@ -34,7 +34,12 @@ def create_app() -> FastAPI:
         scheduler = None
         scheduler_needed = settings.reconciliation_enabled or settings.watchdog_enabled
         if scheduler_needed and settings.app_env != "test":
-            scheduler = build_scheduler(settings, runtime.reconciliation, runtime.watchdog)
+            scheduler = build_scheduler(
+                settings,
+                runtime.reconciliation,
+                runtime.watchdog,
+                runtime.pipeline_health,
+            )
             scheduler.start()
             runtime.scheduler = scheduler
             event(

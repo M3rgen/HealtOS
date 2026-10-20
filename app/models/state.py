@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,6 +38,11 @@ class RawHealthData(TimestampMixin, Base):
         UniqueConstraint("data_type", "google_data_point_id"),
         Index("ix_raw_health_data_type_start", "data_type", "source_start_time"),
         Index("ix_raw_health_data_updated_at", "updated_at"),
+        Index(
+            "ix_raw_health_data_type_freshness",
+            "data_type",
+            text("coalesce(source_end_time, source_start_time)"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

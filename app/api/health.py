@@ -11,6 +11,12 @@ router = APIRouter(tags=["health"])
 logger = logging.getLogger(__name__)
 
 
+@router.get("/health/live")
+async def live() -> dict:
+    """Process liveness for container healthchecks; never touches the database."""
+    return {"status": "ok", "service": "personal-health-mirror"}
+
+
 @router.get("/health", response_model=None)
 async def health(request: Request) -> dict | JSONResponse:
     runtime = request.app.state.runtime

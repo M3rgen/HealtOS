@@ -13,7 +13,7 @@ from app.services.runtime import Runtime
 router = APIRouter(prefix="/sync", tags=["sync"])
 
 
-def _serialize(item: SyncState) -> dict:
+def _serialize(item: SyncState, runtime: Runtime) -> dict:
     return {
         "data_type": item.data_type,
         "status": item.status,
@@ -22,29 +22,42 @@ def _serialize(item: SyncState) -> dict:
         "last_successful_sync": item.last_successful_sync,
         "records_downloaded": item.records_downloaded,
         "last_error": item.last_error,
+        "last_run": runtime.incremental.last_runs.get(item.data_type),
     }
 
 
 @router.get("/status")
-async def all_status(session: AsyncSession = Depends(get_session)) -> list[dict]:
+async def all_status(
+    session: AsyncSession = Depends(get_session), runtime: Runtime = Depends(runtime_dep)
+) -> list[dict]:
     rows = (await session.scalars(select(SyncState).order_by(SyncState.data_type))).all()
-    return [_serialize(row) for row in rows]
+    return [_serialize(row, runtime) for row in rows]
 
 
 @router.get("/status/{data_type}")
-async def one_status(data_type: str, session: AsyncSession = Depends(get_session)) -> dict:
+async def one_status(
+    data_type: str,
+    session: AsyncSession = Depends(get_session),
+    runtime: Runtime = Depends(runtime_dep),
+) -> dict:
     row = await session.get(SyncState, data_type)
     if row is None:
         raise HTTPException(404, "No synchronization state for this data type")
-    return _serialize(row)
+    return _serialize(row, runtime)
 
 
 @router.post(
     "/all", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_job_request)]
 )
 async def start_all(runtime: Runtime = Depends(runtime_dep)) -> dict:
+    # Runs that finish with a higher sequence than this one belong to (or follow) this request.
+    sequence = runtime.incremental.sequence
     runtime.spawn(runtime.incremental.run_all())
-    return {"status": "accepted", "data_types": list(runtime.incremental.specs)}
+    return {
+        "status": "accepted",
+        "data_types": list(runtime.incremental.specs),
+        "sequence": sequence,
+    }
 
 
 @router.post(

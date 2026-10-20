@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -279,3 +280,18 @@ async def test_relay_tools_streaming_followup_and_cancel(monkeypatch):
         await browser.incoming.put(WebSocketDisconnect())
         with pytest.raises(WebSocketDisconnect):
             await asyncio.wait_for(task, 2)
+
+
+def test_unavailable_bridge_warns_once_per_outage(monkeypatch, caplog):
+    monkeypatch.setattr(codex, "_bridge_unavailable_logged", False)
+    caplog.set_level(logging.DEBUG, logger=codex.logger.name)
+
+    for _ in range(5):
+        codex._log_bridge_unavailable()
+    codex._log_bridge_available()
+    codex._log_bridge_unavailable()
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    debug = [record for record in caplog.records if record.levelno == logging.DEBUG]
+    assert len(warnings) == 2
+    assert len(debug) == 4

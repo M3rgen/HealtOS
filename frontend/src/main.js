@@ -19,12 +19,18 @@ const metrics={height:['Boy','cm'],weight:['Kilo','kg'],body_fat:['Yağ oranı',
 const states={empty:'Kayıt yok',partial:'Devam ediyor',complete:'Kayıt var',missing:'Eksik ölçüm'};
 function readPreference(key,fallback){try{return localStorage.getItem(key)??fallback;}catch{return fallback;}}
 function writePreference(key,value){try{localStorage.setItem(key,value);}catch{/* Restricted browser storage still allows using the app. */}}
-let zone=readPreference('healtos.timezone','UTC');
-if(!['Europe/Istanbul','UTC'].includes(zone))zone='UTC';
+const validZone=(value)=>{if(!value)return false;try{new Intl.DateTimeFormat('en-US',{timeZone:value});return true;}catch{return false;}};
+const deviceZone=(()=>{try{const value=Intl.DateTimeFormat().resolvedOptions().timeZone;return validZone(value)?value:'UTC';}catch{return 'UTC';}})();
+const resolveZone=(choice)=>choice==='auto'?deviceZone:choice;
+let zoneChoice=readPreference('healtos.timezone.v2','auto');
+if(zoneChoice!=='auto'&&!validZone(zoneChoice))zoneChoice='auto';
+let zone=resolveZone(zoneChoice);
 let data=null,health=null,busy=false,pendingRefresh=false,activePage='overview',poll=null;
 let selectedDate=null;
 const motion=true;
-$('timezone').value=zone; $('model-motion').checked=motion;
+$('timezone').querySelector('option[value="auto"]').textContent=`Cihaz saati (${deviceZone})`;
+if(![...$('timezone').options].some(option=>option.value===zoneChoice))$('timezone').add(new Option(zoneChoice,zoneChoice));
+$('timezone').value=zoneChoice; $('model-motion').checked=motion;
 const body=createBody($('body-model'),motion);
 const shortDate=(value)=>new Intl.DateTimeFormat('tr-TR',{timeZone:zone,day:'numeric',month:'short'}).format(new Date(value));
 const fullDate=(value)=>new Intl.DateTimeFormat('tr-TR',{timeZone:zone,day:'numeric',month:'long',year:'numeric'}).format(new Date(value));
@@ -32,7 +38,7 @@ const timeOf=(value)=>new Intl.DateTimeFormat('tr-TR',{timeZone:zone,hour:'2-dig
 function today(){const parts=new Intl.DateTimeFormat('en-CA',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());const get=(type)=>parts.find(x=>x.type===type).value;return `${get('year')}-${get('month')}-${get('day')}`;}
 function civilDate(value){return new Date(`${value}T12:00:00Z`);}
 function notice(message,error=false,source='general'){$('notice').hidden=false;$('notice').textContent=message;$('notice').classList.toggle('error',error);$('notice').dataset.source=source;}
-function clearSyncNotice(includeStart=false){if($('notice').dataset.source==='sync'||(includeStart&&$('notice').dataset.source==='sync-start')){$('notice').hidden=true;$('notice').textContent='';}}
+function clearSyncNotice(includeStart=false){if($('notice').dataset.source==='sync'||(includeStart&&['sync-start','sync-result'].includes($('notice').dataset.source))){$('notice').hidden=true;$('notice').textContent='';}}
 async function request(url,options={}){
   const response=await fetch(url,{...options,cache:'no-store',signal:AbortSignal.timeout(20000)});
   const payload=await response.json();
@@ -161,14 +167,32 @@ $('measurement-form').addEventListener('submit',async event=>{
   catch(error){$('form-error').textContent=error.message;}
   finally{$('measurement-save').disabled=false;}
 });
+let syncing=false;
+const wait=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
+function syncBusy(on){syncing=on;const button=$('sync-button');button.disabled=on;button.classList.toggle('syncing',on);button.setAttribute('aria-busy',String(on));button.lastElementChild.textContent=on?'Eşitleniyor…':'Şimdi eşitle';}
+async function watchSync(){try{const times=(await request('/google-health/devices')).devices.map(device=>device.last_sync_time).filter(Boolean).sort((a,b)=>new Date(b)-new Date(a));if(!times[0])return '';const day=fullDate(times[0])===fullDate(new Date())?'':`${shortDate(times[0])} `;return ` Saatin son eşitlemesi: ${day}${timeOf(times[0])}`;}catch{return '';}}
+async function waitForSync({data_types:types,sequence}){
+  // A run counts once its in-memory outcome has a sequence above the baseline returned by POST /sync/all.
+  for(const deadline=Date.now()+90000;Date.now()<deadline;){
+    await wait(2000);
+    try{const rows=await request('/sync/status');const runs=types.map(type=>{const row=rows.find(item=>item.data_type===type);return {type,error:row?.last_error,...row?.last_run};});if(runs.every(run=>run.sequence>sequence))return runs;}catch{/* Keep polling until the deadline. */}
+  }
+  return null;
+}
 $('sync-button').addEventListener('click',async()=>{
-  $('sync-button').disabled=true;
-  try{await request('/sync/all',{method:'POST',headers:{'X-HealthOS-Request':'1'}});clearSyncNotice(true);setTimeout(refresh,3000);}
-  catch(error){notice(`Eşitleme başlatılamadı: ${error.message}`,true,'sync-start');}
-  finally{$('sync-button').disabled=false;}
+  if(syncing)return;
+  syncBusy(true);clearSyncNotice(true);
+  try{
+    const runs=await waitForSync(await request('/sync/all',{method:'POST',headers:{'X-HealthOS-Request':'1'}}));
+    const added=runs?.reduce((sum,run)=>sum+run.inserted,0),changed=runs?.reduce((sum,run)=>sum+run.updated,0),failed=runs?.filter(run=>run.failed).length,counts=[added&&`${num(added)} yeni kayıt`,changed&&`${num(changed)} kayıt güncellendi`].filter(Boolean).join(' · ');
+    const message=!runs?'Eşitleme arka planda sürüyor; tamamlanınca panel kendiliğinden güncellenecek.':failed?`Eşitleme ${num(failed)}/${num(runs.length)} veri türünde başarısız oldu · ${runs.filter(run=>run.failed).map(run=>`${run.type}: ${run.error||'Eşitleme tamamlanamadı.'}`).join(' · ')}${counts?` · ${counts}`:''}`:`Eşitleme tamamlandı · ${counts||`Google’da yeni veri yok.${await watchSync()}`}`;
+    await refresh();notice(message,Boolean(failed),failed?'sync':'sync-result');
+    if(!failed)setTimeout(()=>{if($('notice').textContent===message)clearSyncNotice(true);},20000);
+  }catch(error){notice(`Eşitleme başlatılamadı: ${error.message}`,true,'sync-start');}
+  finally{syncBusy(false);}
 });
 $('refresh-system').addEventListener('click',async()=>{await refresh();await loadSystem();});
-$('timezone').addEventListener('change',async()=>{zone=$('timezone').value;writePreference('healtos.timezone',zone);await refresh();if(activePage==='system')await loadSystem();if(activePage==='sports')await workouts.update();});
+$('timezone').addEventListener('change',async()=>{zoneChoice=$('timezone').value;zone=resolveZone(zoneChoice);writePreference('healtos.timezone.v2',zoneChoice);await refresh();if(activePage==='system')await loadSystem();if(activePage==='sports')await workouts.update();});
 function updateMotion(){body.setMotion($('model-motion').checked);}
 $('model-motion').addEventListener('change',()=>{writePreference('healtos.motion',String($('model-motion').checked));updateMotion();});
 matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change',updateMotion);updateMotion();

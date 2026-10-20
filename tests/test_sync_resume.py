@@ -1,7 +1,10 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 
+from app.api.sync import _serialize
 from app.core.config import Settings
 from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY
@@ -112,3 +115,57 @@ async def test_unfiltered_reference_backfill_creates_only_one_snapshot_job(sessi
 
     assert await service.ensure_jobs(["food"]) == 1
     assert await service.ensure_jobs(["food"]) == 0
+
+
+def heart_rate(bpm=60):
+    return {
+        "name": "users/1/dataTypes/heart-rate/dataPoints/abc",
+        "heartRate": {
+            "sampleTime": {"physicalTime": "2026-08-01T10:00:00Z", "utcOffset": "0s"},
+            "beatsPerMinute": bpm,
+        },
+    }
+
+
+async def test_incremental_run_reports_per_run_outcome(sessions):
+    """records_downloaded is cumulative and counts safety-window re-downloads; last_run does not."""
+    client = FakeClient([Page([heart_rate()], None), Page([heart_rate()], None)])
+    service = IncrementalSync(Settings(), sessions, client, {"heart-rate": REGISTRY["heart-rate"]})
+    assert service.sequence == 0 and service.last_runs == {}
+    await service.run("heart-rate")
+    assert service.last_runs["heart-rate"] == {
+        "sequence": 1,
+        "inserted": 1,
+        "updated": 0,
+        "failed": False,
+    }
+    await service.run("heart-rate")
+    assert service.last_runs["heart-rate"] == {
+        "sequence": 2,
+        "inserted": 0,
+        "updated": 0,
+        "failed": False,
+    }
+
+    class BrokenClient:
+        async def list_data_points(self, spec, start, end, page_token=None):
+            raise RuntimeError("Google erişimi reddedildi")
+
+    service.client = BrokenClient()
+    with pytest.raises(RuntimeError):
+        await service.run("heart-rate")
+    assert service.last_runs["heart-rate"] == {
+        "sequence": 3,
+        "inserted": 0,
+        "updated": 0,
+        "failed": True,
+    }
+    async with sessions() as session:
+        state = await session.get(SyncState, "heart-rate")
+    assert state.records_downloaded == 2
+    runtime = SimpleNamespace(incremental=service)
+    payload = _serialize(state, runtime)
+    assert payload["status"] == JobStatus.failed
+    assert payload["last_run"] == service.last_runs["heart-rate"]
+    state.data_type = "steps"
+    assert _serialize(state, runtime)["last_run"] is None

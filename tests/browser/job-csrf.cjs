@@ -14,12 +14,13 @@ const { chromium } = require('playwright');
         start_date:'2026-10-01',end_date:'2026-10-01',timezone:'UTC',
         days:[{date:'2026-10-01',steps:2000,sleep_seconds:28800,resting_bpm:70,status:'partial',partial:true}],
         charts:{steps:Array(24).fill(10),heart_rate:Array(24).fill(70)}}}));
-      await page.route('**/sync/status', route => route.fulfill({json:[]}));
+      await page.route('**/sync/status', route => route.fulfill({json:[{data_type:'steps',status:'completed',
+        last_error:null,last_run:{sequence:started,inserted:0,updated:0,failed:false}}]}));
       await page.route('**/sync/all', async route => {
         assert.equal((await route.request().allHeaders())['x-healthos-request'],'1');
         assert.equal(route.request().method(),'POST');
         started++;
-        await route.fulfill({status:202,json:{status:'accepted',data_types:['steps']}});
+        await route.fulfill({status:202,json:{status:'accepted',data_types:['steps'],sequence:0}});
       });
       await page.goto(process.env.HEALTHOS_TEST_URL || 'http://127.0.0.1:5174');
       await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');

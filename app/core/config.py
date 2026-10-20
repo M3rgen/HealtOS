@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     watchdog_enabled: bool = True
     watchdog_interval_seconds: int = Field(default=900, ge=60, le=86_400)
     pipeline_stale_threshold_minutes: int = Field(default=120, ge=15, le=10_080)
+    # raw_health_data freshness summary (data_freshness, latest_health_write) is
+    # recomputed at most this often; /health serves the cached result in between.
+    pipeline_freshness_refresh_seconds: int = Field(default=3_600, ge=60, le=86_400)
     recovery_cooldown_minutes: int = Field(default=360, ge=15, le=43_200)
     startup_gap_threshold_minutes: int = Field(default=120, ge=15, le=10_080)
     automatic_recovery_enabled: bool = True

@@ -6,5 +6,6 @@ export default defineConfig({
     '/api': { target: 'http://127.0.0.1:8000', ws: true },
     '/health': 'http://127.0.0.1:8000',
     '/sync': 'http://127.0.0.1:8000',
+    '/google-health': 'http://127.0.0.1:8000',
   } },
 });

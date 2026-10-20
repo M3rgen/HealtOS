@@ -11,7 +11,9 @@ from app.core.config import Settings
 @pytest.fixture
 def application(monkeypatch):
     settings = Settings(_env_file=None, app_env="test")
-    jobs = SimpleNamespace(specs={"steps": None}, run=AsyncMock(), run_all=AsyncMock())
+    jobs = SimpleNamespace(
+        specs={"steps": None}, run=AsyncMock(), run_all=AsyncMock(), sequence=7, last_runs={}
+    )
     spawned = []
 
     def spawn(coroutine):
@@ -114,3 +116,12 @@ async def test_vite_origin_and_duplicate_security_headers(application):
         )
         assert "access-control-allow-origin" not in preflight.headers
     assert len(application.state.runtime.spawned) == 1
+
+
+async def test_sync_all_reports_sequence_baseline(application):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://localhost:8000"
+    ) as client:
+        response = await client.post("/sync/all", headers={"X-HealthOS-Request": "1"})
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted", "data_types": ["steps"], "sequence": 7}

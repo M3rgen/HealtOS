@@ -17,6 +17,31 @@ from app.services.codex_health import read_health
 router = APIRouter(prefix="/api/codex", tags=["codex"])
 logger = logging.getLogger(__name__)
 
+# The browser reconnects with backoff while the chat panel is open, so an absent bridge
+# (e.g. a server deployment without the host Codex CLI) would log on every attempt.
+# Warn once per outage; repeats go to debug until a connection succeeds again.
+_bridge_unavailable_logged = False
+
+
+def _log_bridge_unavailable() -> None:
+    global _bridge_unavailable_logged
+    if _bridge_unavailable_logged:
+        logger.debug("Local Codex chat connection still unavailable")
+        return
+    _bridge_unavailable_logged = True
+    logger.warning(
+        "Local Codex chat connection unavailable; further failures are logged at debug "
+        "level until the bridge connects",
+        exc_info=False,
+    )
+
+
+def _log_bridge_available() -> None:
+    global _bridge_unavailable_logged
+    if _bridge_unavailable_logged:
+        logger.info("Local Codex chat connection restored")
+    _bridge_unavailable_logged = False
+
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -267,12 +292,13 @@ async def chat(websocket: WebSocket):
             rpc = CodexRPC(connection)
             async with asyncio.timeout(60):
                 thread_id, model = await rpc.start()
+            _log_bridge_available()
             await websocket.send_json({"type": "ready", "model": model, "effort": EFFORT})
             await relay(websocket, rpc, thread_id)
     except WebSocketDisconnect:
         pass
     except Exception:
-        logger.warning("Local Codex chat connection unavailable", exc_info=False)
+        _log_bridge_unavailable()
         with suppress(Exception):
             await websocket.send_json(
                 {
