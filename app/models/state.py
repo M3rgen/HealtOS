@@ -20,9 +20,14 @@ from sqlalchemy import (
     false,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin
+
+# Raw payloads as kept from Google: jsonb on PostgreSQL (migration 20261020_0010), plain
+# JSON text elsewhere (SQLite tests). The app reads values, never the stored text.
+RawJSON = JSON().with_variant(JSONB(), "postgresql")
 
 
 class JobStatus(StrEnum):
@@ -53,7 +58,7 @@ class RawHealthData(TimestampMixin, Base):
     source_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_timezone: Mapped[str | None] = mapped_column(String(128))
-    raw_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    raw_json: Mapped[dict] = mapped_column(RawJSON, nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -113,7 +118,7 @@ class WebhookEvent(TimestampMixin, Base):
     data_type: Mapped[str | None] = mapped_column(String(128), index=True)
     health_user_id: Mapped[str | None] = mapped_column(String(128))
     operation: Mapped[str | None] = mapped_column(String(32))
-    raw_json: Mapped[dict | list] = mapped_column(JSON, nullable=False)
+    raw_json: Mapped[dict | list] = mapped_column(RawJSON, nullable=False)
     raw_body: Mapped[bytes | None] = mapped_column(LargeBinary)
     signature_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     element_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -129,7 +134,7 @@ class WebhookNotification(TimestampMixin, Base):
 
     element_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     raw_json: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
-        JSON, nullable=False
+        RawJSON, nullable=False
     )
     data_type: Mapped[str | None] = mapped_column(String(128), index=True)
     health_user_id: Mapped[str | None] = mapped_column(String(128))
