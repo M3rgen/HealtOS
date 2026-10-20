@@ -1,3 +1,4 @@
+import re
 from urllib.parse import urlsplit
 
 from fastapi import Header, HTTPException, Request
@@ -53,3 +54,21 @@ def require_job_request(
             pass
     if not valid:
         raise HTTPException(403, "A same-origin job request is required")
+
+
+async def bounded_body(
+    request: Request, limit: int, detail: str = "Request body is too large"
+) -> bytes:
+    """Read the request body, refusing anything over ``limit`` bytes (413) as it streams."""
+    lengths = request.headers.getlist("content-length")
+    if lengths:
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,20}", lengths[0]):
+            raise HTTPException(400, "Invalid Content-Length")
+        if int(lengths[0]) > limit:
+            raise HTTPException(413, detail)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise HTTPException(413, detail)
+        body.extend(chunk)
+    return bytes(body)

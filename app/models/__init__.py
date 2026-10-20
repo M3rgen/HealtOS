@@ -16,6 +16,7 @@ from app.models.health import (
     Weight,
 )
 from app.models.manual import ManualMeasurement, ManualWorkout
+from app.models.settings import AppearanceSettings
 from app.models.state import (
     BackfillJob,
     OAuthToken,
@@ -31,6 +32,7 @@ __all__ = [
     "ManualMeasurement",
     "ManualWorkout",
     "ActiveZoneMinute",
+    "AppearanceSettings",
     "BackfillJob",
     "Distance",
     "EnergyExpenditure",

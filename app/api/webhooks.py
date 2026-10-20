@@ -3,10 +3,10 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-import re
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 
+from app.api.deps import bounded_body
 from app.api.deps import runtime as runtime_dep
 from app.api.deps import settings as settings_dep
 from app.core.config import Settings
@@ -16,21 +16,6 @@ from app.services.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["webhooks"])
-
-
-async def bounded_body(request: Request, limit: int) -> bytes:
-    lengths = request.headers.getlist("content-length")
-    if lengths:
-        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,20}", lengths[0]):
-            raise HTTPException(400, "Invalid Content-Length")
-        if int(lengths[0]) > limit:
-            raise HTTPException(413, "Webhook payload is too large")
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > limit:
-            raise HTTPException(413, "Webhook payload is too large")
-        body.extend(chunk)
-    return bytes(body)
 
 
 @router.post("/webhooks/google-health")
@@ -50,7 +35,9 @@ async def google_health_webhook(
     ):
         event(logger, "WEBHOOK_SIGNATURE_INVALID", reason="authorization")
         raise HTTPException(401, "Invalid webhook authorization")
-    raw = await bounded_body(request, settings.google_health_webhook_max_body_bytes)
+    raw = await bounded_body(
+        request, settings.google_health_webhook_max_body_bytes, "Webhook payload is too large"
+    )
     try:
         payload = json.loads(raw)
     except (ValueError, UnicodeDecodeError) as exc:

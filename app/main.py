@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api import auth, backfill, codex, dashboard, google_health, health, login, sync, webhooks
+from app.api import settings as settings_api
 from app.core.auth import UITokenMiddleware
 from app.core.config import get_settings
 from app.core.host_validation import HostValidationMiddleware
@@ -102,6 +103,7 @@ def create_app() -> FastAPI:
     application.include_router(webhooks.router)
     application.include_router(dashboard.router)
     application.include_router(codex.router)
+    application.include_router(settings_api.router)
     static = Path(__file__).parent / "static"
     if static.is_dir():
         application.mount("/assets", StaticFiles(directory=static / "assets"), name="assets")
