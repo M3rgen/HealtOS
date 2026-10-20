@@ -42,13 +42,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.logging import event
 from app.core.timeutil import as_utc
+from app.models import identity as identity_guards
+from app.models import raw_versions as version_guards
 from app.models.raw_versions import (
     FUNCTION_BODIES,
     HISTORY_VIEW,
-    PG_TRIGGER_SQL,
-    PROTECTIVE_TRIGGERS,
     RENUMBER_SETTING,
-    SQLITE_TRIGGER_SQL,
     RawHealthDataEvent,
     RawHealthDataVersion,
 )
@@ -57,6 +56,11 @@ from app.parsers.common import payload_hash
 from app.services.storage import dialect_insert
 
 logger = logging.getLogger(__name__)
+
+# Every protective trigger: those of migration 20261020_0011 and of 20261021_0012.
+PG_TRIGGER_SQL = {**version_guards.PG_TRIGGER_SQL, **identity_guards.PG_TRIGGER_SQL}
+PROTECTIVE_TRIGGERS = (*version_guards.PROTECTIVE_TRIGGERS, *identity_guards.PROTECTIVE_TRIGGERS)
+SQLITE_TRIGGER_SQL = {**version_guards.SQLITE_TRIGGER_SQL, **identity_guards.SQLITE_TRIGGER_SQL}
 
 IMPORT_SOURCE = "archive-import"
 

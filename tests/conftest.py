@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -21,3 +23,21 @@ async def sessions():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     yield factory
     await engine.dispose()
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """store_records' wall clock (identity tests: sightings decide what was seen together)."""
+    from identity_records import Clock
+
+    from app.services import storage
+
+    current = Clock()
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003 - signature of datetime.now
+            return current.now
+
+    monkeypatch.setattr(storage, "datetime", Frozen)
+    return current

@@ -22,11 +22,24 @@ def payload_for(spec: DataTypeSpec, record: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def source_id(spec: DataTypeSpec, record: object) -> str:
+def google_name(record: object) -> str | None:
+    """The record's own Google id, when it has one."""
     if isinstance(record, dict):
         for key in ("name", "dataPointName"):
             if isinstance(record.get(key), str) and record[key]:
                 return record[key]
+    return None
+
+
+def source_id(spec: DataTypeSpec, record: object) -> str:
+    """The record's Google id, or its v1 synthetic id (see app/parsers/identity.py for v2).
+
+    v1 is frozen: rows stored under it keep it forever, and a record without a v2 alias is
+    looked up by it first, so changing this function would re-archive every such record.
+    """
+    name = google_name(record)
+    if name is not None:
+        return name
     identity: dict[str, Any] = {"dataType": spec.name}
     if isinstance(record, dict):
         payload = payload_for(spec, record)
