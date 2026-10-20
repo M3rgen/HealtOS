@@ -15,6 +15,7 @@ from app.api.deps import require_job_request
 from app.core.timeutil import as_utc
 from app.db.session import get_session
 from app.models.health import ExerciseSession, SleepSession, Steps
+from app.models.identity import superseded
 from app.models.manual import ManualMeasurement, ManualWorkout
 from app.models.state import RawHealthData
 from app.services.dashboard import dashboard_data
@@ -97,6 +98,7 @@ async def workouts(
             RawHealthData.google_data_point_id == ExerciseSession.google_data_point_id,
             RawHealthData.is_quarantined.is_(False),
             RawHealthData.source_deleted_at.is_(None),
+            ~superseded(RawHealthData.id),
         )
         .exists()
     )
@@ -170,6 +172,7 @@ async def metric_history(
         RawHealthData.data_type == source_type,
         RawHealthData.is_quarantined.is_(False),
         RawHealthData.source_deleted_at.is_(None),
+        ~superseded(RawHealthData.id),
         source_time < stop,
     )
     if metric != "heart":

@@ -3,12 +3,13 @@
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, true
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timeutil import as_utc
 from app.google_health.data_types import supported_data_types
 from app.models.health import HeartRate, SleepSession, Steps, Weight
+from app.models.identity import superseded
 from app.models.manual import ManualMeasurement
 from app.models.state import RawHealthData
 from app.parsers.common import first_number, parse_date, payload_for
@@ -68,6 +69,10 @@ async def dashboard_data(
     }
     step_hours: list[float | None] = [None] * 24
 
+    # A superseded row is a duplicate of a record another row holds now (migration
+    # 20261021_0012): never counted, whatever the deletion filter.
+    raw_superseded = superseded(RawHealthData.id)
+
     def valid_source(model, data_type: str):
         raw = select(RawHealthData.id).where(
             RawHealthData.data_type == data_type,
@@ -77,16 +82,20 @@ async def dashboard_data(
             return raw.where(
                 RawHealthData.is_quarantined.is_(False),
                 RawHealthData.source_deleted_at.is_(None),
+                ~raw_superseded,
             ).exists()
         if include_source_deleted:
-            return true()
+            return ~raw.where(raw_superseded).exists()
         # Normalized rows outlive a source deletion; hide them unless asked for.
-        return ~raw.where(RawHealthData.source_deleted_at.is_not(None)).exists()
+        return ~raw.where(
+            or_(RawHealthData.source_deleted_at.is_not(None), raw_superseded)
+        ).exists()
 
-    raw_not_deleted = (
+    raw_not_deleted = and_(
         true()
         if include_source_deleted and not valid_sources_only
-        else RawHealthData.source_deleted_at.is_(None)
+        else RawHealthData.source_deleted_at.is_(None),
+        ~raw_superseded,
     )
 
     # Split source intervals at civil-hour boundaries, including midnight and DST.

@@ -206,6 +206,7 @@ def verify() -> None:
 
     async def command():
         from app.parsers.common import payload_hash
+        from app.services.identity import verify_identities
         from app.services.raw_history import verify_guards, verify_versions
         from app.services.responses import verify_responses
 
@@ -230,15 +231,17 @@ def verify() -> None:
             errors.extend(version_errors)
             responses, response_errors = await verify_responses(session)
             errors.extend(response_errors)
+            aliases, identity_errors = await verify_identities(session)
+            errors.extend(identity_errors)
             failed = (
                 await session.scalars(select(SyncState).where(SyncState.last_error.is_not(None)))
             ).all()
-        return count, versions, responses, errors, failed
+        return count, versions, responses, aliases, errors, failed
 
-    count, versions, responses, errors, failed = run(command())
+    count, versions, responses, aliases, errors, failed = run(command())
     typer.echo(
-        f"Verified {count} raw records, {versions} earlier versions "
-        f"and {responses} stored Google responses"
+        f"Verified {count} raw records, {versions} earlier versions, "
+        f"{responses} stored Google responses and {aliases} identity aliases"
     )
     for error in errors:
         typer.echo(error, err=True)
@@ -343,6 +346,68 @@ def import_versions(
             err=True,
         )
         raise typer.Exit(1)
+
+
+DATA_TYPES_OPTION = typer.Option(
+    None, "--data-type", help="Only this data type (repeatable); default: every archived type."
+)
+AFTER_OPTION = typer.Option(
+    None,
+    "--after",
+    formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"],
+    help="Only rows starting at/after this UTC time (resume a stopped run of --data-type).",
+)
+
+
+@app.command()
+def identity_backfill(
+    batch_size: int = typer.Option(5_000, min=100, max=100_000),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report only; write nothing."),
+    data_type: list[str] | None = DATA_TYPES_OPTION,
+    after: datetime | None = AFTER_OPTION,
+    statement_timeout: str = typer.Option(
+        "120s", help="PostgreSQL statement_timeout for each batch (e.g. 120s, 5min)."
+    ),
+) -> None:
+    """Add v2 identity aliases and link duplicate rows of the same record (idempotent)."""
+    import re
+
+    from app.services.identity_backfill import BackfillStats
+    from app.services.identity_backfill import identity_backfill as run_backfill
+
+    if not re.fullmatch(r"[1-9][0-9]*(ms|s|min)", statement_timeout):
+        raise typer.BadParameter(
+            "use a value like 120s, 500ms or 5min", param_hint="--statement-timeout"
+        )
+
+    def progress(name: str, stats: BackfillStats, reached: datetime) -> None:
+        typer.echo(
+            f"{name}: {stats.rows} rows, {sum(stats.linked.values())} superseded, "
+            f"up to {reached.isoformat()} (resume: --data-type {name} "
+            f"--after {reached.strftime('%Y-%m-%dT%H:%M:%S')})",
+            err=True,
+        )
+
+    results = run(
+        run_backfill(
+            SessionLocal,
+            data_types=data_type,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            after=after.replace(tzinfo=UTC) if after else None,
+            statement_timeout=statement_timeout,
+            progress=progress,
+        )
+    )
+    total = BackfillStats()
+    for stats in results.values():
+        total.add(stats)
+    report = {
+        "dry_run": dry_run,
+        "data_types": {name: stats.as_dict() for name, stats in results.items()},
+        "total": total.as_dict(),
+    }
+    typer.echo(json.dumps(report, indent=2))
 
 
 FETCHED_SINCE_OPTION = typer.Option(
