@@ -47,7 +47,7 @@ from it. Assistant Markdown is rendered with Marked and sanitized with DOMPurify
 user messages remain literal text. The renderer retains raw streamed text so
 formatting split across response chunks is not lost. Browser regression checks in
 `tests/browser/umay-chat.cjs` cover streaming, formatting, unsafe HTML, and mobile
-overflow (requires Playwright on Node's module path and the local site running).
+overflow (`cd frontend && npm run test:browser -- --only umay-chat`).
 
 Edit the personality file to refine the voice. An existing conversation keeps its
 initial personality; start **Yeni sohbet** to apply an edit. With the Docker image,

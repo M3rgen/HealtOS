@@ -1,9 +1,9 @@
 // Synthetic fixtures; no live account records.
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
+const { BASE, launch, shot, run } = require('./lib.cjs');
 
-(async () => {
-  const browser = await chromium.launch({ headless: true, channel: 'msedge' });
+run(async () => {
+  const browser = await launch();
   try {
     for (const [width, height] of [[1920, 976], [1920, 900], [1280, 720], [1024, 650], [1280, 600], [390, 844], [320, 700]]) {
       const page = await browser.newPage({ viewport: { width, height } });
@@ -28,8 +28,22 @@ const { chromium } = require('playwright');
         charts: { steps: Array.from({ length: 24 }, (_, i) => i === 8 ? 1000 : 20),
           heart_rate: Array.from({ length: 24 }, (_, i) => i === 9 ? 90 : 65 + i % 5) },
       } }));
-      await page.goto('http://127.0.0.1:5174');
+      await page.goto(BASE);
       await page.waitForFunction(() => document.querySelectorAll('#history-rows tr').length === 7);
+      // Informational only (plan 4.3): time from navigation start until the dashboard shows its
+      // data (7 history rows), plus the browser's FCP/LCP. Goal: < 2 s locally; never fails.
+      const paint = await page.evaluate(() => new Promise((resolve) => {
+        const meaningful = performance.now();
+        const fcp = performance.getEntriesByName('first-contentful-paint')[0]?.startTime ?? null;
+        const done = (lcp) => resolve({ meaningful, fcp, lcp });
+        try {
+          new PerformanceObserver((list) => done(list.getEntries().at(-1)?.startTime ?? null))
+            .observe({ type: 'largest-contentful-paint', buffered: true });
+        } catch { done(null); }
+        setTimeout(() => done(null), 500);
+      }));
+      const ms = (value) => value == null ? 'n/a' : `${Math.round(value)} ms`;
+      console.log(`INFO ${width}x${height}: first meaningful paint ${ms(paint.meaningful)} (FCP ${ms(paint.fcp)}, LCP ${ms(paint.lcp)}; goal < 2000 ms, not enforced)`);
       async function assertNoPageScroll() {
         const size = await page.evaluate(() => ({height:innerHeight,width:innerWidth,
           scrollHeight:document.documentElement.scrollHeight,scrollWidth:document.documentElement.scrollWidth}));
@@ -54,7 +68,7 @@ const { chromium } = require('playwright');
       await page.keyboard.press('Escape');
       assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
       await page.waitForFunction(() => !document.querySelector('#history-panel').getAnimations().length);
-      if (width === 1920) await page.locator('.metric-cards').screenshot({ path: '.test-tmp-chart-fixed.png' });
+      if (width === 1920) await page.locator('.metric-cards').screenshot({ path: shot('chart-fixed.png') });
       await toggle.scrollIntoViewIfNeeded();
       const panel = page.locator('#history-panel');
       const initial = await panel.boundingBox();
@@ -93,4 +107,4 @@ const { chromium } = require('playwright');
       await page.close();
     }
   } finally { await browser.close(); }
-})().catch(error => { console.error(error); process.exit(1); });
+});

@@ -1,18 +1,23 @@
 // Synthetic fixtures; no live account records.
 const assert = require('node:assert/strict');
-const { chromium } = require('playwright');
-(async () => {
- const browser = await chromium.launch({headless:true,channel:'msedge'});
+const path = require('node:path');
+const { BASE, launch, shot, run } = require('./lib.cjs');
+const fx = require(path.join(__dirname, '../../frontend/preview/fixtures.cjs'));
+run(async () => {
+ const browser = await launch();
  try {
   for(const width of [1280,390]) {
    const page=await browser.newPage({viewport:{width,height:900},hasTouch:width===390});
    const errors=[];page.on('pageerror',e=>errors.push(e.message));
    let saved;
+   await page.route('**/health',route=>route.fulfill({json:fx.health}));
+   await page.route('**/api/dashboard?**',route=>route.fulfill({json:fx.dashboard(new URL(route.request().url()).searchParams)}));
+   await page.route('**/sync/status',route=>route.fulfill({json:fx.syncStatus}));
    await page.route('**/api/dashboard/workouts**',async route=>{
     if(route.request().method()==='POST') {saved=route.request().postDataJSON();await route.fulfill({status:201,json:{...saved,id:'test',source:'Manuel'}});}
     else await route.fulfill({json:[{id:'test',exercise_type:'Yürüyüş',start_time:'2026-09-29T09:00:00Z',end_time:'2026-09-29T10:00:00Z',duration_seconds:3600,calories_kcal:200,distance_meters:4000,source:'Fitbit'}]});
    });
-   await page.goto('http://127.0.0.1:5174');
+   await page.goto(BASE);
    await page.waitForFunction(()=>document.querySelectorAll('#history-rows tr').length===7);
    const steps=await page.locator('#steps-value').textContent();
    await page.locator('#history-toggle').click();
@@ -23,7 +28,7 @@ const { chromium } = require('playwright');
    await page.locator('#history-month').fill('2026-09');await page.locator('#history-month').dispatchEvent('change');
    await page.waitForFunction(()=>document.querySelectorAll('#history-rows tr').length===30);
    assert.match(await page.locator('#export-button').getAttribute('href'),/days=30/);
-   await page.screenshot({path:`.test-tmp-history-${width}.png`,fullPage:false});
+   await page.screenshot({path:shot(`history-${width}.png`),fullPage:false});
    await page.keyboard.press('Escape');await page.waitForFunction(()=>document.querySelectorAll('#history-rows tr').length===7);
    await page.locator('#history-toggle').scrollIntoViewIfNeeded();
    const box=await page.locator('#history-toggle').boundingBox();
@@ -48,10 +53,10 @@ const { chromium } = require('playwright');
    await page.locator('[name="distance_km"]').fill('5');await page.locator('#workout-save').click();
    await page.waitForFunction(()=>!document.querySelector('#workout-editor').open);
    assert.equal(saved.distance_meters,5000);assert.equal(saved.exercise_type,'Bisiklet');
-   await page.screenshot({path:`.test-tmp-workouts-${width}.png`,fullPage:true});
+   await page.screenshot({path:shot(`workouts-${width}.png`),fullPage:true});
    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
    assert.deepEqual(errors,[]);console.log(`PASS ${width}: weekly/month, month selector/CSV, drag/Escape, sports/manual form`);
    await page.close();
   }
  } finally {await browser.close();}
-})().catch(e=>{console.error(e);process.exit(1)});
+});
