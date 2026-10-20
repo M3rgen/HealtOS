@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -46,6 +48,14 @@ class ProcessingStats:
     rejected_elements: int = 0
 
 
+class _ElementLock:
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0  # coroutines holding or waiting for the lock
+
+
 class WebhookBatchProcessor:
     """Durably ingest, deduplicate, process, and retry signed webhook batches."""
 
@@ -58,7 +68,8 @@ class WebhookBatchProcessor:
         self.sessions = sessions
         self.incremental = incremental
         self.supported_data_types = supported_data_types
-        self._element_locks: dict[str, asyncio.Lock] = {}
+        # Only elements being processed right now have an entry; see _element_lock.
+        self._element_locks: dict[str, _ElementLock] = {}
 
     async def ingest_verified(self, raw: bytes, payload: object) -> IngestResult:
         """Persist an authenticated request without altering its signed raw bytes."""
@@ -247,8 +258,28 @@ class WebhookBatchProcessor:
         await self._finalize_batch(batch_hash)
         return stats
 
+    @asynccontextmanager
+    async def _element_lock(self, element_hash: str) -> AsyncIterator[None]:
+        """Serialize work on one element without keeping a lock per element forever.
+
+        The entry is counted before awaiting the lock and dropped only when no coroutine
+        holds or waits for it. There is no await between the lookup and the count, so a
+        newcomer can never pick up an entry that is about to be removed.
+        """
+        entry = self._element_locks.get(element_hash)
+        if entry is None:
+            entry = self._element_locks[element_hash] = _ElementLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0 and self._element_locks.get(element_hash) is entry:
+                del self._element_locks[element_hash]
+
     async def _process_element(self, element_hash: str) -> str:
-        async with self._element_locks.setdefault(element_hash, asyncio.Lock()):
+        async with self._element_lock(element_hash):
             async with self.sessions.begin() as session:
                 notification = await session.get(WebhookNotification, element_hash)
                 if notification is None:
