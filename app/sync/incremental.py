@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
@@ -95,8 +96,8 @@ class IncrementalSync:
                 if state.last_page_token and state.last_requested_from and state.last_requested_to:
                     rounds.append(
                         (
-                            _utc(state.last_requested_from),
-                            _utc(state.last_requested_to),
+                            as_utc(state.last_requested_from),
+                            as_utc(state.last_requested_to),
                             state.last_page_token,
                         )
                     )
@@ -105,7 +106,7 @@ class IncrementalSync:
                     self.settings.safety_window(data_type),
                     request_end,
                 )
-                requested = (_utc(request_start), _utc(request_end))
+                requested = (as_utc(request_start), as_utc(request_end))
                 if not rounds or rounds[0][:2] != requested:
                     rounds.append((*requested, None))
                 state.status = JobStatus.running
@@ -177,7 +178,7 @@ class IncrementalSync:
             state = await session.get(SyncState, data_type)
             previous_success = state.last_successful_sync
             state.last_successful_sync = (
-                max(_utc(previous_success), end) if previous_success else end
+                max(as_utc(previous_success), end) if previous_success else end
             )
             state.last_page_token = None
             if fetched_since is not None:
@@ -197,7 +198,3 @@ class IncrementalSync:
 
         results = await asyncio.gather(*(guarded(name) for name in self.specs))
         return dict(zip(self.specs, results, strict=True))
-
-
-def _utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

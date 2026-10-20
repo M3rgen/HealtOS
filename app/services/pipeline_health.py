@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.core.timeutil import as_utc
 from app.models.state import (
     RawHealthData,
     ReliabilityState,
@@ -120,7 +121,7 @@ class PipelineHealthService:
         """Recompute the raw_health_data freshness summary (hourly job / cache miss)."""
         async with self._freshness_lock:
             async with self.sessions() as session:
-                return await self._compute_freshness(session, _aware(now or datetime.now(UTC)))
+                return await self._compute_freshness(session, as_utc(now or datetime.now(UTC)))
 
     async def _freshness_summary(self, session: AsyncSession, now: datetime) -> FreshnessSummary:
         max_age = self.settings.pipeline_freshness_refresh_seconds
@@ -151,14 +152,14 @@ class PipelineHealthService:
             ]
             row = (await session.execute(select(*probes))).one()
             data_freshness = {
-                name: _aware(value)
+                name: as_utc(value)
                 for name, value in zip(names, row, strict=True)
                 if value is not None
             }
         latest_health_write = await session.scalar(select(func.max(RawHealthData.updated_at)))
         summary = FreshnessSummary(
             data_freshness=data_freshness,
-            latest_health_write=_aware(latest_health_write),
+            latest_health_write=as_utc(latest_health_write),
             checked_at=now,
             computed_monotonic=time.monotonic(),
         )
@@ -172,7 +173,7 @@ class PipelineHealthService:
         scheduler_running: bool = True,
         session: AsyncSession | None = None,
     ) -> PipelineSnapshot:
-        now = _aware(now or datetime.now(UTC))
+        now = as_utc(now or datetime.now(UTC))
         if session is not None:
             return await self._inspect(session, now, scheduler_running)
         async with self.sessions() as owned_session:
@@ -217,7 +218,7 @@ class PipelineHealthService:
         freshness = await self._freshness_summary(session, now)
         reliability = await session.get(ReliabilityState, 1)
 
-        sync_by_type = {name: _aware(value) for name, value in sync_rows}
+        sync_by_type = {name: as_utc(value) for name, value in sync_rows}
         stale_after = timedelta(minutes=self.settings.pipeline_stale_threshold_minutes)
         stale_streams = tuple(
             sorted(
@@ -267,13 +268,13 @@ class PipelineHealthService:
         return PipelineSnapshot(
             status=status,
             checked_at=now,
-            last_webhook_received=_aware(webhook[0]),
-            last_webhook_processed=_aware(webhook[1]),
-            last_sync_success=_aware(sync_summary[0]),
+            last_webhook_received=as_utc(webhook[0]),
+            last_webhook_processed=as_utc(webhook[1]),
+            last_sync_success=as_utc(sync_summary[0]),
             latest_frequent_sync=latest_frequent_sync,
             latest_health_write=freshness.latest_health_write,
             last_reconciliation=(
-                _aware(reliability.last_reconciliation_success_at) if reliability else None
+                as_utc(reliability.last_reconciliation_success_at) if reliability else None
             ),
             pending_notifications=pending,
             failed_notifications=failed_notifications,
@@ -297,12 +298,6 @@ async def update_reliability_state(
         for name, value in values.items():
             setattr(state, name, value)
         return state
-
-
-def _aware(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _iso(value: datetime | None) -> str | None:

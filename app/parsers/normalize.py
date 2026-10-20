@@ -313,7 +313,7 @@ def _sleep_efficiency(payload: dict) -> Decimal | None:
         return None
     asleep = number(summary.get("minutesAsleep"))
     period = number(summary.get("minutesInSleepPeriod"))
-    if asleep is None or period in {None, 0}:
+    if asleep is None or period is None or period == 0:
         return None
     return (asleep / period) * 100
 

@@ -289,3 +289,46 @@ async def test_redelivered_signed_body_older_than_a_day_cannot_restart_processin
     await age_batch(48)
     await processor.process_pending(recover_running=False)
     assert (len(incremental.calls), await element_status()) == (3, "completed")
+
+
+class GatedIncremental(Incremental):
+    """Blocks inside the sync until the test opens the gate."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def run(self, data_type, start=None, end=None):
+        self.calls.append((data_type, start, end))
+        self.entered.set()
+        await self.gate.wait()
+
+
+async def test_element_locks_serialize_work_and_are_dropped_when_idle(sessions):
+    incremental = GatedIncremental()
+    _, _, _, processor, _ = await make_client(sessions, incremental)
+    payload = notification("steps")
+    raw = json.dumps(payload).encode()
+    batch = await processor.ingest_verified(raw, payload)
+    async with sessions() as session:
+        element_hash = (await session.scalar(select(WebhookNotification))).element_hash
+
+    holder = asyncio.create_task(processor.process_batch(batch.batch_hash))
+    await asyncio.wait_for(incremental.entered.wait(), 2)
+    waiters = [asyncio.create_task(processor.process_batch(batch.batch_hash)) for _ in range(2)]
+    await asyncio.sleep(0.01)
+    assert processor._element_locks[element_hash].users == 3
+    # A waiter cancelled while queued must not drop the lock the holder still owns.
+    waiters[0].cancel()
+    await asyncio.gather(waiters[0], return_exceptions=True)
+    assert processor._element_locks[element_hash].users == 2
+    assert processor._element_locks[element_hash].lock.locked()
+
+    incremental.gate.set()
+    first = await asyncio.wait_for(holder, 2)
+    second = await asyncio.wait_for(waiters[1], 2)
+    assert (first.completed_elements, second.completed_elements) == (1, 1)
+    # The queued call saw the completed element instead of syncing it again.
+    assert len(incremental.calls) == 1
+    assert processor._element_locks == {}

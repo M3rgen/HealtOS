@@ -31,9 +31,10 @@ def _verify_state(settings: Settings, state: str) -> None:
     try:
         timestamp, nonce, signature = state.split(".", 2)
         payload = f"{timestamp}.{nonce}"
-        expected = hmac.new(
-            settings.google_token_encryption_key.encode(), payload.encode(), hashlib.sha256
-        ).digest()
+        secret = settings.google_token_encryption_key
+        if secret is None:
+            raise ValueError("no OAuth state key configured")
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()
         actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
         fresh = abs(time.time() - int(timestamp)) < 600
     except (AttributeError, ValueError):

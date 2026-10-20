@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 
@@ -33,7 +33,7 @@ class QueueClient:
 
 
 async def test_mock_backfill_then_incremental_correction(sessions):
-    settings = Settings(backfill_start_date=date.today() - timedelta(days=1))
+    settings = Settings(backfill_start_date=datetime.now(UTC).date() - timedelta(days=1))
     backfill = BackfillService(
         settings,
         sessions,

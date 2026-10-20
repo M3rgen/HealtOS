@@ -6,15 +6,12 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timeutil import as_utc
 from app.google_health.data_types import supported_data_types
 from app.models.health import HeartRate, SleepSession, Steps, Weight
 from app.models.manual import ManualMeasurement
 from app.models.state import RawHealthData
 from app.parsers.common import first_number, parse_date, payload_for
-
-
-def aware(value: datetime) -> datetime:
-    return value.replace(tzinfo=value.tzinfo or UTC)
 
 
 def sleep_total(sessions: list[SleepSession]) -> float | None:
@@ -27,7 +24,7 @@ def sleep_total(sessions: list[SleepSession]) -> float | None:
         return None
     spans = []
     for row in sessions:
-        start, end = aware(row.start_time), aware(row.end_time)
+        start, end = as_utc(row.start_time), as_utc(row.end_time)
         seconds = (end - start).total_seconds()
         if seconds <= 0:
             continue
@@ -69,7 +66,7 @@ async def dashboard_data(
         }
         for i in range(days)
     }
-    step_hours = [None] * 24
+    step_hours: list[float | None] = [None] * 24
 
     def valid_source(model, data_type: str):
         raw = select(RawHealthData.id).where(
@@ -104,7 +101,7 @@ async def dashboard_data(
         )
     ).all()
     for item in steps:
-        left, right = aware(item.start_time), aware(item.end_time)
+        left, right = as_utc(item.start_time), as_utc(item.end_time)
         duration = (right - left).total_seconds()
         if duration <= 0:
             continue
@@ -141,7 +138,7 @@ async def dashboard_data(
     ).all()
     for day, values in rows.items():
         values["sleep_seconds"] = sleep_total(
-            [item for item in sleep if aware(item.end_time).astimezone(zone).date() == day]
+            [item for item in sleep if as_utc(item.end_time).astimezone(zone).date() == day]
         )
         if values["steps"] is not None:
             values["steps"] = round(values["steps"])
@@ -178,7 +175,7 @@ async def dashboard_data(
     for item in daily:
         payload = payload_for(specs[item.data_type], item.raw_json)
         day = parse_date(payload.get("date"))
-        if day in rows:
+        if day is not None and day in rows:
             key, fields = metrics[item.data_type]
             value = first_number(payload, fields)
             if value is not None:
@@ -198,7 +195,7 @@ async def dashboard_data(
     ).all()
     buckets: dict[int, list[float]] = {}
     for timestamp, bpm in heart:
-        hour = aware(timestamp).astimezone(zone).hour
+        hour = as_utc(timestamp).astimezone(zone).hour
         buckets.setdefault(hour, []).append(float(bpm))
 
     measurements = []
@@ -217,7 +214,7 @@ async def dashboard_data(
             {
                 "metric": "weight",
                 "value": float(latest_weight.kilograms),
-                "measured_at": aware(latest_weight.timestamp),
+                "measured_at": as_utc(latest_weight.timestamp),
                 "source": "Google",
             }
         )
@@ -243,7 +240,7 @@ async def dashboard_data(
                     {
                         "metric": metric,
                         "value": float(value) * scale,
-                        "measured_at": aware(item.source_start_time),
+                        "measured_at": as_utc(item.source_start_time),
                         "source": "Google",
                     }
                 )
@@ -259,7 +256,7 @@ async def dashboard_data(
                 {
                     "metric": metric,
                     "value": float(item.value),
-                    "measured_at": aware(item.measured_at),
+                    "measured_at": as_utc(item.measured_at),
                     "source": "Manuel",
                 }
             )

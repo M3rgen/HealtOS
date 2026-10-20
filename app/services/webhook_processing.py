@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -12,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.models.state import (
     OAuthToken,
     WebhookBatchItem,
@@ -27,6 +30,7 @@ logger = logging.getLogger(__name__)
 # batch first verified longer ago than this cannot restart its processing; retries of
 # old batches go through process_pending (the replay CLI) instead.
 SIGNED_REPLAY_MAX_AGE = timedelta(hours=24)
+INTERRUPTED_ERROR = "Recovered interrupted webhook processing attempt"
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,14 @@ class ProcessingStats:
     rejected_elements: int = 0
 
 
+class _ElementLock:
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0  # coroutines holding or waiting for the lock
+
+
 class WebhookBatchProcessor:
     """Durably ingest, deduplicate, process, and retry signed webhook batches."""
 
@@ -57,7 +69,8 @@ class WebhookBatchProcessor:
         self.sessions = sessions
         self.incremental = incremental
         self.supported_data_types = supported_data_types
-        self._element_locks: dict[str, asyncio.Lock] = {}
+        # Only elements being processed right now have an entry; see _element_lock.
+        self._element_locks: dict[str, _ElementLock] = {}
 
     async def ingest_verified(self, raw: bytes, payload: object) -> IngestResult:
         """Persist an authenticated request without altering its signed raw bytes."""
@@ -246,8 +259,28 @@ class WebhookBatchProcessor:
         await self._finalize_batch(batch_hash)
         return stats
 
+    @asynccontextmanager
+    async def _element_lock(self, element_hash: str) -> AsyncIterator[None]:
+        """Serialize work on one element without keeping a lock per element forever.
+
+        The entry is counted before awaiting the lock and dropped only when no coroutine
+        holds or waits for it. There is no await between the lookup and the count, so a
+        newcomer can never pick up an entry that is about to be removed.
+        """
+        entry = self._element_locks.get(element_hash)
+        if entry is None:
+            entry = self._element_locks[element_hash] = _ElementLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0 and self._element_locks.get(element_hash) is entry:
+                del self._element_locks[element_hash]
+
     async def _process_element(self, element_hash: str) -> str:
-        async with self._element_locks.setdefault(element_hash, asyncio.Lock()):
+        async with self._element_lock(element_hash):
             async with self.sessions.begin() as session:
                 notification = await session.get(WebhookNotification, element_hash)
                 if notification is None:
@@ -372,6 +405,24 @@ class WebhookBatchProcessor:
             batch.last_error = "; ".join(error for error in errors if error)[:2000] or None
             batch.processed_at = None if incomplete else datetime.now(UTC)
 
+    async def recover_running(self) -> int:
+        """Fail elements left `running` by a process that died mid-attempt.
+
+        A `running` element is never claimed again, so without this its batch stays
+        unprocessed forever. Called at startup (before any webhook is accepted) and by
+        process_pending; failed elements are retried by the next delivery or replay.
+        """
+        async with self.sessions.begin() as session:
+            result = await session.execute(
+                update(WebhookNotification)
+                .where(WebhookNotification.status == "running")
+                .values(status="failed", last_error=INTERRUPTED_ERROR)
+            )
+        recovered = result.rowcount or 0
+        if recovered:
+            event(logger, "WEBHOOK_ELEMENTS_RECOVERED", count=recovered)
+        return recovered
+
     async def process_pending(self, *, recover_running: bool = True) -> ProcessingStats:
         """Hydrate legacy batches, retry failed work, and preserve completed elements."""
 
@@ -384,15 +435,7 @@ class WebhookBatchProcessor:
             if batch_hash not in prepared_batches:
                 await self.prepare_existing_batch(batch_hash)
         if recover_running:
-            async with self.sessions.begin() as session:
-                await session.execute(
-                    update(WebhookNotification)
-                    .where(WebhookNotification.status == "running")
-                    .values(
-                        status="failed",
-                        last_error="Recovered interrupted webhook processing attempt",
-                    )
-                )
+            await self.recover_running()
         async with self.sessions() as session:
             pending = (
                 await session.scalars(
@@ -414,9 +457,7 @@ class WebhookBatchProcessor:
 def _stale(verified_at: datetime | None, now: datetime) -> bool:
     if verified_at is None:
         return True
-    if verified_at.tzinfo is None:
-        verified_at = verified_at.replace(tzinfo=UTC)
-    return now - verified_at > SIGNED_REPLAY_MAX_AGE
+    return now - as_utc(verified_at) > SIGNED_REPLAY_MAX_AGE
 
 
 def _notification_data(item: object) -> dict | None:
