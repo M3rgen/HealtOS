@@ -198,6 +198,8 @@ def main() -> int:
             # Throwaway UI bearer token for the isolated stack (required in production).
             "APP_UI_TOKEN": secrets.token_urlsafe(32),
             "BACKUP_HOST_DIR": BACKUP_DIR.name,
+            # A throwaway database; do not demand the production 5 GiB headroom.
+            "BACKUP_MIN_FREE_MB": "64",
             "PATH": docker_bin + os.pathsep + env.get("PATH", ""),
             "POSTGRES_PASSWORD": "local-smoke-test-only",
             "RECONCILIATION_ENABLED": "false",
@@ -286,6 +288,9 @@ def main() -> int:
             raise RuntimeError(f"Expected one encrypted backup artifact; found {backup_files}")
         if (ROOT / backup_path).read_bytes()[:5] == b"PGDMP":
             raise RuntimeError("Backup artifact is an unencrypted pg_dump archive")
+        backup_status = json.loads((BACKUP_DIR / "last-backup-status.json").read_text("utf-8"))
+        if backup_status.get("result") != "success":
+            raise RuntimeError(f"Backup status file does not report success: {backup_status}")
         restore_report = subprocess.run(
             [BASH, str(ROOT / "scripts" / "restore.sh"), str(backup_path), "health_restore"],
             cwd=ROOT,
@@ -366,6 +371,8 @@ def main() -> int:
                 raise RuntimeError("Refusing to remove a backup directory outside the workspace")
             for backup_file in resolved_backup.glob("health-*.dump*"):
                 backup_file.unlink()
+            for status_file in ("last-backup-status.json", ".last-backup-status.json.tmp"):
+                (resolved_backup / status_file).unlink(missing_ok=True)
             resolved_backup.rmdir()
 
 

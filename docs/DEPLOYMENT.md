@@ -175,7 +175,8 @@ valid Google signature.
 ## 8. Encrypted backups
 
 ```sh
-sudo install -m 644 deploy/systemd/healthos-backup.service deploy/systemd/healthos-backup.timer /etc/systemd/system/
+sudo install -m 644 deploy/systemd/healthos-backup.service deploy/systemd/healthos-backup.timer \
+  deploy/systemd/healthos-backup-failure.service /etc/systemd/system/
 sudo install -d -m 700 /etc/healthos
 age-keygen -o healthos-backup.age     # on a machine other than the VM; prints the public key
 echo 'BACKUP_AGE_RECIPIENT=age1...' | sudo tee /etc/healthos/backup.env >/dev/null
@@ -187,9 +188,14 @@ sudo systemctl start healthos-backup.service && journalctl -u healthos-backup.se
 
 With only the age **public** key on the VM, a stolen VM cannot read its own backups. The timer runs
 [`scripts/backup.sh`](../scripts/backup.sh) daily at 03:30 (catching up after downtime); it writes
-`BACKUP_HOST_DIR/health-<UTC stamp>.dump.age` (default `/opt/healthos/backups`) and deletes dumps
-older than `BACKUP_RETENTION_DAYS` (14). Copy that directory off the VM with whatever you already
-use; HealtOS ships no off-site copy. Without `age`, a mode-600 `/etc/healthos/backup.key` passphrase
+`BACKUP_HOST_DIR/health-<UTC stamp>.dump.age` (default `/opt/healthos/backups`) and **keeps every
+backup forever**; only an explicit positive `BACKUP_RETENTION_DAYS` turns on deletion. A run refuses
+to start when the disk is short of space and never deletes backups to make room; plan disk growth
+and see [disk space for backups](RUNBOOK.md#disk-space-for-backups). Each run writes its result to
+`BACKUP_HOST_DIR/last-backup-status.json`, and a failure is logged at `crit` by
+`healthos-backup-failure.service`. Copy that directory off the VM with whatever you already
+use; HealtOS ships no off-site copy. **Store the age identity (or `/etc/healthos/backup.key`) in a
+password manager, not only on the VM: without it no backup can be read.** Without `age`, a mode-600 `/etc/healthos/backup.key` passphrase
 file switches the script to `gpg --symmetric`. Prove a backup with the restore drill in the
 [runbook](RUNBOOK.md#backup-verify-and-restore-drill); details are in the
 [backup reference](REFERENCE.md#database-backup-and-restore).
@@ -231,7 +237,8 @@ bridge). Restarting and token rotation are in the [runbook](RUNBOOK.md#restart-t
 - `ss -ltn` on the VM shows `127.0.0.1:8000`, the bridge on the `docker0` address only, and no 5432.
 - `https://webhook.example.com/` and `/health` return 404; only the webhook path reaches the app.
 - `http://healthos.localhost:8000` through the SSH tunnel asks for the token.
-- `systemctl list-timers healthos-backup.timer` shows the next run, and one restore drill passed.
+- `systemctl list-timers healthos-backup.timer` shows the next run, `backups/last-backup-status.json`
+  reports `"result": "success"`, and one restore drill passed.
 - Exactly one app instance runs the scheduler. If you start a second copy (for example during a
   migration), set `RECONCILIATION_ENABLED=false` and `WATCHDOG_ENABLED=false` there.
 

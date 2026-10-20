@@ -1,7 +1,8 @@
 # Encrypted daily PostgreSQL backup for the HealthOS Compose deployment.
 #
 # Install (adjust /opt/healthos to the directory holding docker-compose.yml):
-#   sudo install -m 644 deploy/systemd/healthos-backup.service deploy/systemd/healthos-backup.timer /etc/systemd/system/
+#   sudo install -m 644 deploy/systemd/healthos-backup.service deploy/systemd/healthos-backup.timer \
+#     deploy/systemd/healthos-backup-failure.service /etc/systemd/system/
 #   sudo install -d -m 700 /etc/healthos
 #   # Preferred: age public key only; keep the private identity off this host.
 #   echo 'BACKUP_AGE_RECIPIENT=age1...' | sudo tee /etc/healthos/backup.env >/dev/null
@@ -11,12 +12,19 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now healthos-backup.timer
 #   sudo systemctl start healthos-backup.service && journalctl -u healthos-backup.service -n 20
 #
-# Store the backup key and GOOGLE_TOKEN_ENCRYPTION_KEY somewhere other than the
-# backups themselves: a restore needs both.
+# Store the backup key (or the age identity) and GOOGLE_TOKEN_ENCRYPTION_KEY off
+# this host, e.g. in a password manager: a restore needs both, and losing the
+# backup key makes every backup unreadable.
+#
+# Backups are kept forever; nothing is deleted unless BACKUP_RETENTION_DAYS is
+# set to a positive number. A run refuses to start when the disk is short of
+# space, and a failure starts healthos-backup-failure.service (logs at crit).
+# Last result: <BACKUP_HOST_DIR>/last-backup-status.json.
 [Unit]
 Description=HealthOS encrypted PostgreSQL backup
 Requires=docker.service
 After=docker.service
+OnFailure=healthos-backup-failure.service
 
 [Service]
 Type=oneshot
@@ -25,7 +33,8 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/healthos
 # Optional: BACKUP_AGE_RECIPIENT, BACKUP_KEY_FILE, BACKUP_HOST_DIR,
-# BACKUP_RETENTION_DAYS (default 14), COMPOSE_FILE for override files.
+# BACKUP_RETENTION_DAYS (default: never delete), BACKUP_MIN_FREE_MB,
+# COMPOSE_FILE for override files.
 EnvironmentFile=-/etc/healthos/backup.env
 ExecStart=/bin/bash /opt/healthos/scripts/backup.sh
 UMask=0077

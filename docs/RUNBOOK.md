@@ -85,19 +85,46 @@ architecture, verify its checksum, replace `/usr/local/bin/cloudflared`, then
 | --- | --- | --- |
 | `APP_UI_TOKEN` | Yes | Put a new value in `.env`, then `docker compose up -d --force-recreate app`. The restart ends every login session (sessions are kept in memory); log in again. |
 | `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` | Yes, with a gap | The app accepts exactly one value; there is no overlap period. Update the subscriber's authorization with Google and `.env` back to back, then recreate the app. Deliveries in between get 401; Google retries them and reconciliation covers anything lost. Run `health-mirror webhook-readiness` afterwards. |
-| `GOOGLE_TOKEN_ENCRYPTION_KEY` | Only by re-linking | There is a single Fernet key and no re-encryption command. Take a backup, set the new key, recreate the app, then open `/auth/google/start` through the SSH tunnel and consent again; the callback stores the refresh token encrypted with the new key. Until then syncs fail with `Stored OAuth token cannot be decrypted`. Older backups still need the old key, so keep it with them until they expire. |
+| `GOOGLE_TOKEN_ENCRYPTION_KEY` | Only by re-linking | There is a single Fernet key and no re-encryption command. Take a backup, set the new key, recreate the app, then open `/auth/google/start` through the SSH tunnel and consent again; the callback stores the refresh token encrypted with the new key. Until then syncs fail with `Stored OAuth token cannot be decrypted`. Older backups still need the old key; backups are kept forever, so keep the old key forever as well. |
 | `CODEX_BRIDGE_TOKEN` | Yes | Stop the bridge (below), delete `~/.codex/healthos-bridge/bridge.token`, start the launcher again (it generates a token and updates `.env`), then recreate the app. |
 | `POSTGRES_PASSWORD` | Manual | The image only reads it when the data directory is first created. Change the role first, `docker compose exec postgres psql -U health -d health -c "ALTER ROLE health PASSWORD '<new>'"`, then update `.env` and run `docker compose up -d --force-recreate app`. |
-| Backup key | Yes | Point `BACKUP_AGE_RECIPIENT` (or `/etc/healthos/backup.key`) at the new key. New backups use it; keep the old identity until the last old backup has aged out (14 days by default). |
+| Backup key | Yes | Point `BACKUP_AGE_RECIPIENT` (or `/etc/healthos/backup.key`) at the new key. New backups use it. Backups are kept forever, so keep the old identity (in the password manager) for as long as any backup made with it exists. |
 
 ## Backup, verify and restore drill
 
 ```sh
 make backup                          # prints backups/health-<stamp>.dump.age
 ls -l backups/
+cat backups/last-backup-status.json  # "result": "success", recent "timestamp", "free_bytes"
 systemctl list-timers healthos-backup.timer
 journalctl -u healthos-backup.service -n 20
+journalctl -p crit -t healthos-backup   # failures reported by healthos-backup-failure.service
 ```
+
+Check the status file weekly: `result` must be `success` and `timestamp` from the last day. A
+`failure` carries the reason in `message`; a stale timestamp means the timer is not running.
+
+### Disk space for backups
+
+Backups are kept forever and nothing deletes them automatically. When free space falls below the
+guard (twice the newest dump, at least 1 GiB; or `BACKUP_MIN_FREE_MB`), the backup refuses to start
+and the unit fails; it never deletes old backups to make room. Fix it by adding space:
+
+- **Grow the disk.** Enlarge the VM disk in the hypervisor, then grow the partition and filesystem
+  (e.g. `sudo growpart /dev/sda 1 && sudo resize2fs /dev/sda1`; check names with `lsblk`).
+- **Add a disk for backups.** Format and mount a new disk (e.g. at `/srv/healthos-backups`, listed
+  in `/etc/fstab`), copy the existing backups there (`sudo rsync -a backups/ /srv/healthos-backups/`),
+  set `BACKUP_HOST_DIR=/srv/healthos-backups` in `.env`, and run `make backup` once.
+- **Move old backups to other storage, by hand.** They are encrypted, so any storage will do. Copy,
+  verify, and only then remove the local copy:
+
+  ```sh
+  rsync -a --checksum backups/health-2026*.dump.age /mnt/archive/healthos/
+  (cd backups && sha256sum health-2026*.dump.age) > /tmp/healthos-moved.sha256
+  (cd /mnt/archive/healthos && sha256sum -c /tmp/healthos-moved.sha256)   # all OK before deleting
+  ```
+
+  Keep at least the newest backups on the host, and keep the backup key with the archive.
 
 Restore drill, monthly and after every change to backups or keys. It never touches the live
 `health` database: it drops and recreates a scratch database, restores into it, and prints row
