@@ -2,13 +2,17 @@
 // (public/assets/presets/manifest.json) or uploaded by the user. Applied at
 // runtime without a reload; any failure falls back to the built-in defaults.
 //
-// Persistence goes through a small store adapter (see createLocalAppearanceStore)
-// so a backend endpoint can replace browser storage later with the same API:
+// Persistence goes through a small store adapter with this API:
 //   getSelection() → {logo?, umay?, background?}   setSelection(selection)
 //   getUpload(kind) → record|null   putUpload(kind, record)   deleteUpload(kind)
+// createSyncedAppearanceStore (the default) keeps the preset ids on the server
+// (/api/settings/appearance) so every device shows the same choice, with
+// localStorage as the offline copy. Uploaded images are never sent anywhere: they
+// stay in this browser's IndexedDB; a device without the upload shows the default.
 //
 // Security: uploaded files are only ever shown through <img src> or CSS url()
 // with a blob: URL. Uploaded SVG text is never parsed into the DOM.
+import { request } from './api.js';
 import { iconMarkup } from './icons.js';
 
 const MANIFEST_URL = '/assets/presets/manifest.json';
@@ -18,6 +22,8 @@ const TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', '
 const MIN_SIDE = { logo: 16, umay: 64, background: 64 };
 const MAX_SIDE = 8192;
 const UPLOAD = 'upload';
+const PRESET_ID = /^[a-z0-9][a-z0-9-]{0,47}$/;
+const REMOTE_URL = '/api/settings/appearance';
 const DEFAULT_GLYPH = '/assets/umay/umay-glyph.svg';
 const TEXT = {
   logo: { legend: 'Logo', hint: 'Üst çubukta ve tarayıcı sekmesinde görünür.' },
@@ -88,6 +94,58 @@ export function createLocalAppearanceStore({ key = 'healtos.appearance', dbName 
     async deleteUpload(kind) {
       memory.delete(kind);
       await run('readwrite', store => store.delete(kind), () => undefined);
+    },
+  };
+}
+
+// Shared selection. getSelection() answers from localStorage at once (first paint);
+// sync() then asks the server, whose copy wins when reachable. Offline, the local
+// copy stays in use and a write that could not reach the server is marked pending,
+// then sent on the next load that reaches it (last write wins).
+const cleanSelection = value => Object.fromEntries(KINDS.flatMap(kind => (
+  typeof value?.[kind] === 'string' && PRESET_ID.test(value[kind]) ? [[kind, value[kind]]] : [])));
+export function createSyncedAppearanceStore({ local = createLocalAppearanceStore(), url = REMOTE_URL, pendingKey = 'healtos.appearance.pending' } = {}) {
+  const pending = (value) => {
+    try {
+      if (value === undefined) return localStorage.getItem(pendingKey) === '1';
+      if (value) localStorage.setItem(pendingKey, '1'); else localStorage.removeItem(pendingKey);
+    } catch { /* Private mode: nothing to resume later. */ }
+    return false;
+  };
+  let latest = null, queue = Promise.resolve();
+  const enqueue = (selection) => {
+    latest = selection; pending(true);
+    // One request at a time, newest last; superseded writes are skipped.
+    queue = queue.then(() => (latest === selection ? push(selection) : undefined));
+    return queue;
+  };
+  const push = async (selection) => {
+    try {
+      await request(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-HealthOS-Request': '1' },
+        body: JSON.stringify(cleanSelection(selection)),
+      });
+      if (latest === selection) pending(false);
+    } catch { /* Offline or rejected: stays pending; the local copy still applies. */ }
+  };
+  return {
+    ...local,
+    async getSelection() { return cleanSelection(await local.getSelection()); },
+    // → the server's selection, or null when it is unreachable or this browser's
+    // copy was sent instead (an unsent change, or a server with nothing stored yet).
+    async sync() {
+      const cached = cleanSelection(await local.getSelection());
+      let remote;
+      try { remote = await request(url); } catch { return null; }
+      if (pending() || (!remote?.updated_at && Object.keys(cached).length)) { await enqueue(cached); return null; }
+      const selection = cleanSelection(remote?.selection);
+      await local.setSelection(selection);
+      return selection;
+    },
+    async setSelection(selection) {
+      await local.setSelection(selection);
+      return enqueue(selection);
     },
   };
 }
@@ -248,7 +306,7 @@ function setLink(id, rel, href, type, sizes) {
   if (old) old.replaceWith(link); else document.head.append(link);
 }
 
-export function setupAppearance({ store = createLocalAppearanceStore() } = {}) {
+export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) {
   const $ = id => document.getElementById(id);
   const root = document.documentElement;
   const brand = document.querySelector('.topbar .brand');
@@ -258,6 +316,15 @@ export function setupAppearance({ store = createLocalAppearanceStore() } = {}) {
   inlineMark?.after(headerMark);
   const dialog = $('appearance-dialog');
   let manifest = normalize(FALLBACK), selection = {}, uploads = {}, current = {};
+  // What is stored (and shared): like `selection`, but an `upload` choice made on a
+  // device whose image this browser lacks is kept, not replaced by the fallback.
+  let saved = {}, edits = 0;
+  const save = (changes) => { edits += 1; saved = { ...saved, ...changes }; return store.setSelection(saved); };
+  const resolveSelection = () => Object.fromEntries(KINDS.map((kind) => {
+    const id = saved[kind];
+    const valid = id === UPLOAD ? Boolean(uploads[kind]) : manifest[kind].some(entry => entry.id === id);
+    return [kind, valid ? id : manifest[kind][0].id];
+  }));
 
   const defaults = () => Object.fromEntries(KINDS.map(kind => [kind, manifest[kind][0].id]));
   function entryFor(kind, id) {
@@ -416,7 +483,7 @@ export function setupAppearance({ store = createLocalAppearanceStore() } = {}) {
     error(kind);
     selection = { ...selection, [kind]: id };
     applyKind(kind); updateForm();
-    await store.setSelection(selection);
+    await save({ [kind]: id });
   }
   async function upload(kind, file) {
     const group = dialog.querySelector(`[data-appearance-kind="${kind}"]`);
@@ -435,14 +502,14 @@ export function setupAppearance({ store = createLocalAppearanceStore() } = {}) {
   async function removeUpload(kind) {
     await store.deleteUpload(kind);
     delete uploads[kind];
-    if (selection[kind] === UPLOAD) { selection = { ...selection, [kind]: manifest[kind][0].id }; await store.setSelection(selection); }
+    if (selection[kind] === UPLOAD) { selection = { ...selection, [kind]: manifest[kind][0].id }; await save({ [kind]: selection[kind] }); }
     applyKind(kind); renderGroup(kind); updateForm();
   }
   async function reset() {
     selection = defaults();
-    await store.setSelection(selection);
     KINDS.forEach(error);
     applyAll();
+    await save(selection);
   }
 
   if (dialog) {
@@ -460,18 +527,24 @@ export function setupAppearance({ store = createLocalAppearanceStore() } = {}) {
   }
 
   const ready = (async () => {
-    const [loaded, saved] = await Promise.all([loadManifest(), store.getSelection().catch(() => ({}))]);
+    const [loaded, remembered] = await Promise.all([loadManifest(), store.getSelection().catch(() => ({}))]);
     manifest = loaded;
+    saved = cleanSelection(remembered);
     const stored = await Promise.all(KINDS.map(kind => store.getUpload(kind).catch(() => null)));
     KINDS.forEach((kind, i) => { const record = stored[i]; if (record?.files && record.kind === kind) uploads[kind] = record; });
-    selection = Object.fromEntries(KINDS.map((kind) => {
-      const id = saved?.[kind];
-      const valid = id === UPLOAD ? Boolean(uploads[kind]) : manifest[kind].some(entry => entry.id === id);
-      return [kind, valid ? id : manifest[kind][0].id];
-    }));
+    selection = resolveSelection();
     KINDS.forEach(renderGroup);
     applyAll();
     root.dataset.appearanceReady = '';
   })().catch(() => { root.dataset.appearanceReady = 'fallback'; });
-  return { ready, choose, reset };
+  // Then the shared copy from the server, unless the user already changed something.
+  const synced = ready.then(async () => {
+    const before = edits;
+    const remote = store.sync ? await store.sync().catch(() => null) : null;
+    if (remote && edits === before && JSON.stringify(remote) !== JSON.stringify(saved)) {
+      saved = remote; selection = resolveSelection(); applyAll();
+    }
+    root.dataset.appearanceSynced = remote ? '' : 'local';
+  });
+  return { ready, synced, choose, reset };
 }
