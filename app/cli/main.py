@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 
 import typer
 from sqlalchemy import func, select
@@ -199,10 +200,11 @@ def webhook_replay_pending() -> None:
 
 @app.command()
 def verify() -> None:
-    """Check raw uniqueness, payload hashes, and checkpoint errors."""
+    """Check raw uniqueness, payload hashes, version history, and checkpoint errors."""
 
     async def command():
         from app.parsers.common import payload_hash
+        from app.services.raw_history import verify_versions
 
         errors = []
         count = 0
@@ -219,18 +221,90 @@ def verify() -> None:
                 count += 1
                 if payload_hash(raw_json) != expected_hash:
                     errors.append(f"payload hash mismatch: {data_type}/{google_data_point_id}")
+            versions, version_errors = await verify_versions(session)
+            errors.extend(version_errors)
             failed = (
                 await session.scalars(select(SyncState).where(SyncState.last_error.is_not(None)))
             ).all()
-        return count, errors, failed
+        return count, versions, errors, failed
 
-    count, errors, failed = run(command())
-    typer.echo(f"Verified {count} raw records")
+    count, versions, errors, failed = run(command())
+    typer.echo(f"Verified {count} raw records and {versions} earlier versions")
     for error in errors:
         typer.echo(error, err=True)
     for state in failed:
         typer.echo(f"sync error: {state.data_type}: {state.last_error}", err=True)
     if errors or failed:
+        raise typer.Exit(1)
+
+
+SINCE_OPTION = typer.Option(
+    None,
+    "--since",
+    formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"],
+    help="Only records replaced at or after this UTC date/time.",
+)
+
+
+@app.command()
+def history(
+    data_type: str = typer.Option(..., "--data-type", help="Google data type, e.g. heart-rate."),
+    google_id: str | None = typer.Option(
+        None, "--id", help="One record's google_data_point_id (shown even with one version)."
+    ),
+    since: datetime | None = SINCE_OPTION,
+    limit: int = typer.Option(20, min=1, max=10_000, help="Most recently changed records."),
+    payload: bool = typer.Option(True, "--payload/--no-payload", help="Include raw payloads."),
+) -> None:
+    """List every stored version of raw records (oldest first) as JSON."""
+    from app.services.raw_history import record_history
+
+    async def command():
+        async with SessionLocal() as session:
+            return await record_history(
+                session,
+                data_type,
+                google_id=google_id,
+                since=since.replace(tzinfo=UTC) if since else None,
+                limit=limit,
+                include_payload=payload,
+            )
+
+    records = run(command())
+    typer.echo(json.dumps(records, indent=2, ensure_ascii=False))
+    if google_id is not None and not records:
+        typer.echo(f"no record {data_type}/{google_id}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command()
+def import_versions(
+    from_db: str = typer.Option(
+        ...,
+        "--from-db",
+        help="Restored archive: a database name on the live server, or a full URL.",
+    ),
+    batch_size: int = typer.Option(2_000, min=1, max=50_000),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Count only; write nothing."),
+) -> None:
+    """Add payload versions that only survive in an old dump; current rows stay as they are."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.services.raw_history import import_versions as run_import
+    from app.services.raw_history import source_database_url
+
+    url = source_database_url(from_db, get_settings().database_url)
+
+    async def command():
+        source = create_async_engine(url)
+        try:
+            return await run_import(SessionLocal, source, batch_size=batch_size, dry_run=dry_run)
+        finally:
+            await source.dispose()
+
+    stats = run(command())
+    typer.echo(json.dumps({"dry_run": dry_run, **stats.as_dict()}, indent=2))
+    if stats.source_hash_mismatches:
         raise typer.Exit(1)
 
 

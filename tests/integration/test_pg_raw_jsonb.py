@@ -106,12 +106,23 @@ def _insert_as_json(engine) -> dict[str, object]:
     return expected
 
 
-async def _assert_app_reads_unchanged(database_url: str, expected: dict[str, object]) -> None:
+async def _assert_app_reads_unchanged(
+    database_url: str, expected: dict[str, object], *, writes: bool = False
+) -> None:
+    """Reads work at any revision; the write checks need the app's schema (head)."""
     engine = create_async_engine(database_url)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with sessions() as session:
-            rows = (await session.execute(select(RawHealthData))).scalars().all()
+            rows = (
+                await session.execute(
+                    select(
+                        RawHealthData.google_data_point_id,
+                        RawHealthData.raw_json,
+                        RawHealthData.payload_hash,
+                    )
+                )
+            ).all()
             assert {row.google_data_point_id: row.raw_json for row in rows} == expected
             for row in rows:
                 # What `health-mirror verify` checks for every archived record.
@@ -123,6 +134,8 @@ async def _assert_app_reads_unchanged(database_url: str, expected: dict[str, obj
                 payload_hash(item): item for item in WEBHOOK_BATCH
             }
 
+        if not writes:
+            return
         # Re-storing the same Google record compares hashes and leaves it unchanged.
         async with sessions.begin() as session:
             stats = await store_records(session, REGISTRY["steps"], [STEPS])
@@ -153,9 +166,11 @@ async def test_raw_json_jsonb_round_trip_keeps_values_and_hashes(
         assert _version(engine) == AFTER
         assert _column_types(engine) == dict.fromkeys(TABLES, "jsonb")
         await _assert_app_reads_unchanged(database_url, expected)
-        command.check(alembic_config)
 
-        # New writes after the upgrade go through the JSONB type too.
+        # New writes (by the app at head) go through the JSONB type too.
+        command.upgrade(alembic_config, "head")
+        command.check(alembic_config)
+        await _assert_app_reads_unchanged(database_url, expected, writes=True)
         writer = create_async_engine(database_url)
         try:
             async with async_sessionmaker(writer, expire_on_commit=False).begin() as session:
@@ -178,7 +193,7 @@ async def test_raw_json_jsonb_round_trip_keeps_values_and_hashes(
 
         command.upgrade(alembic_config, "head")
         assert _column_types(engine) == dict.fromkeys(TABLES, "jsonb")
-        await _assert_app_reads_unchanged(database_url, expected)
+        await _assert_app_reads_unchanged(database_url, expected, writes=True)
     finally:
         engine.dispose()
 

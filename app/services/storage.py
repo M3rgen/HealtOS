@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import pairwise
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,20 +32,49 @@ class StoreStats:
     normalization_skipped: int = 0
     # Archived records a complete window re-fetch no longer returned (see app.sync.deletions).
     source_deleted: int = 0
+    # Replaced payloads preserved in raw_health_data_versions.
+    versions_kept: int = 0
 
     def add(self, other: StoreStats) -> None:
         for field in self.__dataclass_fields__:
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
 
+# The write path that delivered the records being stored (raw_health_data.payload_source,
+# raw_health_data_versions.source). Callers that run the incremental sync on behalf of
+# something else (webhooks, reconciliation) set it around the call; see recording_source.
+_source: ContextVar[str] = ContextVar("raw_payload_source", default="sync")
+
+
+@contextmanager
+def recording_source(source: str) -> Iterator[None]:
+    token = _source.set(source)
+    try:
+        yield
+    finally:
+        _source.reset(token)
+
+
 async def store_records(
-    session: AsyncSession, spec: DataTypeSpec, records: Sequence[object]
+    session: AsyncSession,
+    spec: DataTypeSpec,
+    records: Sequence[object],
+    *,
+    source: str | None = None,
 ) -> StoreStats:
+    """Archive one page of records; a changed payload keeps the previous one as a version.
+
+    ``raw_health_data`` is overwritten with the newest payload, and the trigger from
+    migration 20261020_0011 copies the replaced row into ``raw_health_data_versions`` in
+    the same statement. A record that appears more than once in ``records`` with
+    different payloads is written once per distinct payload, in order, so each becomes
+    its own version (consecutive identical copies collapse into one).
+    """
     stats = StoreStats()
     now = datetime.now(UTC)
-    # One INSERT ... ON CONFLICT statement may not touch the same row twice on
-    # PostgreSQL, and synthetic rollup IDs can repeat within a page: last one wins.
-    by_id: dict[str, tuple] = {}
+    origin = source or _source.get()
+    # Per record id, the distinct consecutive payloads of this page, in page order.
+    by_id: dict[str, list[tuple]] = {}
     duplicates = 0
     for record in records:
         google_id = source_id(spec, record)
@@ -50,15 +82,16 @@ async def store_records(
         start = end = timezone = None
         if isinstance(record, dict):
             start, end, timezone = temporal(spec, record)
-        if (previous := by_id.pop(google_id, None)) is not None:
+        sequence = by_id.setdefault(google_id, [])
+        if sequence:
             duplicates += 1
-            if previous[2] != digest:
-                event(logger, "RECORD_BATCH_DUPLICATE_CONFLICT", data_type=spec.name)
-        by_id[google_id] = (record, google_id, digest, start, end, timezone)
-    prepared = list(by_id.values())
+            if sequence[-1][2] == digest:
+                continue
+            event(logger, "RECORD_BATCH_DUPLICATE_CONFLICT", data_type=spec.name)
+        sequence.append((record, google_id, digest, start, end, timezone))
 
     existing_hashes: dict[str, str] = {}
-    google_ids = [item[1] for item in prepared]
+    google_ids = list(by_id)
     for offset in range(0, len(google_ids), 5000):
         rows = await session.execute(
             select(RawHealthData.google_data_point_id, RawHealthData.payload_hash).where(
@@ -68,39 +101,33 @@ async def store_records(
         )
         existing_hashes.update(rows.tuples().all())
 
-    raw_values = []
+    # One INSERT ... ON CONFLICT statement may not touch the same row twice on
+    # PostgreSQL, so the n-th payload of every record goes into the n-th statement.
+    rounds: list[list[dict]] = []
     normalized_values = defaultdict(list)
-    for record, google_id, digest, start, end, timezone in prepared:
+    for google_id, sequence in by_id.items():
+        for position, item in enumerate(sequence):
+            if position == len(rounds):
+                rounds.append([])
+            rounds[position].append(_raw_row(spec, item, now, origin))
         existing_hash = existing_hashes.get(google_id)
-        inserted = existing_hash is None
-        changed = inserted or existing_hash != digest
-        raw_values.append(
-            {
-                "google_data_point_id": google_id,
-                "data_type": spec.name,
-                "source_start_time": start,
-                "source_end_time": end,
-                "source_timezone": timezone,
-                "raw_json": record,
-                "payload_hash": digest,
-                "first_seen_at": now,
-                "last_seen_at": now,
-                "source_deleted_at": None,
-            }
-        )
-        if inserted:
+        hashes = [existing_hash, *(item[2] for item in sequence)]
+        replaced = sum(old is not None and old != new for old, new in pairwise(hashes))
+        stats.versions_kept += replaced
+        if existing_hash is None:
             stats.inserted += 1
-        elif changed:
+        elif replaced:
             stats.updated += 1
         else:
             stats.unchanged += 1
-        normalized = normalize(spec, record)
+        normalized = normalize(spec, sequence[-1][0])
         if normalized is None:
             stats.normalization_skipped += 1
-        elif changed:
+        elif existing_hash is None or replaced:
             normalized_values[normalized.model].append(normalized.values)
             stats.normalized += 1
-    await _upsert_raw_many(session, raw_values)
+    for rows in rounds:
+        await _upsert_raw_many(session, rows)
     for model, values in normalized_values.items():
         await _upsert_normalized_many(session, model, values)
     if records:
@@ -113,8 +140,27 @@ async def store_records(
             updated=stats.updated,
             unchanged=stats.unchanged,
             duplicates=duplicates,
+            versions_kept=stats.versions_kept,
         )
     return stats
+
+
+def _raw_row(spec: DataTypeSpec, item: tuple, now: datetime, origin: str) -> dict:
+    record, google_id, digest, start, end, timezone = item
+    return {
+        "google_data_point_id": google_id,
+        "data_type": spec.name,
+        "source_start_time": start,
+        "source_end_time": end,
+        "source_timezone": timezone,
+        "raw_json": record,
+        "payload_hash": digest,
+        "first_seen_at": now,
+        "last_seen_at": now,
+        "source_deleted_at": None,
+        "payload_received_at": now,
+        "payload_source": origin,
+    }
 
 
 async def _upsert_normalized_many(session: AsyncSession, model, rows: list[dict]) -> None:
@@ -139,6 +185,10 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
         return
     table = RawHealthData.__table__
     statement = _insert(session, table)
+    # The payload is overwritten in place; when its hash changes, the trigger of
+    # migration 20261020_0011 has already copied the replaced row into
+    # raw_health_data_versions. When and how a payload arrived only changes with it.
+    unchanged = table.c.payload_hash == statement.excluded.payload_hash
     updates = {
         "source_start_time": statement.excluded.source_start_time,
         "source_end_time": statement.excluded.source_end_time,
@@ -147,6 +197,13 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
         "payload_hash": statement.excluded.payload_hash,
         "last_seen_at": statement.excluded.last_seen_at,
         "source_deleted_at": None,
+        "payload_received_at": case(
+            (unchanged, table.c.payload_received_at),
+            else_=statement.excluded.payload_received_at,
+        ),
+        "payload_source": case(
+            (unchanged, table.c.payload_source), else_=statement.excluded.payload_source
+        ),
         "updated_at": datetime.now(UTC),
     }
     statement = statement.on_conflict_do_update(

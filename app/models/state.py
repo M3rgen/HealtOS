@@ -67,6 +67,11 @@ class RawHealthData(TimestampMixin, Base):
         Boolean, default=False, server_default=false(), nullable=False
     )
     quarantine_reason: Mapped[str | None] = mapped_column(String(255))
+    # When and how the current payload arrived (set on insert and on every change);
+    # NULL for payloads stored before migration 20261020_0011. Earlier payloads of the
+    # record are in raw_health_data_versions (app/models/raw_versions.py).
+    payload_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload_source: Mapped[str | None] = mapped_column(String(32))
 
 
 class SyncState(TimestampMixin, Base):

@@ -11,7 +11,9 @@ A fully self-hosted, subscription-free, read-only archive of health and fitness 
 - Google Health remains the source of truth. This application only makes read requests to user data endpoints.
 - Raw responses are retained in `raw_health_data`; unknown fields are never dropped from the archive.
 - A Google resource name is the primary source identifier. Where a response lacks one, a deterministic identity is derived from type, time coordinates, and data source.
-- Payload hashes distinguish unchanged records from source corrections.
+- Payload hashes distinguish unchanged records from source corrections. A correction never
+  overwrites the old payload: every version is kept in `raw_health_data_versions` (see
+  [Raw record versions](#raw-record-versions)).
 - Raw and normalized UPSERTs plus their page checkpoint commit in one transaction.
 - Backfill progress is stored per data type and time window, including the next page token.
 - Incremental sync deliberately overlaps previous checkpoints to catch late or enriched data.
@@ -392,7 +394,7 @@ curl -X POST -H "Authorization: Bearer $APP_UI_TOKEN" -H 'X-HealthOS-Request: 1'
 curl -H "Authorization: Bearer $APP_UI_TOKEN" http://127.0.0.1:8000/sync/status
 ```
 
-Default overlaps are 60 minutes for heart rate, 12 hours for steps/activity streams, 72 hours for sleep/temperature derivations, seven days for daily metrics, and 24 hours otherwise. UPSERT makes every replay safe.
+Default overlaps are 60 minutes for heart rate, 12 hours for steps/activity streams, 72 hours for sleep/temperature derivations, seven days for daily metrics, and 24 hours otherwise. UPSERT makes every replay safe; a changed payload keeps the previous one as a [version](#raw-record-versions).
 
 ### Source deletions
 
@@ -413,6 +415,85 @@ never marked.
 - A record whose time was moved upstream out of the window that is re-fetched looks deleted from
   that window and is marked until a fetch covering its new time returns it again (and unmarks it).
   For a move of more than 7 days that is the weekly 90-day reconciliation.
+
+## Raw record versions
+
+Google re-sends records with a different payload when it recomputes them (HRV, calories, heart-rate
+zones and resting heart rate often change for a day or two). A record is identified by
+`(data_type, google_data_point_id)`; when a fetch brings a payload whose `payload_hash` differs
+from the stored one, the old payload is **kept as a version**, never overwritten:
+
+- `raw_health_data` holds the current version of every record; every reader (dashboards, Umay,
+  normalized tables, `analytics_*` views) keeps using it. `payload_received_at` and
+  `payload_source` (`sync`, `webhook`, `reconciliation`, `backfill`) say when and how the current
+  payload arrived; both are NULL for payloads stored before migration `20261020_0011`.
+- `raw_health_data_versions` holds every earlier payload, numbered per record (1 = oldest), with
+  `received_at` (NULL if unknown), `last_seen_at` (the last fetch that still returned it),
+  `superseded_at` (the fetch that replaced it), `source` (as above, `legacy` for pre-0011
+  payloads, `archive-import` for payloads recovered from old dumps) and `raw_id` (the current row).
+  A database trigger writes the row in the same statement that replaces the payload, so a crash
+  or two concurrent writers cannot lose it. Re-receiving the same payload writes nothing. The table
+  is append-only: triggers refuse `UPDATE` (except renumbering `version` during an archive import),
+  `DELETE` and `TRUNCATE`, and its foreign key keeps the current row from being deleted.
+- A record that appears more than once in one page with different payloads becomes one version
+  per payload, in page order.
+- Normalized tables stay "current state": they are derived from the current raw payload and can be
+  rebuilt from `raw_health_data`; the earlier payloads are only in the raw history.
+- A record without history rows is version 1, so the migration copied nothing: the existing
+  archive is not stored twice and the history grows only by payloads that really changed.
+
+The view **`raw_health_data_history`** lists every version of every record: the history rows plus
+the current row, with `version`, `is_current`, `valid_from` (when the version arrived; NULL if
+unknown), `valid_to` (when it was replaced; NULL for the current version and for imported versions
+whose replacement time is unknown), `last_seen_at`, `source`, `payload_hash` and `raw_json`. Filter
+it by `data_type` and `google_data_point_id` (both indexed); for "what changed recently" query
+`raw_health_data_versions` directly.
+
+```sql
+-- Bir kaydın tüm sürümleri (all versions of one record), oldest first
+SELECT version, is_current, valid_from, valid_to, source, payload_hash, raw_json
+FROM raw_health_data_history
+WHERE data_type = 'heart-rate-variability'
+  AND google_data_point_id = 'users/me/dataTypes/heart-rate-variability/dataPoints/…'
+ORDER BY version;
+
+-- Son 7 günde değişen kayıtlar (records replaced in the last 7 days)
+SELECT v.data_type, v.google_data_point_id, v.version AS replaced_version,
+       v.superseded_at, v.payload_hash AS old_hash, r.payload_hash AS current_hash
+FROM raw_health_data_versions v
+JOIN raw_health_data r ON r.id = v.raw_id
+WHERE v.superseded_at >= now() - interval '7 days'
+ORDER BY v.superseded_at DESC;
+
+-- Veri türüne göre değişiklik sayısı (changes per data type)
+SELECT data_type, count(*) AS earlier_versions, count(DISTINCT raw_id) AS changed_records,
+       max(superseded_at) AS last_change
+FROM raw_health_data_versions
+GROUP BY data_type
+ORDER BY earlier_versions DESC;
+```
+
+The same from the command line (JSON, oldest version first; no secrets, payloads are included
+unless `--no-payload`):
+
+```sh
+health-mirror history --data-type heart-rate-variability                 # 20 most recently changed records
+health-mirror history --data-type heart-rate-variability --since 2026-10-13 --limit 100
+health-mirror history --data-type resting-heart-rate --id 'users/me/dataTypes/…' --no-payload
+```
+
+### Recovering versions from old dumps
+
+Before migration `20261020_0011` a changed payload overwrote the stored one; those versions only
+survive in older backups. `health-mirror import-versions --from-db <database>` reads a restored
+dump (any revision, including `json`-typed `raw_json` from before `20261020_0010`) and adds every
+`(record, payload_hash)` the archive does not have yet as a version with `source =
+'archive-import'`, slotted by its `last_seen_at`. Current rows are never changed; existing history
+rows keep their order and are only renumbered. Running it again adds nothing, and dumps can be
+imported in any order. Rows whose stored hash does not match their payload are reported and
+skipped; records that exist only in the dump are counted under `missing_records`, not copied.
+`--dry-run` only counts. `--from-db` takes a database name on the live server or a full SQLAlchemy
+URL. Procedure: [RUNBOOK](RUNBOOK.md#import-payload-versions-from-archive-dumps).
 
 ## Webhooks
 
@@ -667,7 +748,10 @@ docker compose exec app health-mirror verify
 health-mirror verify
 ```
 
-This recalculates every raw payload hash and reports sync errors. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
+This recalculates every raw payload hash and every history payload hash, checks that each record
+has exactly one current row, that its version numbers run 1..n without gaps, that history rows
+match their record's key, and that no version repeats its neighbour's payload, and reports sync
+errors. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
 
 ## Troubleshooting
 

@@ -210,7 +210,7 @@ class BackfillService:
         try:
             async for page in iter_pages(self.client, spec, start, end, token):
                 async with self.sessions.begin() as session:
-                    await store_records(session, spec, page.data_points)
+                    await store_records(session, spec, page.data_points, source="backfill")
                     job = await session.get(BackfillJob, job_id)
                     job.page_token = page.next_page_token
                     job.records_downloaded += len(page.data_points)
