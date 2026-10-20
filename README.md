@@ -169,7 +169,11 @@ Umay is a warm, mythology-inspired companion for exploring your health history. 
 
 The supplied Windows launcher creates an isolated, authenticated local Codex bridge. Follow the [bridge setup](docs/REFERENCE.md#local-codex-chat-on-windows) to enable it. The persona lives in [`app/personas/umay/soul.md`](app/personas/umay/soul.md).
 
-**Privacy boundary:** requested health records and conversation text are sent to OpenAI when you use Umay. The core archive works independently of this feature. AI responses are informational, not a diagnosis.
+**Privacy boundary:** when you use Umay, your questions (with your time zone) and the results of the `health_archive` tool are sent to OpenAI. Each tool call returns a bounded slice: daily summaries for up to 366 days, or original Google records for at most 31 days and 200 records per page; Umay may make several calls per question. The database itself, whole tables, OAuth tokens, secrets and backups are never sent. The core archive works independently of this feature. AI responses are informational, not a diagnosis.
+
+**Gizlilik:** Umay'a sorduğunuz sorular ve `health_archive` aracının sonuçları OpenAI'ye gider; ham tablolar olduğu gibi gitmez. Araç her çağrıda sınırlı bir parça döndürür: en fazla 366 günün gün gün özeti ya da en fazla 31 günlük bir aralıktan sayfa başına 200 özgün kayıt. Umay tek bir soru için birkaç sorgu yapabilir. Veritabanının kendisi, OAuth anahtarları ve yedekler hiçbir zaman gönderilmez.
+
+The bridge listens only on loopback or the Docker bridge address, never on all interfaces (`CODEX_BRIDGE_BIND_HOST`). On a Linux host, also restrict port 8766 to Docker bridges with [`deploy/firewall/codex-bridge.nft`](deploy/firewall/codex-bridge.nft) (or the ufw variant next to it).
 
 ## Keep your archive yours
 
@@ -179,14 +183,15 @@ The supplied Windows launcher creates an isolated, authenticated local Codex bri
 - Real health records, secrets, logs, backups, and local verification outputs are excluded from this repository.
 - A public webhook deployment should expose only the webhook route. The dashboard and administrative API should stay private.
 
-Create a backup with the optional Compose profile:
+Backups are encrypted and automated: a systemd timer ([`deploy/systemd/`](deploy/systemd/healthos-backup.timer)) runs [`scripts/backup.sh`](scripts/backup.sh) daily at 03:30. It streams `pg_dump` from the Compose `backup` profile through `age` (preferred) or `gpg --symmetric`, writes `BACKUP_HOST_DIR/health-<stamp>.dump.age`, and keeps 14 days. The key lives outside `.env` (`BACKUP_AGE_RECIPIENT` or a mode-600 `/etc/healthos/backup.key`).
 
 ```sh
-docker compose --profile backup run --rm backup
+make backup                                   # one encrypted backup now
+make restore FILE=backups/health-<stamp>.dump.age   # restore drill into a scratch database
 docker compose exec app health-mirror verify
 ```
 
-Backups are written to `BACKUP_HOST_DIR` (`./backups` by default). They contain sensitive data; protect them and test restoration to a separate database. The backup command also applies the configured retention policy. See the [backup and restore reference](docs/REFERENCE.md#database-backup-and-restore).
+`scripts/restore.sh` never touches the live database: it restores into `health_restore` and prints row counts. Keep `GOOGLE_TOKEN_ENCRYPTION_KEY` with the backup key, away from the backups — a restored archive needs it to decrypt the stored Google tokens. See the [backup and restore reference](docs/REFERENCE.md#database-backup-and-restore).
 
 ## Documentation
 

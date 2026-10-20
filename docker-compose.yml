@@ -1,3 +1,10 @@
+# Bounded json-file logs so a chatty container cannot fill the VM disk (5 x 20 MB each).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
@@ -8,6 +15,20 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # The entrypoint starts as root, fixes data-directory ownership and switches to
+    # the postgres user with su-exec; these are the only capabilities that needs.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    # read_only is not enabled yet: the image writes /var/run/postgresql and /tmp
+    # and has not been verified here with a read-only root plus tmpfs mounts.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U health -d health"]
       interval: 5s
@@ -15,6 +36,7 @@ services:
       retries: 10
     networks:
       - database
+    logging: *default-logging
     # Deliberately no public port. Use the optional development override if needed.
 
   app:
@@ -29,18 +51,27 @@ services:
       - no-new-privileges:true
     env_file: ${APP_ENV_FILE:-.env}
     environment:
+      # The Compose stack is the deployment path, so the startup guard in
+      # app/core/config.py always runs here. docker-compose.dev.yml relaxes it.
+      APP_ENV: production
       APP_HOST: 0.0.0.0
+      APP_UI_TOKEN: ${APP_UI_TOKEN:?APP_UI_TOKEN must be set}
       DATABASE_URL: postgresql+asyncpg://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
       RECONCILIATION_ENABLED: ${RECONCILIATION_ENABLED:-true}
       WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
+    extra_hosts:
+      # Linux Docker Engine: resolves to the docker0 gateway, where
+      # scripts/start_codex_bridge.py listens. Docker Desktop provides it already.
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - database
       - application
+    logging: *default-logging
     healthcheck:
       test:
         - CMD
@@ -55,19 +86,31 @@ services:
       start_period: 20s
 
   backup:
+    # Streams a custom-format dump to stdout; scripts/backup.sh encrypts it on the
+    # host (age or gpg) and applies retention. Scheduled by deploy/systemd/.
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     profiles: ["backup"]
     environment:
-      DATABASE_URL_PG: postgresql://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
-      BACKUP_DIR: /backups
-      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
-    volumes:
-      - ${BACKUP_HOST_DIR:-./backups}:/backups
-      - ./scripts:/scripts:ro
+      PGHOST: postgres
+      PGUSER: health
+      PGDATABASE: health
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ -t 1 ]; then
+        echo 'Refusing to write an unencrypted dump to a terminal; run scripts/backup.sh.' >&2;
+        exit 2; fi;
+        exec pg_dump --format=custom --compress=9
     restart: "no"
     networks:
       - database
@@ -91,6 +134,7 @@ services:
         condition: service_healthy
     networks:
       - application
+    logging: *default-logging
 
 networks:
   database:

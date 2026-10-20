@@ -8,6 +8,10 @@ from typing import Annotated
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+# Google's webhook signing keyset is only ever fetched from Google's static host;
+# an attacker-controlled keyset URL would let forged webhooks pass verification.
+GOOGLE_KEYSET_URL_PREFIX = "https://www.gstatic.com/"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -113,6 +117,15 @@ class Settings(BaseSettings):
     def parse_csv(cls, value: object) -> object:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("google_health_webhook_public_key_url")
+    @classmethod
+    def require_google_keyset_host(cls, value: str) -> str:
+        if not value.startswith(GOOGLE_KEYSET_URL_PREFIX):
+            raise ValueError(
+                f"webhook public keyset URL must start with {GOOGLE_KEYSET_URL_PREFIX}"
+            )
         return value
 
     @property

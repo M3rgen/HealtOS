@@ -17,4 +17,8 @@ compose-down:
 compose-smoke:
 	python scripts/verify_compose.py
 backup:
-	docker compose exec -T postgres pg_dump -U health -d health -Fc > backups/health.dump
+	bash scripts/backup.sh
+.PHONY: restore
+restore:
+	@test -n "$(FILE)" || { echo "usage: make restore FILE=backups/health-<stamp>.dump.age [DB=health_restore]" >&2; exit 2; }
+	bash scripts/restore.sh "$(FILE)" $(DB)

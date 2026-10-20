@@ -9,6 +9,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from app.core.config import GOOGLE_KEYSET_URL_PREFIX
+
 
 class WebhookVerificationError(ValueError):
     pass
@@ -22,6 +24,8 @@ class CachedKeyset:
 
 class WebhookSignatureVerifier:
     def __init__(self, keyset_url: str, http: httpx.AsyncClient | None = None):
+        if not keyset_url.startswith(GOOGLE_KEYSET_URL_PREFIX):
+            raise ValueError(f"Webhook keyset URL must start with {GOOGLE_KEYSET_URL_PREFIX}")
         self.keyset_url = keyset_url
         self.http = http or httpx.AsyncClient(timeout=10)
         self._cache: CachedKeyset | None = None
@@ -53,7 +57,8 @@ class WebhookSignatureVerifier:
     async def _get_keyset(self, force: bool = False) -> dict:
         if not force and self._cache and self._cache.expires_at > time.time():
             return self._cache.value
-        response = await self.http.get(self.keyset_url)
+        # No redirects: the keyset must come from the pinned Google host itself.
+        response = await self.http.get(self.keyset_url, follow_redirects=False)
         response.raise_for_status()
         value = response.json()
         if not isinstance(value, dict) or not isinstance(value.get("key"), list):

@@ -5,7 +5,10 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from app.core.config import Settings
 from app.google_health.webhook import WebhookSignatureVerifier, WebhookVerificationError
+
+KEYSET_URL = "https://www.gstatic.com/googlehealthapi/webhooks/webhooks_public_keyset.json"
 
 
 def _field(number, value):
@@ -36,7 +39,7 @@ async def test_webhook_tink_signature_verification():
     der = private.sign(body, ec.ECDSA(hashes.SHA256()))
     signed = bytes([1]) + key_id.to_bytes(4, "big") + der
     verifier = WebhookSignatureVerifier(
-        "https://keys.test/keyset", httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        KEYSET_URL, httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
     await verifier.verify(body, base64.b64encode(signed).decode())
     with pytest.raises(WebhookVerificationError):
@@ -63,7 +66,7 @@ async def test_webhook_tink_signature_verification_with_batched_body():
     }
 
     verifier = WebhookSignatureVerifier(
-        "https://keys.test/keyset",
+        KEYSET_URL,
         httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: httpx.Response(200, json=keyset))
         ),
@@ -103,7 +106,7 @@ async def test_unknown_cached_webhook_key_forces_rotation_refresh():
         return httpx.Response(200, json={"key": []} if calls == 1 else rotated)
 
     verifier = WebhookSignatureVerifier(
-        "https://keys.test/keyset",
+        KEYSET_URL,
         httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     await verifier._get_keyset()
@@ -114,3 +117,24 @@ async def test_unknown_cached_webhook_key_forces_rotation_refresh():
     await verifier.verify(body, base64.b64encode(signed).decode())
 
     assert calls == 2
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://keys.example.com/keyset.json",
+        "http://www.gstatic.com/googlehealthapi/webhooks/webhooks_public_keyset.json",
+        "https://www.gstatic.com.example.com/keyset.json",
+        "https://www.gstatic.com@example.com/keyset.json",
+    ],
+)
+def test_keyset_url_must_be_pinned_to_google_static_host(url):
+    with pytest.raises(ValueError, match="gstatic"):
+        Settings(google_health_webhook_public_key_url=url, _env_file=None)
+    with pytest.raises(ValueError, match="gstatic"):
+        WebhookSignatureVerifier(url)
+
+
+def test_default_keyset_url_is_accepted():
+    settings = Settings(_env_file=None)
+    assert settings.google_health_webhook_public_key_url == KEYSET_URL

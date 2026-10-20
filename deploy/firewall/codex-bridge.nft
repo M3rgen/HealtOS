@@ -1,0 +1,26 @@
+#!/usr/sbin/nft -f
+# Allow the Umay/Codex bridge port (8766) only from loopback and Docker bridges.
+#
+# The app container reaches the bridge through host.docker.internal (host-gateway,
+# i.e. the docker0 address). Compose networks use their own br-<id> bridges, so
+# both docker0 and br-* are allowed. Everything else (LAN, VPN, tunnels) is dropped.
+#
+# Install on the Docker host:
+#   sudo install -m 644 deploy/firewall/codex-bridge.nft /etc/nftables.d/healthos-codex-bridge.nft
+#   sudo nft -f /etc/nftables.d/healthos-codex-bridge.nft
+#   # persist: add `include "/etc/nftables.d/*.nft"` to /etc/nftables.conf
+#   sudo nft list table inet healthos_codex_bridge
+#
+# A separate table with policy accept only adds the drop below; it does not
+# change any other rule set on the host.
+table inet healthos_codex_bridge
+delete table inet healthos_codex_bridge
+table inet healthos_codex_bridge {
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		tcp dport 8766 iifname "lo" accept
+		tcp dport 8766 iifname "docker0" accept
+		tcp dport 8766 iifname "br-*" accept
+		tcp dport 8766 counter drop
+	}
+}

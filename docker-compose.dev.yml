@@ -2,3 +2,8 @@ services:
   postgres:
     ports:
       - "127.0.0.1:5432:5432"
+
+  app:
+    environment:
+      # Local development only: skips the production secret guard.
+      APP_ENV: development

@@ -1,10 +1,17 @@
-"""Start an authenticated, detached Windows Codex app-server for the local site.
+"""Start an authenticated, detached Codex app-server for the local site.
 
 Uses the installed Codex CLI and ChatGPT login. No API key is required.
-Run again after a Windows restart; an existing healthy bridge is reused.
+Run again after a restart; an existing healthy bridge is reused.
+
+The bridge never listens on all interfaces. CODEX_BRIDGE_BIND_HOST picks the
+address; the default is the docker0 gateway on Linux Docker Engine (the address
+`host.docker.internal:host-gateway` resolves to inside the app container) and
+127.0.0.1 elsewhere (Docker Desktop forwards host.docker.internal to loopback).
+Firewall example for a Linux host: deploy/firewall/.
 """
 
 import asyncio
+import ipaddress
 import json
 import os
 import secrets
@@ -15,6 +22,57 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PORT = 8766
+
+
+def docker0_address():
+    """IPv4 of the default Docker bridge on Linux, or None."""
+    if not sys.platform.startswith("linux") or not shutil.which("ip"):
+        return None
+    result = subprocess.run(
+        ["ip", "-4", "-o", "addr", "show", "dev", "docker0"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for field in result.stdout.split():
+        if "/" in field:
+            try:
+                return str(ipaddress.IPv4Interface(field).ip)
+            except ValueError:
+                continue
+    return None
+
+
+def env_file_value(name):
+    path = ROOT / ".env"
+    if not path.exists():
+        return ""
+    values = [
+        value.strip().strip("\"'")
+        for key, _, value in (line.partition("=") for line in path.read_text("utf-8").splitlines())
+        if key.strip() == name
+    ]
+    return values[-1] if values else ""
+
+
+def bind_host():
+    host = (
+        os.environ.get("CODEX_BRIDGE_BIND_HOST", "").strip()
+        or env_file_value("CODEX_BRIDGE_BIND_HOST")
+        or docker0_address()
+        or "127.0.0.1"
+    )
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError as exc:
+        raise SystemExit(f"CODEX_BRIDGE_BIND_HOST bir IP adresi olmalı: {host!r}") from exc
+    if address.is_unspecified:
+        raise SystemExit(
+            "Köprü tüm arayüzlerde dinleyemez; CODEX_BRIDGE_BIND_HOST için 127.0.0.1 "
+            "ya da docker0 adresini kullan."
+        )
+    return f"[{address}]" if address.version == 6 else str(address)
 
 
 def update_env(token):
@@ -22,7 +80,7 @@ def update_env(token):
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     replacements = {
         "CODEX_BRIDGE_TOKEN": token,
-        "CODEX_BRIDGE_URL": "ws://host.docker.internal:8766",
+        "CODEX_BRIDGE_URL": f"ws://host.docker.internal:{PORT}",
     }
     lines = [line for line in lines if line.partition("=")[0] not in replacements]
     path.write_text(
@@ -31,12 +89,12 @@ def update_env(token):
     )
 
 
-async def healthy(token):
+async def healthy(token, host):
     from websockets.asyncio.client import connect
 
     try:
         async with connect(
-            "ws://127.0.0.1:8766",
+            f"ws://{host}:{PORT}",
             open_timeout=2,
             additional_headers={"Authorization": f"Bearer {token}"},
         ) as ws:
@@ -60,14 +118,21 @@ async def healthy(token):
 
 
 def main():
+    host = bind_host()
     source_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     bridge_home = source_home / "healthos-bridge"
     bridge_home.mkdir(parents=True, exist_ok=True)
     token_file = bridge_home / "bridge.token"
     token = token_file.read_text().strip() if token_file.exists() else secrets.token_urlsafe(48)
-    if asyncio.run(healthy(token)):
+    if asyncio.run(healthy(token, host)):
         update_env(token)
-        print("healthOS Codex köprüsü zaten çalışıyor (port 8766).")
+        print(f"healthOS Codex köprüsü zaten çalışıyor ({host}:{PORT}).")
+        if host != "127.0.0.1" and asyncio.run(healthy(token, "127.0.0.1")):
+            print(
+                "Uyarı: köprü loopback'te de yanıt veriyor; eski bir sürüm tüm arayüzlerde "
+                f"dinliyor olabilir. {bridge_home / 'bridge.pid'} içindeki süreci durdurup "
+                "bu komutu yeniden çalıştır."
+            )
         return
     source_auth = source_home / "auth.json"
     if not source_auth.exists():
@@ -117,7 +182,7 @@ def main():
     command += [
         "app-server",
         "--listen",
-        "ws://0.0.0.0:8766",
+        f"ws://{host}:{PORT}",
         "--ws-auth",
         "capability-token",
         "--ws-token-file",
@@ -137,10 +202,10 @@ def main():
             start_new_session=os.name != "nt",
         )
     for _ in range(15):
-        if asyncio.run(healthy(token)):
+        if asyncio.run(healthy(token, host)):
             update_env(token)
             (bridge_home / "bridge.pid").write_text(str(process.pid), encoding="utf-8")
-            print("healthOS Codex köprüsü başlatıldı (port 8766, ChatGPT aboneliği).")
+            print(f"healthOS Codex köprüsü başlatıldı ({host}:{PORT}, ChatGPT aboneliği).")
             print("Siteyi güncelle: docker compose up -d --build app")
             print(f"Tanılama günlüğü: {bridge_home / 'bridge.log'}")
             return
