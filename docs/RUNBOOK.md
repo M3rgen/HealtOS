@@ -168,6 +168,68 @@ other events, timing, level, columns or `WHEN` than migration 0011 created, e.g.
 an *unexpected trigger on a guarded table* or a *changed* function means the schema was altered by
 hand: restore from a backup rather than patching it.
 
+### `20261021_0012` (record identity, superseded duplicates)
+
+Adds `raw_health_data_identity` (v2 identity key → raw row) and `raw_health_data_supersessions`
+(duplicate row → the row holding its record now), both append-only with `ENABLE ALWAYS` guards,
+and replaces the `analytics_*` views so they skip superseded rows (see
+[Record identity](REFERENCE.md#record-identity)). It copies no rows: two empty tables, triggers and
+view definitions; measured 0.02 s on a synthetic 515,151-row `raw_health_data` (PostgreSQL 16).
+The foreign keys need a SHARE ROW EXCLUSIVE lock on `raw_health_data`, which a running `pg_dump`
+does **not** block (tested), but a writing transaction does: with the app container restarting
+nothing else should write, but stop a CLI `backfill`/`import-versions` first. The upgrade sets
+`lock_timeout = 30s` and otherwise fails with `20261021_0012 could not lock its tables within 30s`,
+changing nothing.
+
+From this revision on, records without a Google id are written onto the row that holds their
+identity, so a device rename or an interval that grows no longer creates rows; deletion marking
+compares identities, so the old rows are not marked either. Rows that were duplicated before the
+deploy (on 21 Oct about 17,000 rows, most of them heart rate, then heart-rate zones, activity
+level, energy, swim lengths, sedentary periods, steps and distance) are linked by
+`health-mirror identity-backfill`, which also writes the aliases of every existing row. Run it
+right after the deploy; until it has run the dashboard still counts those duplicates (nothing is
+lost or wrongly marked meanwhile).
+Order: **backup → deploy → dry run → review → backfill → verify**.
+
+```sh
+make backup
+docker compose exec app alembic current          # expect 20261020_0011
+git pull --ff-only
+docker compose up -d --build
+docker compose exec app alembic current          # expect 20261021_0012 (head)
+df -h /var/lib/docker                            # the aliases need ~2 GB (≈ 310 bytes per row)
+docker compose exec -T app health-mirror identity-backfill --dry-run > /tmp/identity-dry.json
+```
+
+Review the dry run before writing anything: per data type, `linked` counts superseded rows by
+reason (`display-name-change`, `package-suffix-change`, `interval-shape-change`,
+`growing-interval`, …) and should be in the order of the numbers above; `distinct_sources` (sources
+returned together, kept apart) and `alias_elsewhere` should be 0, `deletions_kept` is the number of
+genuinely deleted records that stay marked (a handful), `superseded_marked` the old rows
+that carried a deletion mark (those marks stay, as history). Then:
+
+```sh
+docker compose exec -T app health-mirror identity-backfill > /tmp/identity.json
+docker compose exec app health-mirror verify     # exit 0: guards incl. the new tables, aliases match
+api /health
+```
+
+Duration: on a synthetic archive of 515,151 rows (PostgreSQL 16, developer laptop) the dry run took
+10 s, the backfill 26 s and a repeated run 18 s; the 5.8 million rows of production are therefore
+about 2 minutes (dry run) and 5 minutes (backfill) at that speed. Plan for 10–30 minutes on the
+2-vCPU VM: the work is one Python core plus index inserts. The app keeps running meanwhile (the
+command only reads `raw_health_data` and commits every batch of 5,000 rows, each with
+`statement_timeout` 120 s). It prints its progress per batch on stderr. It is idempotent: if it is
+interrupted (or a batch times out), run it again, or resume where it stopped with the
+`--data-type ... --after ...` that the last progress line names, then once more without them.
+`--batch-size` (default 5,000) and `--statement-timeout` tune it.
+
+Rolling back the application: as for 0011, never downgrade the schema (`alembic downgrade
+20261020_0011` refuses while the new tables hold rows; `-x allow-identity-loss=1` would drop the
+links, never on the live archive). The previous image runs against the 0012 schema with the
+no-migrate override above; it ignores aliases and links, so its dashboard counts the duplicates
+again and new renames would duplicate again until you roll forward.
+
 ## Import payload versions from archive dumps
 
 Payload versions overwritten before `20261020_0011` survive only in older dumps. Import them one

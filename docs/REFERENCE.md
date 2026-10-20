@@ -12,7 +12,10 @@ A fully self-hosted, subscription-free, read-only archive of health and fitness 
 - Every HTTP response body Google sends is kept byte for byte in `raw_api_responses`, and every
   record parsed from it in `raw_health_data`; unknown fields are never dropped from the archive
   (see [What is preserved where](#what-is-preserved-where)).
-- A Google resource name is the primary source identifier. Where a response lacks one, a deterministic identity is derived from type, time coordinates, and data source.
+- A Google resource name is the primary source identifier. Where a response lacks one, a
+  deterministic identity is derived from type, physical time, discriminators and the stable
+  data-source fields, so a renamed device or a reshaped interval is still the same record (see
+  [Record identity](#record-identity)).
 - Payload hashes distinguish unchanged records from source corrections. A correction never
   overwrites the old payload: every version is kept in `raw_health_data_versions` (see
   [Raw record versions](#raw-record-versions)).
@@ -417,6 +420,85 @@ never marked.
 - A record whose time was moved upstream out of the window that is re-fetched looks deleted from
   that window and is marked until a fetch covering its new time returns it again (and unmarks it).
   For a move of more than 7 days that is the weekly 90-day reconciliation.
+- "Not returned" is decided per [record identity](#record-identity), not per row: a row that was
+  archived under an older id of a record (before a device rename, a package suffix change, a
+  grown interval) is not marked while the row holding that record's identity was returned by
+  the same fetch. This holds before, during and after `health-mirror identity-backfill`.
+
+## Record identity
+
+Records with a Google `name` are identified by it. Most data types (heart rate, steps, zones,
+activity level, intervals, daily summaries, rollups) arrive without one; until migration
+`20261021_0012` they were keyed by a hash of the raw `interval`/`sampleTime`/`date` object, the
+zone fields, the **whole** `dataSource` and the top-level start/end (v1, `synthetic:<hash>`). Each
+of these upstream changes therefore made the same record a new row: Google renaming a device
+(`dataSource.device.displayName`), Apple Health dropping the `.<UUID>` suffix of its package name,
+Google adding civil times and UTC offsets inside `interval`, and a sedentary period whose end grows
+every 15 minutes while its start stays.
+
+The **v2 identity** (`app/parsers/identity.py`) hashes only:
+
+- the data type;
+- the physical UTC start and end (intervals; rollups: their top-level window) or the instant
+  (samples; daily records: their civil date), as parsed, never the raw time objects, so civil
+  times and offsets do not count;
+- for **growing intervals** the start alone. In the archive only `sedentary-period` behaves like
+  that (checked on 21 Oct: no other type has two records with the same start, source and
+  discriminators but different ends; sleep and exercise carry Google ids);
+- the discriminators `heartRateZone`, `heartRateZoneType`, `activityLevelType`,
+  `measurementLocation`, `measurementMethod`, `swimStrokeType`;
+- the stable source fields `platform`, `recordingMethod`, `device.formFactor`,
+  `device.manufacturer` and `application.packageName` without a trailing `.<UUID>`.
+
+Left out (but kept in the record's *fingerprint*): `displayName` and every other `dataSource`
+field, and a growing interval's end. The value never belongs to the identity; a changed value of
+the same identity is a new [version](#raw-record-versions) of the same row.
+
+**Distinct sources are not merged.** Fitbit sends no serial number, only `displayName`, so two
+devices recording at the same instant share a v2 key. Records with the same key and different
+fingerprints are kept apart when they were seen *together*: in the same page, or while the stored
+row with the other fingerprint was last seen less than 2 minutes earlier (another page of the same
+fetch); for archived rows, when their sightings (`first_seen_at` … `last_seen_at`) overlap. Such a
+record falls back to its **specific key** (v2 key plus fingerprint) and keeps a row of its own. A
+rename is the opposite case: the new form appears only after the old one stopped appearing (on 19
+Oct the old device name was last seen six hours before the new one first appeared).
+
+**Aliases.** A raw row's `google_data_point_id` never changes (trigger), so existing rows are not
+re-keyed. `raw_health_data_identity (data_type, identity_key → raw_id, google_data_point_id,
+created_at)` points each identity at the row that holds it. `store_records` resolves a record
+without a Google id in this order: its specific key's alias, its v2 key's alias (unless that row
+is a distinct source), a stored row with the same identity found among the rows with the same
+`source_start_time` (its v1 row first), otherwise a new row `synthetic:v2:<hash>` (or
+`synthetic:v2s:<hash>` for a distinct source); new aliases are written in the same transaction.
+The record is then written onto that row with the usual UPSERT: a changed payload (new device
+name, new package, longer interval) becomes a new version of that row, the trigger keeps the old
+one, and nothing is deleted or re-keyed.
+
+**Supersession.** Duplicates archived before v2 remain rows of their own. `health-mirror
+identity-backfill` links each of them to the row that holds the record now in
+`raw_health_data_supersessions (old_raw_id → new_raw_id, data_type, both keys, reason,
+created_at)`, with the reason `display-name-change`, `package-suffix-change`, `source-change`,
+`interval-shape-change`, `growing-interval` or `duplicate`, and appends an `identity-merged`
+event for the superseded row. A superseded row is **history, not data**: its payload, versions,
+`source_deleted_at` and events stay exactly as they were, but dashboards, Umay, the `analytics_*`
+views and the normalized-table readers skip it, as they skip a source deletion, so a record is
+counted once. Old deletion marks are not cleared: they truthfully say that the row's form of the
+record stopped being returned on that date; the record itself lives on in the successor row.
+A marked row whose identity has no other row is a genuine deletion and is never linked.
+
+Both tables are append-only (no `UPDATE`, `DELETE` or `TRUNCATE`, `ENABLE ALWAYS` triggers;
+`health-mirror verify` checks them with the other guards, and that every alias and link matches the
+rows it names).
+
+```sql
+-- Bağlanan kopyalar (superseded duplicates) per data type and reason
+SELECT data_type, reason, count(*) FROM raw_health_data_supersessions GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- Bir kopyanın yerine geçen kayıt (the row that holds a duplicate's record now)
+SELECT s.reason, n.google_data_point_id, n.raw_json
+FROM raw_health_data_supersessions s JOIN raw_health_data n ON n.id = s.new_raw_id
+WHERE s.old_google_data_point_id = 'synthetic:…';
+```
 
 ## Raw record versions
 
@@ -543,7 +625,9 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 | Exact HTTP response bodies from the Google Health API | `raw_api_responses` | append-only (no `UPDATE`/`DELETE`/`TRUNCATE`); SHA-256 checked by `verify` |
 | Current payload of every record | `raw_health_data` | no `DELETE`/`TRUNCATE`/identity change; a changed payload (hash or text) is kept as a version first |
 | Every earlier payload | `raw_health_data_versions` | append-only (renumbering only during an archive import) |
-| Source-deletion marks set and cleared | `raw_health_data_events` | append-only, written by trigger |
+| Source-deletion marks set and cleared, identity merges | `raw_health_data_events` | append-only, written by trigger (merges by `identity-backfill`) |
+| Record identities (v2 key → row) | `raw_health_data_identity` | append-only (no `UPDATE`/`DELETE`/`TRUNCATE`) |
+| Duplicate row → row holding its record | `raw_health_data_supersessions` | append-only; the superseded row itself is unchanged |
 | Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
 | Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only |
 | Manual measurements and workouts | `manual_measurements`, `manual_workouts` | append-only: the UI only adds entries; a correction is a new entry (for the same measurement time the newest entry wins) |
@@ -605,7 +689,9 @@ trigger, to **`raw_health_data_events`**: `source-deleted` (marked, with the mar
 an archive import restores a record as deleted) and `source-returned` (with the fetch that saw it
 again and `previous_deleted_at`, the mark being cleared). A record that disappears and comes back
 therefore keeps its whole timeline; `health-mirror history` lists the events next to the
-versions.
+versions. `identity-merged` is appended (by `health-mirror identity-backfill`, not by a trigger)
+when a duplicate row is linked to the row that holds its record now (see
+[Record identity](#record-identity)); it changes nothing on the row.
 
 ### Write paths (audit)
 
@@ -614,7 +700,9 @@ above, and why it is allowed:
 
 | Write | Table | Verdict |
 |---|---|---|
-| `store_records` UPSERT (`app/services/storage.py`) | `raw_health_data` | payload change → kept as a version by trigger first; `last_seen_at`, `source_deleted_at` → `NULL` (logged as an event), `payload_received_at`/`payload_source`/`response_id` change only with the payload; derived `source_*_time`/`source_timezone` |
+| `store_records` UPSERT (`app/services/storage.py`) | `raw_health_data` | onto the row that holds the record's identity (never re-keyed); payload change → kept as a version by trigger first; `last_seen_at`, `source_deleted_at` → `NULL` (logged as an event), `payload_received_at`/`payload_source`/`response_id` change only with the payload; derived `source_*_time`/`source_timezone` |
+| `store_records` aliases (`app/services/identity.py`) | `raw_health_data_identity` | `INSERT ... ON CONFLICT DO NOTHING` only |
+| `identity-backfill` (`app/services/identity_backfill.py`) | `raw_health_data_identity`, `raw_health_data_supersessions`, `raw_health_data_events` | inserts only; `raw_health_data` is only read |
 | `mark_source_deletions` (`app/sync/deletions.py`) | `raw_health_data` | sets `source_deleted_at` only (logged as an event); nothing deleted |
 | import-restored row takes a newer dump payload (`app/services/raw_history.py`) | `raw_health_data` | only rows the import itself created; the old payload is kept as a version by trigger |
 | version renumbering (`import-versions`) | `raw_health_data_versions` | `version` only, in a transaction with `healthos.renumber = '1'` |
@@ -635,6 +723,15 @@ Normalized tables (`heart_rate`, `steps`, `sleep_sessions`, `scalar_metrics`, �
 `analytics_*` views are **derived** from the current raw payloads and can be rebuilt from
 `raw_health_data` at any time, so their UPSERTs overwrite in place and that is acceptable: no
 received data lives only there.
+
+A normalized row carries the key of its raw row, so a duplicate raw row has a duplicate normalized
+row. Those rows are not deleted, flagged or rewritten: whether a row counts is decided in one
+place, `raw_health_data_supersessions`, and every reader applies it (the dashboard's source
+filters, the workout list, the history bounds, Umay's archive tool and, on PostgreSQL, the
+`analytics_*` views, which add `NOT EXISTS` on the supersession table). A rebuild of the
+normalized tables from `raw_health_data` therefore gives the same counts, and nothing has to be kept
+in sync. A renamed record written after `20261021_0012` updates its existing normalized row (same
+key), so no new duplicate appears.
 
 ## Webhooks
 
@@ -918,7 +1015,8 @@ recalculates every raw payload hash and every history payload hash, checks that 
 exactly one current row, that its version numbers run 1..n without gaps, that history rows match
 their record's key, and that no version repeats its neighbour's payload, and reports sync errors.
 It then recomputes the SHA-256 of every stored Google response body and of every signed webhook
-body, and checks that every `response_id` points to a stored response. It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
+body, and checks that every `response_id` points to a stored response, and that every identity
+alias and supersession link matches the rows it names (same data type and key, no cycle). It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
 
 ## Troubleshooting
 
@@ -936,7 +1034,8 @@ body, and checks that every `response_id` points to a stored response. It exits 
 Connect read-only analytics tools to the `analytics_*` views, such as
 `analytics_heart_rate`, `analytics_sleep_sessions`, `analytics_energy_expenditure`, and
 `analytics_scalar_metrics`. These views expose the normalized tables while automatically excluding
-records explicitly marked `is_quarantined`. The underlying normalized tables remain available for
+records explicitly marked `is_quarantined` and, since `20261021_0012` (PostgreSQL), rows of
+[superseded duplicates](#record-identity). They do not hide source-deleted records. The underlying normalized tables remain available for
 auditing, and the raw JSON remains available for future Pandas/Jupyter, SQL, Grafana, n8n, or
 local-agent pipelines. The archive itself has no AI layer; the optional Umay chat reads it only
 on request.
