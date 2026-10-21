@@ -577,9 +577,10 @@ async def resolve_ids(
     await stored.load_links(stored.rows, revivable())
     page = _Page(stored.rows, chains)
 
-    # A record whose v2s row is not a counted root may have spare rows (one was made each
-    # time its rows were hidden behind another value): found by id, in blocks (spare ids are
-    # taken in order, so the first block with a free one is the last).
+    # A record whose v2s row cannot take it (not a root, or hidden behind another value) may
+    # have spare rows (one was made each time its rows were hidden behind another value):
+    # found by id, in blocks (spare ids are taken in order, so the first block with a free
+    # one is the last).
     pending = []
     for name, group in groups.items():
         taken = stored.by_id.get(new_record_id(group.identity.specific_key))
@@ -588,7 +589,7 @@ async def resolve_ids(
             row.identity is None
             or (row.identity.key, row.identity.source) != name
             or row.same_source_link()
-            or page.hidden(row)
+            or not page.fits(row, group)
         ):
             pending.append(group)
     attempt = 1
@@ -1337,9 +1338,15 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
             notes.append(
                 "index ix_raw_health_data_source_deleted is "
                 f"{'missing' if valid is None else 'invalid'} (the analytics views are slower "
-                "without it): build it with REINDEX INDEX CONCURRENTLY "
-                "ix_raw_health_data_source_deleted, or CREATE INDEX CONCURRENTLY as migration "
-                "20261021_0012 does (docs/RUNBOOK.md)"
+                "without it): build it with "
+                + (
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_raw_health_data_source_deleted "
+                    "ON raw_health_data (data_type, google_data_point_id) WHERE "
+                    "source_deleted_at IS NOT NULL"
+                    if valid is None
+                    else "REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted"
+                )
+                + " (docs/RUNBOOK.md)"
             )
     return count, errors, notes
 

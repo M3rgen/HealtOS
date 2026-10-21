@@ -292,6 +292,12 @@ def test_0012_runs_next_to_a_dump_and_gives_up_on_a_writer(
         alembic_config.cmd_opts = Namespace(x=["lock-timeout=1s"])
         with pytest.raises(RuntimeError, match="0012 could not lock its tables within 1s"):
             command.upgrade(alembic_config, "head")
+        # Nothing was changed: not even the concurrently built index was started.
+        with engine.connect() as connection:
+            assert not connection.scalar(
+                text("SELECT count(*) FROM pg_class WHERE relname = :name"),
+                {"name": "ix_raw_health_data_source_deleted"},
+            )
         blocker.rollback()
         alembic_config.cmd_opts = None
         monkeypatch.delenv("PGOPTIONS")

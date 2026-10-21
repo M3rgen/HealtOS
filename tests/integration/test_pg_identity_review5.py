@@ -52,25 +52,32 @@ def test_the_deleted_index_is_built_concurrently_and_never_blocks_a_writer(
 ) -> None:
     """0012 built the partial index inside the transaction that holds the foreign keys'
     lock: at millions of rows a writer waited. It is built CONCURRENTLY first, outside the
-    transaction: a writer inserting meanwhile is not blocked; a snapshot held as long as a
-    dump (REPEATABLE READ) makes it give up after the lock timeout, the upgrade goes on, verify
-    names the index, and a later upgrade step (or REINDEX CONCURRENTLY) builds it."""
+    transaction: a writer inserting meanwhile is not blocked; next to a snapshot held as long
+    as a dump's (REPEATABLE READ) it is not started (nothing invalid is left behind), the
+    upgrade goes on, verify names the index and the statement builds it later."""
     command.upgrade(alembic_config, "20261020_0011")
     engine = create_engine(_sync_url(database_url))
     try:
         dump = engine.connect().execution_options(isolation_level="REPEATABLE READ")
         dump.execute(text("SELECT count(*) FROM raw_health_data"))  # holds its snapshot
+        time.sleep(5.5)  # open for a while, like a dump
         alembic_config.cmd_opts = Namespace(x=["lock-timeout=1s"])
         started = time.monotonic()
         command.upgrade(alembic_config, "head")
         assert time.monotonic() - started < 20
         dump.rollback()
         dump.close()
-        assert _index_valid(engine) is not True
+        assert _index_valid(engine) is None
         notes = asyncio.run(_verify_notes(database_url))
         assert any("ix_raw_health_data_source_deleted is" in note for note in notes)
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-            connection.execute(text("REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted"))
+            connection.execute(
+                text(
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_raw_health_data_source_deleted "
+                    "ON raw_health_data (data_type, google_data_point_id) "
+                    "WHERE source_deleted_at IS NOT NULL"
+                )
+            )
         assert _index_valid(engine) is True
         command.downgrade(alembic_config, "20261020_0011")
         # Without a dump, and with a writer inserting all along: built, valid, writer unblocked.

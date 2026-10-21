@@ -298,8 +298,10 @@ def upgrade() -> None:
         raise RuntimeError(
             f"20261021_0012 could not lock its tables within {timeout}: another session holds "
             "them (a long sync, backfill or import transaction writing raw_health_data). "
-            "Nothing was changed and the database is still on 20261020_0011; stop the app or "
-            "retry when that session has finished (see docs/RUNBOOK.md, 20261021_0012)."
+            "Nothing was changed and the database is still on 20261020_0011 (a partial index "
+            f"{DELETED_INDEX} built before may remain; it changes no data, and the next "
+            "upgrade checks it); stop the app or retry when that session has finished (see "
+            "docs/RUNBOOK.md, 20261021_0012)."
         ) from exc
     op.execute("SET LOCAL lock_timeout TO DEFAULT")
 
@@ -563,11 +565,13 @@ def _upgrade(dialect: str) -> None:
 
 def _deleted_index(timeout: str) -> None:
     """The partial index of source-deleted rows, built ``CONCURRENTLY`` (writers are never
-    blocked, however large the table) in its own non-transactional step. It waits for
-    transactions that write the table, or hold an older snapshot (a running ``pg_dump``), at
-    most ``timeout``: then it is left for later (``health-mirror verify`` names it and the
-    statement that builds it), since it only makes the ``analytics_*`` views faster. An index
-    left invalid by an interrupted build is built again (``REINDEX ... CONCURRENTLY``)."""
+    blocked, however large the table) in its own non-transactional step. When another
+    session is writing, or has held a snapshot open for a while (a running ``pg_dump``),
+    the build would wait for it: it is not started, and left for later (``health-mirror
+    verify`` names it and the statement that builds it), since it only makes the
+    ``analytics_*`` views faster. A build that still has to wait gives up after
+    ``timeout``; an index left invalid by an interrupted build is built again by the next
+    upgrade (``REINDEX ... CONCURRENTLY``)."""
     build = (
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {DELETED_INDEX} ON raw_health_data "
         "(data_type, google_data_point_id) WHERE source_deleted_at IS NOT NULL"
@@ -577,6 +581,27 @@ def _deleted_index(timeout: str) -> None:
             op.execute(build)
             return
         bind = op.get_bind()
+        # A build that would have to wait (for a writing transaction, or a snapshot open for
+        # a while such as a running dump's) is not started at all: interrupted, it would
+        # leave an invalid index. A short read is waited for.
+        busy = bind.scalar(
+            sa.text(
+                "SELECT count(*) FROM pg_stat_activity a WHERE a.pid <> pg_backend_pid() "
+                "AND a.datname = current_database() "
+                "AND (a.backend_xid IS NOT NULL OR (a.backend_xmin IS NOT NULL "
+                "AND a.xact_start < clock_timestamp() - interval '5 seconds') "
+                "OR EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid "
+                "AND l.relation = 'raw_health_data'::regclass AND l.mode <> 'AccessShareLock'))"
+            )
+        )
+        if busy:
+            print(
+                f"20261021_0012: {DELETED_INDEX} is left for later ({busy} other session(s) "
+                "write, or hold a snapshot open for a while such as a dump's; building it "
+                "now would wait for them). The upgrade goes on without it; build it later with "
+                f"{build} (docs/RUNBOOK.md)."
+            )
+            return
         bind.execute(sa.text(f"SET lock_timeout = '{timeout}'"))
         try:
             bind.execute(sa.text(build))

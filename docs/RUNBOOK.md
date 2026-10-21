@@ -183,12 +183,14 @@ source-deleted rows). It replaces the `analytics_*` views so they count what the
 (no source-deleted rows, no rows superseded by a live row through a link in force). See
 [Record identity](REFERENCE.md#record-identity). It copies no rows and alters no existing table.
 The partial index of source-deleted rows is built first, `CONCURRENTLY` and outside any
-transaction: writers are never blocked by it, however large the table. It waits for writing
-transactions and for older snapshots (a running `pg_dump`) at most the lock timeout; when it cannot
-finish then, the upgrade prints `ix_raw_health_data_source_deleted could not be built within 30s`
-and goes on without it (the `analytics_*` views are only slower), and `health-mirror verify` notes
-it until you build it after the backup with
-`REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted` (an upgrade run again also does).
+transaction: writers are never blocked by it, however large the table. It is not started while
+another session is writing or has held a snapshot open for a while (a running `pg_dump`), since
+it would have to wait for them: the upgrade then prints `ix_raw_health_data_source_deleted is left
+for later` with the statement that builds it, and goes on without it (the `analytics_*` views
+are only slower); `health-mirror verify` notes it until you run that statement
+(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`, also with the app running) after the backup. A
+build that still had to wait gives up after the lock timeout, and an index it left invalid is
+built again by `REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted`.
 The foreign keys need a SHARE ROW EXCLUSIVE lock on `raw_health_data`, which a running `pg_dump`
 does **not** block (tested), but a writing transaction does: with the app container restarting
 nothing else should write, but stop a CLI `backfill`/`import-versions` first. The upgrade sets
