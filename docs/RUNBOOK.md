@@ -181,26 +181,34 @@ duplicates by), all append-only with `ENABLE ALWAYS` guards; `raw_source_sightin
 `identity_reconcile_state` and `fetch_rounds`; and one partial index on `raw_health_data` (its
 source-deleted rows). It replaces the `analytics_*` views so they count what the dashboard counts
 (no source-deleted rows, no rows superseded by a live row through a link in force). See
-[Record identity](REFERENCE.md#record-identity). It copies no rows and alters no existing table;
-the partial index reads `raw_health_data` once (measured 0.3 s for 1.4 million rows on a developer
-laptop, PostgreSQL 16; expect seconds for several million). The foreign keys and the index need a
-SHARE ROW EXCLUSIVE lock on `raw_health_data`, which a running `pg_dump` does **not** block
-(tested), but a writing transaction does: with the app container restarting nothing else should
-write, but stop a CLI `backfill`/`import-versions` first. The upgrade sets `lock_timeout = 30s` and
-otherwise fails with `20261021_0012 could not lock its tables within 30s`, changing nothing.
+[Record identity](REFERENCE.md#record-identity). It copies no rows and alters no existing table.
+The partial index of source-deleted rows is built first, `CONCURRENTLY` and outside any
+transaction: writers are never blocked by it, however large the table. It waits for writing
+transactions and for older snapshots (a running `pg_dump`) at most the lock timeout; when it cannot
+finish then, the upgrade prints `ix_raw_health_data_source_deleted could not be built within 30s`
+and goes on without it (the `analytics_*` views are only slower), and `health-mirror verify` notes
+it until you build it after the backup with
+`REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted` (an upgrade run again also does).
+The foreign keys need a SHARE ROW EXCLUSIVE lock on `raw_health_data`, which a running `pg_dump`
+does **not** block (tested), but a writing transaction does: with the app container restarting
+nothing else should write, but stop a CLI `backfill`/`import-versions` first. The upgrade sets
+`lock_timeout = 30s` and otherwise fails with `20261021_0012 could not lock its tables within 30s`,
+changing nothing.
 
 **The model.** The live write path never decides that two `dataSource` forms are one renamed
-device. A record of a known fingerprint goes onto that fingerprint's row (a changed payload is a
-version); along a decided chain, onto the row of the device that holds the same reading; any
-other fingerprint gets rows of its own (`synthetic:v2s:…`). So a rename that happens is **counted
-twice** (both rows visible) until the reconciler links the rows, and a genuinely distinct device
-is never hidden. Nothing Google currently returns is ever hidden: a superseded row counts again
-when the row holding it is marked deleted, and a returned value that differs from the device's
-row gets a row of its own. A complete fetch does not mark the old form's rows as deleted while
-the new form returns the same records with the same values (the mark is deferred, never
-guessed). A duplicate is hidden only while the two sources it was linked across are one device:
-rejecting a wrong chain (or deciding two sources distinct) counts both sides again at once, and
-the opposite decision undoes that. The **reconciler** (`health-mirror identity-backfill`) decides
+device, and it writes a record only onto a row of **its own** fingerprint (a changed payload is a
+version): no row ever holds another source's payload. A record of a fingerprint joined to another
+by a decided chain gets a row of its own that is linked at once to the device's row showing the
+same reading (counted once); any other fingerprint gets rows of its own (`synthetic:v2s:…`). So a
+rename nobody decided yet is **counted twice** (both rows visible) until the reconciler links the
+rows, and a genuinely distinct device is never hidden. Nothing Google currently returns is ever
+hidden: a superseded row counts again when the row holding it is marked deleted, and a returned
+value that differs from what the row hiding its own shows gets a row of its own. A complete fetch
+does not mark a row as deleted while another source that may be its device renamed returns the
+same reading (the mark is deferred, never guessed, and listed under `identity_deferred_deletions`
+in `status`). A duplicate is hidden only while the two sources it was linked across are one device:
+rejecting a wrong chain (or deciding two sources distinct) counts both sides again at once, each
+device once, and the opposite decision undoes that exactly. The **reconciler** (`health-mirror identity-backfill`) decides
 chains only when every
 fingerprint's whole sighting history leaves no doubt, and links the duplicates; it runs once in
 full after the deploy and then **nightly** at 02:30 UTC as the scheduler job `identity-reconcile`
@@ -259,13 +267,21 @@ Review the dry run before writing anything. Per data type:
   two fetches, the later one with records newer than the first (two devices recording side by
   side: your second watch belongs here, against both names of the band), or you decided them
   distinct; `false` when nothing decided them (see `ambiguous`).
-- `review_distinct`: pairs established distinct by that evidence alone although one source began
-  as the other ended, which looks like a rename. Nothing is merged and no deletion is marked
-  because of them; confirm with `identity-decide distinct`, or, if it was a rename, decide
-  `not-distinct` and `link`.
+- `review_distinct`: pairs established distinct by that evidence alone although it looks like a
+  rename: one source began as the other ended (and no form of one was worn alongside a form of the
+  other for more than a day), or most records both hold came back with the same reading (Google
+  reprocessed old records under the new name, a few with other values). Nothing is merged and no
+  deletion is marked because of them; confirm with `identity-decide distinct`, or, if it was a
+  rename, decide `not-distinct` and `link`.
+- `deferred_deletions`: rows the last complete fetches did not mark because another source, that
+  may be their device renamed, returned the same reading (`rows_of`, `returned_by`, how many).
+  Decide that pair: `distinct` (two devices: the next complete fetch marks them) or `not-distinct`
+  and `link` (one device: they stay, counted once).
 - `refuted`: chains whose two forms turned out to be two devices (no longer used: the rows they
-  linked count on their own again); `returned`: chains whose old form was seen again (a name
-  changed back: still one device, its records go onto the device's rows).
+  linked count on their own again); a chain in state `lapsed` was decided by the reconciler only
+  because another chain made a rival source continue elsewhere, and that chain is no longer live
+  (it is live again when that one is); `returned`: chains whose old form was seen again (a name
+  changed back: still one device, its records get rows of their own, linked to the device's).
 - `linked` (rows that would be superseded, by reason) should be in the order of the chains above;
   `superseded_marked` of those carried a deletion mark (it stays, as history); `deletions_kept`
   the deleted records with no other source at their instant (genuine deletions; expect a few per
@@ -273,8 +289,10 @@ Review the dry run before writing anything. Per data type:
   holds live (possibly a rename nobody decided: look at `ambiguous`); `kept_differing` rows of a
   chained source that measured something else than the row holding the record (kept, both
   count); `distinct_sources` the keys held by two devices; `conflicts` (rows of one device left
-  double because linking them would hide a live row behind a deleted one or close a cycle; listed
-  in `status`) should be 0; `start_mismatches` rows with a stale stored start (settled last).
+  double because linking them would close a cycle of links; listed in `status`) should be 0;
+  `start_mismatches` rows with a stale stored start (settled last); `agreement` per pair of
+  sources with evidence of two devices, how many records both hold with the same reading and how
+  many with two.
 
 Then:
 
@@ -307,23 +325,33 @@ docker compose exec app health-mirror identity-decide distinct     --data-type <
 docker compose exec app health-mirror identity-decide not-distinct --data-type <type> --from … --to …
 ```
 
-After `link`, `not-distinct` and a `confirm` that makes a rejected chain live again, the whole data
-type is settled again (like a full run's second pass; minutes for millions of rows), so the rows
-of both forms are linked where they hold the same reading. `reject` and `distinct` take effect at
-once without that pass: the links made across the two sources stop hiding anything (both count
-again in the dashboard, Umay and the `analytics_*` views; `verify` notes them as no longer in
-force), each source gets rows of its own from then on, and both are free for another chain - so
-after a wrong `link`, `reject` it and `link` the right pair. The latest decision per question
-wins, so every decision is undone by the opposite one (`link` or `confirm` after `reject` uses the
-chain again; `not-distinct` after `distinct`). A decision that would make one source continue as
-two (or close a cycle) is refused, naming the chain to reject first. A deletion left undecided
-between two sources is decided by the next complete fetch of its window after your decision
-(the daily deletion check, or a `backfill` of that window); the decision itself fetches nothing.
+Every decision settles again exactly the rows whose devices it changes: after `link`,
+`not-distinct` or a `confirm` that makes a rejected chain live again, every row written since the
+later of the two sources was first seen (rows of both forms are linked where they hold the same
+reading); after `reject` or `distinct`, every row of a link between the two sides (also rows
+archived before 20261020_0011). The links made across the two sources stop hiding anything at once
+(both count again in the dashboard, Umay and the `analytics_*` views, each device once; `verify`
+notes the links as no longer in force), and both sources are free for another chain - so after a
+wrong `link`, `reject` it and `link` the right pair. The latest decision per question wins, so
+every decision is undone by the opposite one, exactly in what is counted (`link` or `confirm`
+after `reject` uses the chain again, and a chain the reconciler decided because of it is live again
+with it; `not-distinct` after `distinct`). There is no decision that forgets one: return to "what
+the evidence says" by deciding what it says. **`distinct` has a permanent consequence**: from then
+on a row of one source whose reading comes back only under the other is marked deleted by the next
+complete fetch, and a mark is never removed by a decision (the outcome and `--dry-run` say so in
+capitals); undoing it with `not-distinct` restores what is counted, not the marks. Decide it only
+for two devices. An owner's `distinct` reaches the other forms of a device only through chains you
+linked or confirmed (a chain only the reconciler suggested may be wrong). A decision that would
+make one source continue as two (or close a cycle) is refused, naming the chain to reject first.
+A deletion left undecided between two sources is decided by the next complete fetch of its window
+after your decision (the daily deletion check, or a `backfill` of that window); the decision itself
+fetches nothing.
 
 The next morning, `health-mirror status` shows `last_mode: incremental` with a fresh
 `last_finished_at` per data type, its `last_result` with the counts and an `open` section
 (chains to review, ambiguous sources, pairs kept apart that nothing decided, pairs that look like
-a rename although evidence made them two devices, refuted chains), and the log has
+a rename although evidence made them two devices, refuted chains, deferred deletions), and
+`identity_deferred_deletions` lists the deletions waiting for a decision; the log has
 `IDENTITY_RECONCILE_COMPLETED` (and one `IDENTITY_RECONCILE_DATA_TYPE` per data type). Check
 `open` after every rename you notice; anything listed there is counted twice (never hidden) until
 you decide it. A data type that never had a full run gets its first full pass from the nightly

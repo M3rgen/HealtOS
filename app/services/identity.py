@@ -47,11 +47,9 @@ from sqlalchemy import (
     String,
     any_,
     bindparam,
-    case,
     func,
     insert,
     literal,
-    null,
     select,
     text,
     union_all,
@@ -239,67 +237,92 @@ _LIGHT = (
 class _Rows:
     """The stored rows a page needs, with their identity, reading and direct links."""
 
-    def __init__(self, session: AsyncSession, spec: DataTypeSpec, known: dict[str, tuple]):
+    def __init__(
+        self,
+        session: AsyncSession,
+        spec: DataTypeSpec,
+        known: dict[str, tuple],
+        named: dict[str, RecordIdentity],
+    ):
         self.session, self.spec, self.known = session, spec, known
+        # The record and source a row with one of these ids holds (its v2s and spare ids: a
+        # row's source never changes): a deleted one is not read whole (it hides nothing, and
+        # what it showed matters to no one).
+        self.named = named
         self.rows: dict[uuid.UUID, StoredRow] = {}
+        # v2 key -> its rows (every source).
+        self.of_key: dict[str, list[StoredRow]] = defaultdict(list)
         # google id -> raw id, alias key -> raw id (of what was looked up and found).
         self.by_id: dict[str, uuid.UUID] = {}
         self.alias: dict[str, uuid.UUID] = {}
         self.looked_up: set[str] = set()
-
-    def _payload(self, column=RawHealthData.raw_json):
-        if not self.known:
-            return column
-        return case(
-            (among(self.session, RawHealthData.payload_hash, sorted(self.known)), null()),
-            else_=column,
-        )
+        self._incomplete: set[uuid.UUID] = set()
 
     def _add(self, values: tuple) -> StoredRow:
+        """A row by its light columns; its payload is read later (``complete``) only when this
+        page does not carry the same payload and the row may matter."""
         from app.core.timeutil import as_utc
 
-        raw_id, google_id, digest, seen, deleted, quarantined, raw_json = values
+        raw_id, google_id, digest, seen, deleted, quarantined = values
         row = self.rows.get(raw_id)
         if row is not None:
             return row
         row = StoredRow(
             raw_id, google_id, digest, as_utc(seen), deleted is not None, bool(quarantined)
         )
+        self.rows[raw_id] = row
         if digest in self.known:
             row.identity, row.reading = self.known[digest][:2]
+        elif row.deleted and google_id in self.named:
+            row.identity = self.named[google_id]
         else:
-            row.identity = record_identity(self.spec, raw_json)
-            row.reading = reading(self.spec, raw_json)
-            row.raw_json = raw_json
-        self.rows[raw_id] = row
+            self._incomplete.add(raw_id)
+            return row
+        if row.identity is not None:
+            self.of_key[row.identity.key].append(row)
         return row
 
-    async def find(self, google_ids: set[str], keys: set[str]) -> None:
-        """Rows by id and by alias, in one statement per chunk; then their links."""
-        google_ids, keys = google_ids - self.looked_up, keys - self.looked_up
+    async def complete(self) -> None:
+        """Read the payloads the identities and readings still need."""
+        wanted, self._incomplete = sorted(self._incomplete), set()
+        for chunk in _chunks(wanted):
+            result = await self.session.execute(
+                select(RawHealthData.id, RawHealthData.raw_json).where(
+                    among(self.session, RawHealthData.id, chunk)
+                )
+            )
+            for raw_id, raw_json in result.tuples():
+                row = self.rows[raw_id]
+                row.identity = record_identity(self.spec, raw_json)
+                row.reading = reading(self.spec, raw_json)
+                row.raw_json = raw_json
+                if row.identity is not None:
+                    self.of_key[row.identity.key].append(row)
+
+    def holding(self, name: tuple[str, str]) -> list[StoredRow]:
+        """The rows of the record ``name`` (v2 key, fingerprint)."""
+        return [row for row in self.of_key.get(name[0], ()) if _holds(row, name)]
+
+    async def find(self, google_ids: Iterable[str], keys: Iterable[str] = ()) -> None:
+        """Rows by id and by alias, in one statement per chunk, then the payloads needed."""
+        google_ids, keys = set(google_ids) - self.looked_up, set(keys) - self.looked_up
         self.looked_up |= google_ids | keys
         ids_left, keys_left = sorted(google_ids), sorted(keys)
         table = RawHealthDataIdentity
-        added: list[uuid.UUID] = []
         while ids_left or keys_left:
             id_chunk, ids_left = ids_left[:_CHUNK], ids_left[_CHUNK:]
             key_chunk, keys_left = keys_left[:_CHUNK], keys_left[_CHUNK:]
             parts = []
             if id_chunk:
                 parts.append(
-                    select(
-                        literal("r", String),
-                        RawHealthData.google_data_point_id,
-                        *_LIGHT,
-                        self._payload(),
-                    ).where(
+                    select(literal("r", String), RawHealthData.google_data_point_id, *_LIGHT).where(
                         RawHealthData.data_type == self.spec.name,
                         among(self.session, RawHealthData.google_data_point_id, id_chunk),
                     )
                 )
             if key_chunk:
                 parts.append(
-                    select(literal("a", String), table.identity_key, *_LIGHT, self._payload())
+                    select(literal("a", String), table.identity_key, *_LIGHT)
                     .join(RawHealthData, RawHealthData.id == table.raw_id)
                     .where(
                         table.data_type == self.spec.name,
@@ -310,40 +333,71 @@ class _Rows:
             for kind, name, *values in (await self.session.execute(statement)).tuples():
                 row = self._add(tuple(values))
                 (self.alias if kind == "a" else self.by_id)[name] = row.raw_id
-                added.append(row.raw_id)
-        await self.load_links(added)
+        await self.complete()
 
-    async def load_links(self, raw_ids: Iterable[uuid.UUID]) -> None:
-        """The direct links of these rows and, transitively, of the rows they point at (so
-        a row's hiders, and theirs, are known), with those rows."""
-        link = RawHealthDataSupersession
+    async def load_links(
+        self, raw_ids: Iterable[uuid.UUID], revived: Iterable[uuid.UUID] = ()
+    ) -> None:
+        """The direct links of these rows that can hide them - to a row that is live, or to one
+        of ``revived`` (rows marked deleted that this page may write onto, which makes them
+        live) - and, transitively, those of the rows they point at; each such row is loaded
+        once."""
+        link, target = RawHealthDataSupersession, aliased(RawHealthData)
         frontier = sorted({raw_id for raw_id in raw_ids if self.rows[raw_id].links is None})
         for _ in range(MAX_CHAIN):
             if not frontier:
                 return
             for raw_id in frontier:
                 self.rows[raw_id].links = []
-            following: set[uuid.UUID] = set()
+            missing: set[uuid.UUID] = set()
+            revived = sorted(set(revived))
             for chunk in _chunks(frontier):
-                result = await self.session.execute(
-                    select(
-                        link.old_raw_id,
-                        link.new_raw_id,
-                        link.old_fingerprint,
-                        link.new_fingerprint,
-                        *_LIGHT,
-                        self._payload(),
-                    )
-                    .join(RawHealthData, RawHealthData.id == link.new_raw_id)
-                    .where(among(self.session, link.old_raw_id, chunk))
+                columns = (
+                    link.old_raw_id,
+                    link.new_raw_id,
+                    link.old_fingerprint,
+                    link.new_fingerprint,
                 )
-                for old, new, old_source, new_source, *values in result.tuples():
+                parts = [
+                    select(*columns)
+                    .join(target, target.id == link.new_raw_id)
+                    .where(
+                        among(self.session, link.old_raw_id, chunk),
+                        target.source_deleted_at.is_(None),
+                        target.is_quarantined.is_(False),
+                    )
+                ]
+                if revived:
+                    parts.append(
+                        select(*columns).where(
+                            among(self.session, link.old_raw_id, chunk),
+                            among(self.session, link.new_raw_id, revived),
+                        )
+                    )
+                statement = union_all(*parts) if len(parts) > 1 else parts[0]
+                for old, new, old_source, new_source in (
+                    await self.session.execute(statement)
+                ).tuples():
                     links = self.rows[old].links
                     assert links is not None
                     links.append((new, old_source, new_source))
-                    if self._add(tuple(values)).links is None:
-                        following.add(new)
-            frontier = sorted(following)
+                    if new not in self.rows:
+                        missing.add(new)
+            for chunk in _chunks(sorted(missing)):
+                result = await self.session.execute(
+                    select(*_LIGHT).where(among(self.session, RawHealthData.id, chunk))
+                )
+                for values in result.tuples():
+                    self._add(tuple(values))
+            await self.complete()
+            frontier = sorted(
+                {
+                    new
+                    for raw_id in frontier
+                    for new, _, _ in self.rows[raw_id].links or ()
+                    if self.rows[new].links is None
+                }
+            )
 
 
 class _Page:
@@ -352,7 +406,21 @@ class _Page:
 
     def __init__(self, rows: dict[uuid.UUID, StoredRow], chains: Chains) -> None:
         self.rows, self.chains = rows, chains
-        self.claimed: dict[uuid.UUID, _Group] = {}
+        self._claimed: dict[uuid.UUID, _Group] = {}
+        # Per decision round (``claimed`` resets them): each row's hiders, and whether a row
+        # shows a group's record (rows of a much-linked record are asked again and again).
+        self._hiders: dict[uuid.UUID, list[StoredRow]] = {}
+        self._shows: dict[tuple[uuid.UUID, tuple[str, str]], bool] = {}
+
+    @property
+    def claimed(self) -> dict[uuid.UUID, _Group]:
+        return self._claimed
+
+    @claimed.setter
+    def claimed(self, value: dict[uuid.UUID, _Group]) -> None:
+        self._claimed = value
+        self._hiders.clear()
+        self._shows.clear()
 
     def live(self, row: StoredRow) -> bool:
         return not row.quarantined and (row.raw_id in self.claimed or not row.deleted)
@@ -367,12 +435,15 @@ class _Page:
     def hiders(self, row: StoredRow) -> list[StoredRow]:
         """The rows that hide ``row`` from readers (``held_elsewhere``): targets of its links
         in force that are neither marked deleted nor quarantined."""
-        found = []
-        for holder, old_source, new_source in row.links or ():
-            target = self.rows.get(holder)
-            if target is not None and self.chains.in_force(old_source, new_source):
-                if self.live(target):
-                    found.append(target)
+        found = self._hiders.get(row.raw_id)
+        if found is None:
+            found = []
+            for holder, old_source, new_source in row.links or ():
+                target = self.rows.get(holder)
+                if target is not None and self.chains.in_force(old_source, new_source):
+                    if self.live(target) and target not in found:
+                        found.append(target)
+            self._hiders[row.raw_id] = found
         return found
 
     def hidden(self, row: StoredRow) -> bool:
@@ -383,10 +454,17 @@ class _Page:
         shows its reading (a growing interval at least as long), or a row hiding it does."""
         if depth > MAX_CHAIN or not self.live(row):
             return False
-        hiders = self.hiders(row)
-        if not hiders:
-            return covers(self.shown(row), group)
-        return any(self.shows(hider, group, depth + 1) for hider in hiders)
+        name = (row.raw_id, (group.key, group.source))
+        found = self._shows.get(name)
+        if found is None:
+            self._shows[name] = False  # a cycle of links shows nothing
+            hiders = self.hiders(row)
+            if not hiders:
+                found = covers(self.shown(row), group)
+            else:
+                found = any(self.shows(hider, group, depth + 1) for hider in hiders)
+            self._shows[name] = found
+        return found
 
     def fits(self, root: StoredRow, group: _Group) -> bool:
         """Writing ``group`` onto ``root`` leaves its reading counted: the root is not hidden,
@@ -403,6 +481,11 @@ def covers(shown: tuple[str | None, str | None], group: _Group) -> bool:
     return reading_ == group.reading and (
         shape == wanted or (shape is not None and wanted is not None and shape > wanted)
     )
+
+
+def _holds(row: StoredRow, name: tuple[str, str]) -> bool:
+    """The row holds the record ``name`` (v2 key, fingerprint)."""
+    return row.identity is not None and (row.identity.key, row.identity.source) == name
 
 
 def _roots(own: list[StoredRow], page: _Page) -> list[StoredRow]:
@@ -464,28 +547,35 @@ async def resolve_ids(
         if left.reading != right.reading
     ]
 
-    # The record's own rows (its v1 ids, its v2s id, its alias) and those of the other
-    # fingerprints of its device (their v2s ids and aliases), in one statement.
-    stored = _Rows(session, spec, known)
+    # The record's own rows: by id (its v1 ids, its v2s id), then by alias for the records
+    # without a row found so (rows archived before v2 whose v1 id changed).
+    named = {
+        new_record_id(group.identity.specific_key): group.identity for group in groups.values()
+    }
+    stored = _Rows(session, spec, known, named)
     google_ids: set[str] = set()
-    keys: set[str] = set()
     for group in groups.values():
         google_ids.add(new_record_id(group.identity.specific_key))
         google_ids.update(ids[index] for index in group.indexes)
-        keys.add(group.identity.specific_key)
-        for source in chains.members(group.source) - {group.source}:
-            other = specific_key(group.key, source)
-            google_ids.add(new_record_id(other))
-            keys.add(other)
-    await stored.find(google_ids, keys)
-    page = _Page(stored.rows, chains)
+    await stored.find(google_ids)
+    unfound = {
+        group.identity.specific_key for name, group in groups.items() if not stored.holding(name)
+    }
+    if unfound:
+        await stored.find(set(), unfound)
 
-    def own_rows(name: tuple[str, str]) -> list[StoredRow]:
-        return [
-            row
-            for row in stored.rows.values()
-            if row.identity is not None and (row.identity.key, row.identity.source) == name
-        ]
+    def revivable() -> set[uuid.UUID]:
+        # Per record with no live row of its own: its own row seen last, marked deleted
+        # (the page writes onto it, so rows linked to it may be hidden by it afterwards).
+        found = set()
+        for name in groups:
+            own = stored.holding(name)
+            if own and all(row.deleted for row in own):
+                found.add(max(own, key=lambda row: row.order).raw_id)
+        return found
+
+    await stored.load_links(stored.rows, revivable())
+    page = _Page(stored.rows, chains)
 
     # A record whose v2s row is not a counted root may have spare rows (one was made each
     # time its rows were hidden behind another value): found by id, in blocks (spare ids are
@@ -504,21 +594,25 @@ async def resolve_ids(
     attempt = 1
     while pending:
         block = range(attempt, attempt + SPARE_BLOCK)
-        await stored.find(
-            {spare_record_id(group.identity, number) for group in pending for number in block},
-            set(),
-        )
+        spares = {
+            spare_record_id(group.identity, number): group.identity
+            for group in pending
+            for number in block
+        }
+        stored.named.update(spares)
+        await stored.find(set(spares))
         pending = [
             group
             for group in pending
             if all(spare_record_id(group.identity, number) in stored.by_id for number in block)
         ]
         attempt += SPARE_BLOCK
+    await stored.load_links(stored.rows, revivable())
 
     # Which root each group writes onto. Rows written by this page count with its reading,
     # which may let another group's root show it: decided until nothing changes.
     targets: dict[tuple[str, str], StoredRow | None] = {}
-    owned = {name: own_rows(name) for name in groups}
+    owned = {name: stored.holding(name) for name in groups}
     for _ in range(4):
         decided: dict[tuple[str, str], StoredRow | None] = {}
         for name, group in sorted(groups.items()):
@@ -548,6 +642,19 @@ async def resolve_ids(
             resolution.new_aliases[own_key] = target.google_data_point_id
     if fresh:
         _new_ids(fresh, stored.by_id, ids, resolution)
+        # The other fingerprints' rows of a decided device (their v2s ids and aliases), to
+        # link the new rows to.
+        others: set[str] = set()
+        for group, _ in fresh:
+            for source in chains.members(group.source) - {group.source}:
+                other = specific_key(group.key, source)
+                others |= {new_record_id(other), other}
+        if others:
+            await stored.find(
+                {name for name in others if name.startswith("synthetic:")},
+                {name for name in others if not name.startswith("synthetic:")},
+            )
+            await stored.load_links(stored.rows, revivable())
         for group, google_id in ((group, ids[group.indexes[0]]) for group, _ in fresh):
             _link_new_row(spec, group, google_id, stored, page, resolution)
     return resolution
@@ -568,9 +675,8 @@ def _link_new_row(
         return
     counted = [
         row
-        for row in stored.rows.values()
+        for row in stored.of_key.get(group.key, ())
         if row.identity is not None
-        and row.identity.key == group.key
         and row.identity.source != group.source
         and chains.same_device(group.source, row.identity.source)
         and page.live(row)
@@ -812,30 +918,52 @@ async def present_records(
     write path). ``chains``: the data type's chains with every span (loaded when not given).
     """
     from app.core.timeutil import as_utc
+    from app.parsers.common import temporal
 
     presence = Presence()
-    identities = {raw_id: record_identity(spec, raw_json) for raw_id, raw_json, _ in candidates}
-    values = {raw_id: reading(spec, raw_json) for raw_id, raw_json, _ in candidates}
-    starts = {identity.start for identity in identities.values() if identity and identity.start}
-    # A stale stored start (written by an older parser) still finds the other rows.
-    starts |= {as_utc(start) for _, _, start in candidates if start is not None}
+    # Each candidate's instants: its parsed start and (a stale one, written by an older
+    # parser, still finds the other rows) its stored start. Only candidates at an instant some
+    # row was seen at are identified (hashed) at all.
+    instants: dict[uuid.UUID, set[datetime]] = {}
+    for raw_id, raw_json, start in candidates:
+        found = {as_utc(start)} if start is not None else set()
+        parsed = (
+            temporal(spec, raw_json)[0]
+            if isinstance(raw_json, dict) and google_name(raw_json) is None
+            else None
+        )
+        if parsed is not None:
+            found.add(as_utc(parsed))
+        instants[raw_id] = found
+    starts = set().union(*instants.values()) if instants else set()
     if not starts:
         return presence
     seen_rows: dict[str, list[tuple[uuid.UUID, str, str | None]]] = defaultdict(list)
+    seen_at: set[datetime] = set()
     for chunk in _chunks(sorted(starts)):
         rows = await session.execute(
-            select(RawHealthData.id, RawHealthData.raw_json).where(
+            select(RawHealthData.id, RawHealthData.raw_json, RawHealthData.source_start_time).where(
                 RawHealthData.data_type == spec.name,
                 among(session, RawHealthData.source_start_time, chunk),
                 RawHealthData.last_seen_at >= seen_since,
             )
         )
-        for raw_id, raw_json in rows.tuples():
+        for raw_id, raw_json, start in rows.tuples():
+            if start is not None:
+                seen_at.add(start)
             identity = record_identity(spec, raw_json)
+            if identity is not None and identity.start is not None:
+                seen_at.add(identity.start)
             if identity is not None:
                 seen_rows[identity.key].append((raw_id, identity.source, reading(spec, raw_json)))
     if not seen_rows:
         return presence
+    seen_starts = {as_utc(start) for start in seen_at}
+    relevant = [
+        (raw_id, raw_json) for raw_id, raw_json, _ in candidates if instants[raw_id] & seen_starts
+    ]
+    identities = {raw_id: record_identity(spec, raw_json) for raw_id, raw_json in relevant}
+    values = {raw_id: reading(spec, raw_json) for raw_id, raw_json in relevant}
     if chains is None:
         chains = await load_chains(session, spec.name)
     # Per (candidate fingerprint, other fingerprint): keys the other returned with the

@@ -54,17 +54,21 @@ the owner to decide (``identity-decide link`` or ``distinct``).
 
 A link joins its two fingerprints into one *device* in both directions. It is kept for good
 (``raw_source_chains`` is append-only, with the spans it was decided on as evidence). The old
-form returning later does not undo it (a name can change back); the device's rows simply take
-that form again. A link is *live* until it is *refuted* (its two fingerprints became
-established distinct: a ``refuted`` event in ``raw_source_chain_events``, recorded by the
-reconciler) or the two are decided distinct by the owner, or the owner's latest decision about
-it is ``reject``; a later ``not-distinct`` or ``link`` makes it live again. Only live links make
-devices and must form chains (``problems`` lists any fork or cycle); a dead link frees both its
-fingerprints for another link. Whenever devices change, ``record_devices`` appends the new
-device of each fingerprint to ``raw_source_devices``: readers count a supersession only while
-its two fingerprints are one device there (app/models/identity.py, ``in_force``), so a wrong
-link is undone in what they count as soon as it is rejected or refuted. Every link the
-reconciler decides is listed for review until the owner confirms or rejects it.
+form returning later does not undo it (a name can change back); its records simply get rows of
+their own again, linked to the device's. A link is *live* until it is *refuted* (its two
+fingerprints became established distinct: a ``refuted`` event in ``raw_source_chain_events``,
+recorded by the reconciler) or the two are decided distinct by the owner, or the owner's latest
+decision about it is ``reject``; a later ``not-distinct`` or ``link`` makes it live again. A
+link the reconciler decided only because other live links kept a rival source out (its
+*premise*, kept in its evidence: the rival continued as another source, or was a form of either
+device) is live only while those are, unless the owner linked or confirmed it, so undoing those
+undoes it too. Only live links make devices and must form chains (``problems`` lists any fork
+or cycle); a dead link frees both its fingerprints for another link. Whenever devices change,
+``record_devices`` appends the new device of each fingerprint to ``raw_source_devices``:
+readers count a supersession only while its two fingerprints are one device there
+(app/models/identity.py, ``in_force``), so a wrong link is undone in what they count as soon as
+it is rejected or refuted. Every link the reconciler decides is listed for review until the
+owner confirms or rejects it.
 
 Concurrency: ``store_records`` and deletion marking hold a shared transaction lock per data
 type, a reconciler batch the exclusive one, and only one reconciler runs at a time (a session

@@ -422,20 +422,22 @@ never marked.
   that window and is marked until a fetch covering its new time returns it again (and unmarks it).
   For a move of more than 7 days that is the weekly 90-day reconciliation.
 - "Not returned" is decided per [record identity](#record-identity), not per row. A row is not
-  marked while the same fetch returned its v2 key **with the same reading** under a row it is
-  linked with (through links in force), or under **the same device** (its own fingerprint, or one
-  joined to it by a live chain: a duplicate of the record under another id). Otherwise, when its
-  device returned the key **with another value**, the row is marked: it holds a value its device
-  no longer returns (one device returns one value per record, so the same reading under another
-  source is another device's). Otherwise a row whose reading the fetch returned under a
-  fingerprint **not established distinct** from the row's device (it may be the device renamed,
-  which the nightly reconciler or the owner decides), or under one established distinct by
-  evidence alone whose sightings only touch the row's (it looks like a rename), is *deferred*
-  (`SOURCE_DELETIONS_DEFERRED` in the log), never guessed: a mark is permanent, so it is never
-  made on the strength of a decision that may still be undone. A row of a device established
-  distinct by the owner, or by evidence with overlapping sightings (see
-  [Record identity](#record-identity)), never keeps a record: of two devices that recorded at one
-  instant, one can be deleted alone. Only a fetch from page 1 marks (a resumed fetch does not,
+  marked while the same fetch returned its v2 key **with the same reading** under **the same
+  device** (its own fingerprint, or one joined to it by a live chain: a duplicate of the record
+  under another id; every link in force joins two such rows). Otherwise a row whose reading the
+  fetch returned under a fingerprint that is not *certainly* another device is *deferred*
+  (`SOURCE_DELETIONS_DEFERRED` in the log; kept in `identity_reconcile_state` and listed by
+  `health-mirror status` under `identity_deferred_deletions` and by every reconciler run under
+  `deferred_deletions`), never guessed - also when the row's own device returned another value,
+  since the chain that makes it one device may be the wrong one. *Certainly another device*: the
+  owner decided the two `distinct` (a form of each, joined to it only by chains the owner linked
+  or confirmed), or the two fingerprints themselves are established distinct by evidence while
+  their sightings do not merely touch and the keys they share do not mostly agree, and the keys
+  this fetch returned under the other fingerprint did not mostly come back with the rows'
+  readings (records reprocessed under a new name). A mark is permanent, so it is never made on the
+  strength of evidence the owner may still overturn. Otherwise (not returned at all, or only with
+  another value by its own device, or the same reading only by a source certainly another device)
+  the row is marked: of two devices that recorded at one instant, one can be deleted alone. Only a fetch from page 1 marks (a resumed fetch does not,
   whatever its pages returned). Superseded rows are candidates too (a superseded row counts again
   when its holder is marked, so it must be marked itself when its record is gone), except one
   whose holder this fetch saw unchanged since they were linked with the same reading: that is the
@@ -540,7 +542,7 @@ a rename between two pages of one fetch (minutes) is left to the owner.
 
 A link joins its two fingerprints into **one device in both directions** and records the spans it
 was decided on as `evidence`. The old form coming back later is no contradiction (a name can
-change back): the device's rows take that form again (`returned` in the report). A link is
+change back): its records get rows of their own again, linked to the device's (`returned` in the report). A link is
 **live** until it is **refuted** (its two fingerprints became established distinct: a `refuted`
 event in `raw_source_chain_events`, recorded by the reconciler), the owner decides the two
 `distinct`, or the owner's latest decision about it is `reject`; a later `not-distinct`, `link` or
@@ -558,31 +560,33 @@ checks the device log against the chains. Every link the reconciler decides is l
 
 **Writing a record** (`store_records`, `app/services/identity.py`). The write path never decides a
 rename; it applies decided chains (a *device* is a fingerprint and every one joined to it by usable
-links, either way). Records of one page are grouped by v2 key and fingerprint, and every group is
-written onto
+links, either way). **A payload is only ever written onto a row of its own fingerprint**, so a row's
+source never changes and no row's history holds another source's payload (`verify` checks it).
+De-duplication across fingerprints is a matter of links alone. A row is *hidden* exactly when
+readers skip it: a link in force to a row neither marked deleted nor quarantined. Records of one
+page are grouped by v2 key and fingerprint, and every group is written onto
 
-1. the row that holds this key from this **same** fingerprint and is not superseded (a returning
-   record, civil times added, a grown interval, a revised value);
-2. when the fingerprint's own rows are all superseded (the reconciler merged them into a row of
-   the device): the row holding them, when it is the same device and holds the same **reading**
-   (the payload without the source, times as parsed; a deletion mark on it is cleared); else the
-   own row, when that row counts (its holder is marked deleted, or this page writes the holder
-   with the same reading); else a new row: a different value is never hidden behind another row;
-3. else the row of **another fingerprint of the device** that holds this key with the same
-   reading (a rename, a dropped package suffix, the old name come back): a new version of it;
-4. else a **new row of its own**, `synthetic:v2s:<hash of key and fingerprint>` (the first free
-   spare id of the same kind if that id holds another form or value of the record now).
+1. its fingerprint's **root** row (not superseded by a row of its own fingerprint; the one not
+   hidden first, then the live one, then the one seen last) when that row is not hidden, or when
+   the rows hiding it show the same **reading** (the payload without the source, times as parsed;
+   for a growing interval also an end no earlier): a returning record, civil times added, a grown
+   interval, a revised value, the old name back (a deletion mark on it is cleared);
+2. else a **new row of its own**, `synthetic:v2s:<hash of key and fingerprint>` (the first free
+   spare id of the same kind if that id is taken): a reading Google returns is never hidden
+   behind a row showing another value.
 
-"Superseded" here means superseded by a link in force: a row whose links are no longer in force
-is its own holder again. Rows are found by id only: first the record's v1 id (rows archived before
-v2) and the `v2s` id of its key and fingerprint (rows stored since 0012); when that id is taken
-by a row that is not the record's current row, its spare ids, in blocks of eight until one is free
-(spare ids are given in order, so the spare row written last time is found again and never a
-second one made, however often the record moves); then, for the groups without a current row of
-their own, the alias table and the ids of the device's other fingerprints. There is no "newest
-row" fallback and no scan by start time: a device's payload is never written onto another
-device's row, and an unknown fingerprint (a rename not decided yet, a second device, a late
-upload) is counted twice at worst until it is decided, never hidden. Concurrency: the rows a page writes onto are
+A new row is **linked at once** (a supersession and its `identity-merged` event, written by the
+page) to a counted row of another fingerprint of its device that shows the same reading: a
+decided rename, a dropped package suffix or the old name come back is counted once from its first
+page, and an undecided one at worst twice. A new row that is a later shape of a growing interval a
+row of its device counts at an earlier end holds that row instead. Rows are found by id only: the record's v1 id (rows archived before v2), the `v2s` id of its key
+and fingerprint (rows stored since 0012) and its alias, and the `v2s` ids and aliases of the
+device's other fingerprints, in one statement; their links (and the links of the rows those point
+at) in the next; when the `v2s` row is not a counted root, its spare ids, in blocks of eight until
+one is free (spare ids are given in order, so the spare row written last time is found again and
+never a second one made, however often the record moves). There is no "newest row" fallback and no
+scan by start time: an unknown fingerprint (a rename not decided yet, a second device, a late
+upload) is counted twice at worst until it is decided, never hidden. Concurrency: the rows a page writes onto or links to are
 locked (`FOR UPDATE`, key order) and checked against what the resolution read, and new rows are
 inserted with `ON CONFLICT DO NOTHING`; when another writer changed or created one meanwhile, the
 page is resolved again inside a savepoint (`RECORD_BATCH_RESOLVED_AGAIN`). The time written to
@@ -611,25 +615,35 @@ only place that decides chains, and it links what it decided. A **full** run (af
 and whenever wanted) reads every row and earlier version (pass 1: sighting spans; rows whose
 stored `source_start_time` differs from the parsed one are noted by id), merges the spans into
 `raw_source_sightings` (complete from then on), decides the chains, then per v2 key and per device
-(one fingerprint or one usable chain) links every other row of that device to the row that holds
-the record now (a live row first, one that already holds others first, then the newest; a
-deleted-marked row only when the device has no live row) in `raw_health_data_supersessions
+(one fingerprint or one usable chain) links its rows in two steps: per fingerprint, every row not
+yet superseded by one of its own to that fingerprint's **root** (live first, then the one seen
+last; for a growing interval the longest); then every counted root to the device's **holder**
+among them (live first, the one the others already link to, the one that already holds others,
+then the newest), in `raw_health_data_supersessions
 (old_raw_id, new_raw_id → data_type, both keys, reason, both fingerprints, same_reading, the
 holder's payload hash, created_at)` with the reason `display-name-change`, `package-suffix-change`,
 `source-change`, `interval-shape-change`, `growing-interval` or `duplicate`, and appends an
-`identity-merged` event for the superseded row (once per row, ever). A row of **another
-fingerprint** of the device is linked only when it measured the same (its reading equals the
-holder's); otherwise both stay (`kept_differing`). The rows a newly linked row held are linked to
-the holder too, so two devices joined later (each holding rows of its own) end with one holder.
-Rows whose links are no longer in force are settled like any other and linked again when their
-sources are one device again. A deleted-marked row with no live row of its device is a deletion:
+`identity-merged` event for the superseded row (once per row, ever). A root of **another
+fingerprint** is linked only when it measured the same (its reading equals the holder's);
+otherwise both stay (`kept_differing`). Only roots are linked across fingerprints, so when a chain
+is rejected or refuted each fingerprint still counts each record once. The rows a newly linked row
+held are linked to the holder too (rows of the holder's fingerprint, and rows that measured the
+same), so two devices joined later end with one holder. Rows whose links are no longer in force
+are settled like any other and linked again within each device that remains. Per pair of
+fingerprints with evidence of two devices it also counts the keys both hold with the same reading
+and with two (`agreement`; kept in `identity_reconcile_state`): when most agree, the pair is no
+longer taken for two devices on that evidence (a rename whose records Google reprocessed) and is
+listed under `review_distinct`. A deleted-marked row with no live row of its device is a deletion:
 `deletions_kept` when no other source holds its key live, `deletions_suspicious` when another,
 undecided source does (possibly a rename nobody decided: see `ambiguous`). The **incremental**
 run (`--incremental`, the nightly scheduler job
 `identity-reconcile`, 02:30 UTC by default) decides chains from the sightings as the write path
-keeps them and links only the start times of rows created or given a new payload since its
-checkpoint minus one hour, plus, after a new link, everything since the new fingerprint's first
-sighting (the changed start times are streamed, never held in memory at once); a data type that
+keeps them and links the start times of rows created or given a new payload since its
+checkpoint minus one hour, plus exactly the rows whose devices changed: every row of a link
+between two fingerprints that are no longer one device (a refutation; whatever its age, also rows
+archived before 0011), and every row touched since the later of two fingerprints that newly are
+was first seen (the start times are read first, in short transactions of their own, as integers;
+no snapshot is held while they are settled); a data type that
 never had a full run gets its first full pass instead and says so (`skipped`). A data type that
 fails (its lock stays busy, a statement times out) is reported with its `error` and saved in
 `identity_reconcile_state`; the run goes on with the others (the CLI then exits 1). Both report
@@ -650,9 +664,15 @@ no longer hide anything, both sources are free for another chain), `confirm FROM
 rejected chain is live again), `distinct A B` (two devices: a chain between them is no longer used)
 and `not-distinct A B` (ignore the evidence of two devices; a chain refuted by it is live again).
 Each decision is appended to `raw_source_decisions` (with its time and an optional note) and
-applied at once: after `link`, `not-distinct` and any decision that joins two devices the whole
-data type is settled again. The latest decision per question wins, so each decision is undone by
-the opposite one, in what readers count too. A decision that would make live chains fork or cycle
+applied at once: the rows whose devices it changed are settled again, exactly as the incremental
+run settles them (the rows of every lapsed link; every row since the later of two sources newly
+joined). The latest decision per question wins, so each decision is undone by
+the opposite one, in what readers count too (there is no decision that forgets one). A chain the
+reconciler decided only because another live chain made a rival source continue elsewhere records
+that *premise* in its `evidence`; it is live only while the premise is (state `lapsed` otherwise),
+unless the owner linked or confirmed it, so undoing the other chain undoes it too. `distinct`
+warns, in its outcome and its dry run, that rows of one source whose reading then comes back only
+under the other are marked deleted by the next complete fetch: a mark is permanent. A decision that would make live chains fork or cycle
 is refused, naming the chain to reject first; `link` of two sources the owner decided distinct, or
 established distinct by evidence, is refused until `not-distinct`. `--dry-run` reports the effect,
 writes nothing and takes no lock that writers wait for; an unknown `--data-type` is named as such.
@@ -662,8 +682,11 @@ spans, devices, chains, decisions and open cases. See [docs/RUNBOOK.md](RUNBOOK.
 A superseded row is **history, not data**: its payload, versions, `source_deleted_at` and events
 stay exactly as they were, but while a link in force joins it to a live row, dashboards, Umay, the
 `analytics_*` views and the normalized-table readers skip it, as they skip a source deletion, so a
-record is counted once. When every such holder is marked deleted, a live superseded row counts
-again: a link never hides a live record behind a deleted one. Old deletion marks
+record is counted once. When every such holder is marked deleted (or quarantined), a live
+superseded row counts again: a link never hides a live record behind a row that is not counted.
+With source deletions included (the dashboard's option), a deleted row is left out when it is
+superseded or holds a live row that counts, so a live row's value is shown, never a deleted
+holder's. Old deletion marks
 are not cleared: they truthfully say that the row's form of the record stopped being returned on
 that date; the record itself lives on in the successor row. A marked row with no live row of its
 device is a genuine deletion and is never linked (`deletions_kept`). Rows of different devices are
@@ -916,8 +939,9 @@ trigger, to **`raw_health_data_events`**: `source-deleted` (marked, with the mar
 an archive import restores a record as deleted) and `source-returned` (with the fetch that saw it
 again and `previous_deleted_at`, the mark being cleared). A record that disappears and comes back
 therefore keeps its whole timeline; `health-mirror history` lists the events next to the
-versions. `identity-merged` is appended (by `health-mirror identity-backfill`, not by a trigger)
-when a duplicate row is linked to the row that holds its record now (see
+versions. `identity-merged` is appended (by `health-mirror identity-backfill`, or by the page
+that creates a row of a decided device and links it; not by a trigger) when a duplicate row is
+linked to the row that holds its record now (see
 [Record identity](#record-identity)); it changes nothing on the row.
 
 ### Write paths (audit)
@@ -928,7 +952,7 @@ above, and why it is allowed:
 | Write | Table | Verdict |
 |---|---|---|
 | `store_records` UPSERT (`app/services/storage.py`) | `raw_health_data` | onto the row that holds the record's identity (never re-keyed); payload change → kept as a version by trigger first; `last_seen_at`, `source_deleted_at` → `NULL` (logged as an event), `payload_received_at`/`payload_source`/`response_id` change only with the payload; derived `source_*_time`/`source_timezone` |
-| `store_records` aliases and evidence (`app/services/identity.py`, `source_chains.py`) | `raw_health_data_identity`, `raw_source_pairs` | `INSERT ... ON CONFLICT DO NOTHING` only |
+| `store_records` aliases, evidence and links of its new rows (`app/services/identity.py`, `source_chains.py`) | `raw_health_data_identity`, `raw_source_pairs`, `raw_health_data_supersessions`, `raw_health_data_events` (`identity-merged`) | `INSERT ... ON CONFLICT DO NOTHING` / inserts only |
 | `store_records` sightings (`app/services/source_chains.py`) | `raw_source_sightings` | first/last sighting widened in place (bookkeeping, no received data) |
 | `identity-backfill`, the nightly `identity-reconcile` job and `identity-decide` (`app/services/identity_backfill.py`, `identity_decisions.py`) | `raw_health_data_identity`, `raw_health_data_supersessions`, `raw_source_chains`, `raw_source_chain_events`, `raw_source_pairs`, `raw_source_decisions`, `raw_source_devices`, `raw_health_data_events`, `raw_source_sightings`, `identity_reconcile_state` | inserts only (sightings widened, marked complete); `raw_health_data` and its versions are only read |
 | `mark_source_deletions` (`app/sync/deletions.py`) | `raw_health_data` | sets `source_deleted_at` only (logged as an event); nothing deleted |
@@ -1261,7 +1285,12 @@ unchanged (keys, checks and foreign keys only: NOT NULL constraints, which Postg
 too, are not compared), no rule, row-level security or policy on a guarded table, no guard on a
 table that is not guarded, and the `analytics_*` views counting exactly as 0012 defines them
 (compared on their own columns: a column added to a normalized table later, which `SELECT *`
-views do not pick up, is no finding). Notes, not errors: chains refuted or rejected since (no
+views do not pick up, is no finding), and no row without a Google id holding payloads of more
+than one source in its history (a payload written onto another source's row). Notes, not errors:
+records counted more than once within one device (rows of one key and reading that no link in
+force joins yet: before the first full run, or until the next one), the partial index of
+source-deleted rows missing or invalid (a migration that could not build it next to a dump; build
+it with `REINDEX INDEX CONCURRENTLY`), chains refuted or rejected since (no
 longer used: the rows they linked count on their own), supersessions no longer in force,
 superseded rows that count again because every row holding them was marked deleted, holders that
 are superseded themselves, and superseded rows holding an older value than their holder.

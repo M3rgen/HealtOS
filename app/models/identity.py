@@ -469,6 +469,27 @@ def held_elsewhere(raw_id):
     )
 
 
+def key_held_elsewhere(data_type, google_data_point_id):
+    """``held_elsewhere`` of the raw row with this data type and ``google_data_point_id``,
+    found through the supersessions' ``(old_google_data_point_id, data_type)`` index: for a
+    normalized row (keyed like its raw row), so a reader probes the links of the rows it reads
+    instead of joining every raw row of the data type (as the ``analytics_*`` views do)."""
+    holder = aliased(RawHealthData)
+    link = aliased(RawHealthDataSupersession)
+    return (
+        select(link.old_raw_id)
+        .join(holder, holder.id == link.new_raw_id)
+        .where(
+            link.old_google_data_point_id == google_data_point_id,
+            link.data_type == data_type,
+            holder.source_deleted_at.is_(None),
+            holder.is_quarantined.is_(False),
+            in_force(link),
+        )
+        .exists()
+    )
+
+
 def holds_live(raw_id):
     """``EXISTS`` clause: ``raw_id`` holds, through an in-force link, a row that is live and
     not quarantined (a row marked deleted that a live duplicate stands for)."""

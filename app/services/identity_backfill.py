@@ -572,7 +572,7 @@ def _report(
                 {
                     **{name: entry[name] for name in ("from", "to", "fingerprints")},
                     "effect": "old form seen again: still one device (never two values for "
-                    "one record); its records go onto the device's rows",
+                    "one record); its records get rows of their own, linked to the device's",
                 }
             )
     for old, new in refuted:

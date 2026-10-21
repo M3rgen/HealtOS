@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timeutil import as_utc
 from app.google_health.data_types import supported_data_types
 from app.models.health import HeartRate, SleepSession, Steps, Weight
-from app.models.identity import held_elsewhere, holds_live, superseded
+from app.models.identity import held_elsewhere, holds_live, key_held_elsewhere, superseded
 from app.models.manual import ManualMeasurement
 from app.models.state import RawHealthData
 from app.parsers.common import first_number, parse_date, payload_for
@@ -88,18 +88,24 @@ async def dashboard_data(
             RawHealthData.data_type == data_type,
             RawHealthData.google_data_point_id == model.google_data_point_id,
         )
+        # Superseded, by a link in force, by a counted row: found by the normalized row's key.
+        held = key_held_elsewhere(data_type, model.google_data_point_id)
         if valid_sources_only:
-            return raw.where(
-                RawHealthData.is_quarantined.is_(False),
-                RawHealthData.source_deleted_at.is_(None),
-                ~raw_superseded,
-            ).exists()
+            return and_(
+                raw.where(
+                    RawHealthData.is_quarantined.is_(False),
+                    RawHealthData.source_deleted_at.is_(None),
+                ).exists(),
+                ~held,
+            )
         if include_source_deleted:
-            return ~raw.where(any_superseded).exists()
+            deleted_and_held = raw.where(
+                RawHealthData.source_deleted_at.is_not(None),
+                or_(superseded(RawHealthData.id), holds_live(RawHealthData.id)),
+            )
+            return and_(~held, ~deleted_and_held.exists())
         # Normalized rows outlive a source deletion; hide them unless asked for.
-        return ~raw.where(
-            or_(RawHealthData.source_deleted_at.is_not(None), raw_superseded)
-        ).exists()
+        return and_(~raw.where(RawHealthData.source_deleted_at.is_not(None)).exists(), ~held)
 
     raw_not_deleted = (
         ~any_superseded
