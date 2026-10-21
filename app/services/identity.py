@@ -674,9 +674,10 @@ async def resolve_ids(
 def _expect(resolution: Resolution, row: StoredRow) -> None:
     """The page relies on ``row`` as it is now: locked and checked before writing."""
     resolution.expected.setdefault(row.raw_id, row.state)
-    resolution.expected_links.setdefault(
-        row.raw_id, frozenset(holder for holder, _, _ in row.links or ())
-    )
+    if row.links is not None:  # (links beyond MAX_CHAIN steps were not read)
+        resolution.expected_links.setdefault(
+            row.raw_id, frozenset(holder for holder, _, _ in row.links)
+        )
     resolution.locked.add(row.google_data_point_id)
 
 
