@@ -3,13 +3,13 @@
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select, true
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timeutil import as_utc
 from app.google_health.data_types import supported_data_types
 from app.models.health import HeartRate, SleepSession, Steps, Weight
-from app.models.identity import superseded
+from app.models.identity import held_elsewhere, superseded
 from app.models.manual import ManualMeasurement
 from app.models.state import RawHealthData
 from app.parsers.common import first_number, parse_date, payload_for
@@ -70,8 +70,11 @@ async def dashboard_data(
     step_hours: list[float | None] = [None] * 24
 
     # A superseded row is a duplicate of a record another row holds now (migration
-    # 20261021_0012): never counted, whatever the deletion filter.
-    raw_superseded = superseded(RawHealthData.id)
+    # 20261021_0012): not counted while that row is live (a live superseded row whose holder
+    # was marked deleted counts again). With source deletions included, the holder stands
+    # for its duplicates whatever its mark.
+    raw_superseded = held_elsewhere(RawHealthData.id)
+    any_superseded = superseded(RawHealthData.id)
 
     def valid_source(model, data_type: str):
         raw = select(RawHealthData.id).where(
@@ -85,17 +88,16 @@ async def dashboard_data(
                 ~raw_superseded,
             ).exists()
         if include_source_deleted:
-            return ~raw.where(raw_superseded).exists()
+            return ~raw.where(any_superseded).exists()
         # Normalized rows outlive a source deletion; hide them unless asked for.
         return ~raw.where(
             or_(RawHealthData.source_deleted_at.is_not(None), raw_superseded)
         ).exists()
 
-    raw_not_deleted = and_(
-        true()
+    raw_not_deleted = (
+        ~any_superseded
         if include_source_deleted and not valid_sources_only
-        else RawHealthData.source_deleted_at.is_(None),
-        ~raw_superseded,
+        else and_(RawHealthData.source_deleted_at.is_(None), ~raw_superseded)
     )
 
     # Split source intervals at civil-hour boundaries, including midnight and DST.

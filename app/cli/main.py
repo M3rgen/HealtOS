@@ -42,12 +42,17 @@ def status() -> None:
                 select(BackfillJob.status, func.count()).group_by(BackfillJob.status)
             )
             from app.models.identity import IdentityReconcileState
+            from app.services.identity import identity_tables_missing
 
-            identity = (
-                await session.scalars(
-                    select(IdentityReconcileState).order_by(IdentityReconcileState.data_type)
-                )
-            ).all()
+            identity = []
+            open_chains: list[dict] = []
+            if not await identity_tables_missing(session):
+                identity = (
+                    await session.scalars(
+                        select(IdentityReconcileState).order_by(IdentityReconcileState.data_type)
+                    )
+                ).all()
+                open_chains = await _chains_to_review(session)
             return {
                 "raw_records": raw_count,
                 "sync": [
@@ -74,9 +79,34 @@ def status() -> None:
                     }
                     for row in identity
                 ],
+                # Chains the reconciler decided that the owner has not confirmed or rejected
+                # yet (health-mirror identity-decide confirm|reject).
+                "identity_review_suggested": open_chains,
             }
 
     typer.echo(json.dumps(run(command()), indent=2))
+
+
+async def _chains_to_review(session) -> list[dict]:
+    from app.models.identity import RawSourceChain
+    from app.services.source_chains import load_chains
+
+    found = []
+    names = (await session.scalars(select(RawSourceChain.data_type).distinct())).all()
+    for data_type in sorted(names):
+        chains = await load_chains(session, data_type)
+        for old, new in sorted(chains.following.items()):
+            if chains.review(old, new) == "suggested" and chains.usable(old, new):
+                found.append(
+                    {
+                        "data_type": data_type,
+                        "from": chains.spans[old].label if old in chains.spans else old[:12],
+                        "to": chains.spans[new].label if new in chains.spans else new[:12],
+                        "fingerprints": [old[:12], new[:12]],
+                        "decided_by": chains.decided_by.get(old),
+                    }
+                )
+    return found
 
 
 @app.command()
@@ -228,13 +258,17 @@ def verify() -> None:
 
     async def command():
         from app.parsers.common import payload_hash
-        from app.services.identity import verify_identities
+        from app.services.identity import identity_tables_missing, verify_identities
         from app.services.raw_history import verify_guards, verify_versions
         from app.services.responses import verify_responses
 
         errors = []
         count = 0
         async with SessionLocal() as session:
+            if await identity_tables_missing(session):
+                # An older schema: say so instead of failing on the first missing table.
+                _, identity_errors, notes = await verify_identities(session)
+                return 0, 0, 0, 0, identity_errors, notes, []
             # First: a missing or disabled guard means deletes could go through unnoticed.
             errors.extend(await verify_guards(session))
             rows = await session.stream(
@@ -400,10 +434,11 @@ def identity_backfill(
 ) -> None:
     """Decide source chains, add v2 aliases and link duplicate rows of a record (idempotent).
 
-    The only command that decides that two sources are one renamed device. The report lists,
-    per data type, every chain (from -> to source, gap in seconds), the sources the rule left
-    open (``ambiguous``, with why), contradicted chains, and the pairs of sources that share
-    records but are kept apart; review them after a dry run (docs/RUNBOOK.md).
+    Decides, from the sightings, that two sources are one renamed device (the owner decides
+    the rest with identity-decide). The report lists, per data type, every chain (from -> to
+    source, gap in seconds, review state), the chains to review, the sources the rule left
+    open (``ambiguous``, with why), refuted chains, and the pairs of sources that share a class
+    but are kept apart; review them after a dry run (docs/RUNBOOK.md).
     """
     import re
 
@@ -439,6 +474,7 @@ def identity_backfill(
                 incremental=incremental,
                 statement_timeout=statement_timeout,
                 progress=progress,
+                notice=lambda message: typer.echo(message, err=True),
             )
         )
     except (BackfillRunning, LockUnavailable) as exc:
@@ -453,6 +489,69 @@ def identity_backfill(
         "total": total.as_dict(),
     }
     typer.echo(json.dumps(report, indent=2))
+
+
+@app.command()
+def identity_decide(
+    decision: str = typer.Argument(
+        ..., help="link, reject or confirm (a chain FROM -> TO); distinct or not-distinct."
+    ),
+    data_type: str = typer.Option(..., "--data-type"),
+    first: str = typer.Option(
+        ..., "--from", help="Fingerprint (prefix, as reports print it) of the earlier form."
+    ),
+    second: str = typer.Option(..., "--to", help="Fingerprint (prefix) of the later form."),
+    note: str | None = typer.Option(None, "--note", help="Why (kept with the decision)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report the effect; write nothing."),
+    batch_size: int = typer.Option(5_000, min=100, max=100_000),
+) -> None:
+    """Decide what the reconciler left open: two sources are one device, or two devices.
+
+    Recorded append-only (raw_source_decisions) and applied at once: after ``link`` and
+    ``not-distinct`` the data type is settled again (its rows are linked where they hold the
+    same reading). ``reject`` stops using a chain (the rows it linked stay linked: they held
+    equal readings), ``confirm`` takes it off the review list, ``distinct`` declares two
+    devices. Run with --dry-run first (docs/RUNBOOK.md).
+    """
+    from app.services.identity_backfill import LockUnavailable
+    from app.services.identity_decisions import DecisionRefused, decide_sources
+    from app.services.source_chains import BackfillRunning
+
+    def progress(name, stats, reached: datetime) -> None:
+        typer.echo(
+            f"{name}: {stats.rows} rows, {sum(stats.linked.values())} superseded, "
+            f"up to {reached.isoformat()}",
+            err=True,
+        )
+
+    try:
+        outcome = run(
+            decide_sources(
+                SessionLocal,
+                data_type,
+                decision,
+                first,
+                second,
+                note=note,
+                dry_run=dry_run,
+                batch_size=batch_size,
+                progress=progress,
+                notice=lambda message: typer.echo(message, err=True),
+            )
+        )
+    except (DecisionRefused, BackfillRunning, LockUnavailable) as exc:
+        typer.echo(f"identity-decide refused: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(outcome.as_dict(), indent=2, default=str))
+
+
+@app.command()
+def identity_sources(data_type: str = typer.Option(..., "--data-type")) -> None:
+    """List a data type's source fingerprints: spans, devices, chains (with review state),
+    pairs kept apart, the owner's decisions, and what the chain rule leaves open."""
+    from app.services.identity_decisions import list_sources
+
+    typer.echo(json.dumps(run(list_sources(SessionLocal, data_type)), indent=2, default=str))
 
 
 FETCHED_SINCE_OPTION = typer.Option(

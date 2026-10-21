@@ -14,36 +14,40 @@ append-only tables, a widen-only one and a bookkeeping one:
   a reason. Superseded rows stay (payload, versions, `source_deleted_at`, events); readers and
   the `analytics_*` views skip them.
 * `raw_source_chains`: per data type, source fingerprint -> the fingerprint the same device has
-  after a rename or a dropped package suffix, decided by the reconciler only (identity-backfill;
-  app/services/source_chains.py). Only fingerprints of one chain are ever paired or merged.
-* `raw_source_chain_events`: a later sighting contradicted a chain link (no longer used).
-* `raw_source_pairs`: two fingerprints returned together for one key (two distinct sources).
+  after a rename or a dropped package suffix, decided by the reconciler (identity-backfill;
+  app/services/source_chains.py) or by the owner (identity-decide). Only fingerprints of one
+  chain are ever paired or merged.
+* `raw_source_chain_events`: a chain link was refuted (its two forms are two devices).
+* `raw_source_pairs`: a key returned in one response under two fingerprints with two
+  different readings (evidence of two distinct sources).
+* `raw_source_decisions`: the owner's decisions about two fingerprints.
 * `raw_source_sightings` (widen-only): first and last sighting of each fingerprint.
 * `identity_reconcile_state` (bookkeeping): the reconciler's checkpoint per data type.
 
 It also adds `fetch_rounds` (bookkeeping): when a sync round or a backfill window fetch began
 at its first page, kept when the fetch resumes from its page token.
 
-The five append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
+The six append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
 triggers calling 0011's `healthos_refuse_change()`); the sightings refuse `DELETE`,
 `TRUNCATE` and any `UPDATE` that narrows a span (`healthos_sightings_widen_only()`).
 `health-mirror verify` checks them, their constraints, that no rule or row-level security
 sits on them and that the `analytics_*` views are these. On PostgreSQL the `analytics_*`
 views are replaced (`CREATE OR REPLACE`, same columns) so they show what the dashboard
-counts: rows of a quarantined, source-deleted or superseded raw record are left out (before,
-only quarantined ones); SQLite (tests only) keeps the old views.
+counts: rows of a quarantined or source-deleted raw record, and rows superseded by a live row,
+are left out (before, only quarantined ones); SQLite (tests only) keeps the old views.
 
-Catalog-only and fast: empty tables, their indexes and triggers, and view definitions (no
-ALTER of an existing table, so a running pg_dump never blocks it).
+Fast: empty tables, their indexes and triggers, view definitions, and one partial index on
+`raw_health_data` (its source-deleted rows, so the views never scan the whole table); no
+ALTER of an existing table, so a running pg_dump never blocks it.
 Filling them is `health-mirror identity-backfill`, run after the deploy (docs/RUNBOOK.md).
 Like 0011 it sets `lock_timeout` (30 s, `-x lock-timeout=...`): the foreign keys to
 `raw_health_data` need a SHARE ROW EXCLUSIVE lock on it (writers conflict, readers and
 pg_dump do not), and a lock held too long makes the upgrade fail fast, changing nothing,
 instead of queueing every writer behind it.
 
-downgrade() refuses while an append-only table has rows (dropping them would lose which
-duplicates were linked and which sources were chained); pass `-x allow-identity-loss=1` after
-a backup.
+downgrade() refuses while an append-only table or the sightings have rows (dropping them
+would lose which duplicates were linked, which sources were chained, what the owner decided
+and when each source was seen); pass `-x allow-identity-loss=1` after a backup.
 
 The trigger SQL below is a frozen copy of app/models/identity.py; tests/test_identity_keys.py
 compares them.
@@ -65,10 +69,23 @@ SUPERSESSION_TABLE = "raw_health_data_supersessions"
 CHAIN_TABLE = "raw_source_chains"
 CHAIN_EVENT_TABLE = "raw_source_chain_events"
 PAIR_TABLE = "raw_source_pairs"
+DECISION_TABLE = "raw_source_decisions"
 SIGHTING_TABLE = "raw_source_sightings"
 RECONCILE_TABLE = "identity_reconcile_state"
 FETCH_ROUND_TABLE = "fetch_rounds"
-IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE, CHAIN_EVENT_TABLE, PAIR_TABLE)
+IDENTITY_TABLES = (
+    IDENTITY_TABLE,
+    SUPERSESSION_TABLE,
+    CHAIN_TABLE,
+    CHAIN_EVENT_TABLE,
+    PAIR_TABLE,
+    DECISION_TABLE,
+)
+# Source-deleted raw rows, for the analytics views (a partial index; the only object this
+# revision adds to an existing table).
+DELETED_INDEX = "ix_raw_health_data_source_deleted"
+# Tables whose rows downgrade() refuses to drop without -x allow-identity-loss=1.
+KEPT_TABLES = (*IDENTITY_TABLES, SIGHTING_TABLE)
 
 SIGHTINGS_FUNCTION = "healthos_sightings_widen_only"
 FUNCTION_BODIES = {
@@ -200,19 +217,23 @@ def _view(table: str, *, current_only: bool) -> str:
     if not current_only:
         return sql
     # Like the dashboard: a normalized row counts unless its raw record (same key) is marked
-    # deleted at the source or superseded. The data type keeps the lookup on the raw table's
-    # (data_type, google_data_point_id) key.
+    # deleted at the source or superseded by a row that is not. Both lookups are index
+    # probes: the raw table's (data_type, google_data_point_id) key and the supersessions'
+    # (old_google_data_point_id, data_type) index.
     types = NORMALIZED_TABLES[table]
-    same_type = (
-        f"r.data_type = {table}.data_type"
-        if not types
-        else "r.data_type IN (" + ", ".join(f"'{name}'" for name in types) + ")"
-    )
+    if types:
+        names = ", ".join(f"'{name}'" for name in types)
+        raw_type, link_type = f"r.data_type IN ({names})", f"s.data_type IN ({names})"
+    else:
+        raw_type, link_type = (f"{alias}.data_type = {table}.data_type" for alias in "rs")
     return (
         f"{sql} AND NOT EXISTS (SELECT 1 FROM raw_health_data r "
-        f"WHERE {same_type} AND r.google_data_point_id = {table}.google_data_point_id "
-        f"AND (r.source_deleted_at IS NOT NULL OR EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
-        "WHERE s.old_raw_id = r.id)))"
+        f"WHERE {raw_type} AND r.google_data_point_id = {table}.google_data_point_id "
+        "AND r.source_deleted_at IS NOT NULL) "
+        f"AND NOT EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
+        "JOIN raw_health_data h ON h.id = s.new_raw_id "
+        f"WHERE {link_type} AND s.old_google_data_point_id = {table}.google_data_point_id "
+        "AND h.source_deleted_at IS NULL)"
     )
 
 
@@ -370,6 +391,7 @@ def _upgrade(dialect: str) -> None:
         sa.Column("data_type", sa.String(128), nullable=False),
         sa.Column("first_fingerprint", sa.String(64), nullable=False),
         sa.Column("second_fingerprint", sa.String(64), nullable=False),
+        sa.Column("identity_key", sa.String(100), nullable=False),
         sa.Column("seen_together_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column(
             "created_at",
@@ -381,8 +403,44 @@ def _upgrade(dialect: str) -> None:
             "first_fingerprint < second_fingerprint", name=op.f("ck_raw_source_pairs_ordered")
         ),
         sa.PrimaryKeyConstraint(
-            "data_type", "first_fingerprint", "second_fingerprint", name="pk_raw_source_pairs"
+            "data_type",
+            "first_fingerprint",
+            "second_fingerprint",
+            "identity_key",
+            name="pk_raw_source_pairs",
         ),
+    )
+    op.create_table(
+        DECISION_TABLE,
+        sa.Column(
+            "id",
+            sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+            primary_key=True,
+            autoincrement=True,
+        ),
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("decision", sa.String(16), nullable=False),
+        sa.Column("first_fingerprint", sa.String(64), nullable=False),
+        sa.Column("second_fingerprint", sa.String(64), nullable=False),
+        sa.Column("first_label", sa.String(255), nullable=False),
+        sa.Column("second_label", sa.String(255), nullable=False),
+        sa.Column("note", sa.Text(), nullable=True),
+        sa.Column("decided_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "first_fingerprint <> second_fingerprint",
+            name=op.f("ck_raw_source_decisions_distinct_sources"),
+        ),
+        sa.CheckConstraint(
+            "decision IN ('link', 'reject', 'confirm', 'distinct', 'not-distinct')",
+            name=op.f("ck_raw_source_decisions_known_decision"),
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_raw_source_decisions"),
     )
     op.create_table(
         RECONCILE_TABLE,
@@ -412,6 +470,15 @@ def _upgrade(dialect: str) -> None:
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("kind", "key", name="pk_fetch_rounds"),
     )
+    # Under the SHARE ROW EXCLUSIVE lock the foreign keys take anyway (it reads every row
+    # once; measured 0.3 s for 1.4 million rows).
+    op.create_index(
+        DELETED_INDEX,
+        "raw_health_data",
+        ["data_type", "google_data_point_id"],
+        postgresql_where=sa.text("source_deleted_at IS NOT NULL"),
+        sqlite_where=sa.text("source_deleted_at IS NOT NULL"),
+    )
     for statement in POSTGRESQL_DDL if dialect == "postgresql" else SQLITE_DDL:
         op.execute(statement)
     if dialect == "postgresql":
@@ -425,10 +492,8 @@ def _refuse_while_kept(context_) -> None:
     hint = "Take a backup, then rerun with -x allow-identity-loss=1"
     if context_.as_sql:
         if context_.dialect.name != "postgresql":
-            raise RuntimeError(
-                f"offline downgrade cannot check {', '.join(IDENTITY_TABLES)}; {hint}"
-            )
-        for table in IDENTITY_TABLES:
+            raise RuntimeError(f"offline downgrade cannot check {', '.join(KEPT_TABLES)}; {hint}")
+        for table in KEPT_TABLES:
             op.execute(
                 f"""DO $$
 BEGIN
@@ -439,7 +504,7 @@ END
 $$"""
             )
         return
-    for table in IDENTITY_TABLES:
+    for table in KEPT_TABLES:
         kept = op.get_bind().scalar(sa.text(f"SELECT count(*) FROM {table}"))
         if kept:
             raise RuntimeError(f"{table} holds {kept} row(s); downgrading would drop them. {hint}")
@@ -455,11 +520,13 @@ def downgrade() -> None:
     # Dropping a table drops its triggers; healthos_refuse_change() belongs to 0011.
     op.drop_table(FETCH_ROUND_TABLE)
     op.drop_table(RECONCILE_TABLE)
+    op.drop_table(DECISION_TABLE)
     op.drop_table(PAIR_TABLE)
     op.drop_table(CHAIN_EVENT_TABLE)
     op.drop_table(SIGHTING_TABLE)
     op.drop_table(CHAIN_TABLE)
     op.drop_table(SUPERSESSION_TABLE)
     op.drop_table(IDENTITY_TABLE)
+    op.drop_index(DELETED_INDEX, table_name="raw_health_data")
     if context_.dialect.name == "postgresql":
         op.execute(f"DROP FUNCTION {SIGHTINGS_FUNCTION}()")

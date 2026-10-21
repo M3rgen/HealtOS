@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
 
 from app.db.session import SessionLocal
-from app.models.identity import superseded
+from app.models.identity import held_elsewhere
 from app.models.state import RawHealthData
 from app.services.dashboard import dashboard_data
 
@@ -78,7 +78,7 @@ async def read_health(arguments: dict) -> dict:
                 .where(
                     RawHealthData.is_quarantined.is_(False),
                     RawHealthData.source_deleted_at.is_(None),
-                    ~superseded(RawHealthData.id),
+                    ~held_elsewhere(RawHealthData.id),
                 )
                 .group_by(RawHealthData.data_type)
                 .order_by(RawHealthData.data_type)
@@ -119,7 +119,7 @@ async def read_health(arguments: dict) -> dict:
                 RawHealthData.data_type == query.data_type,
                 RawHealthData.is_quarantined.is_(False),
                 RawHealthData.source_deleted_at.is_(None),
-                ~superseded(RawHealthData.id),
+                ~held_elsewhere(RawHealthData.id),
                 RawHealthData.source_start_time < stop,
                 func.coalesce(RawHealthData.source_end_time, RawHealthData.source_start_time)
                 >= start,

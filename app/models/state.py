@@ -50,6 +50,15 @@ class RawHealthData(TimestampMixin, Base):
             "data_type",
             text("coalesce(source_end_time, source_start_time)"),
         ),
+        # The source-deleted rows (a small share): the analytics_* views and the readers
+        # leave them out without scanning every row (migration 20261021_0012).
+        Index(
+            "ix_raw_health_data_source_deleted",
+            "data_type",
+            "google_data_point_id",
+            postgresql_where=text("source_deleted_at IS NOT NULL"),
+            sqlite_where=text("source_deleted_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)

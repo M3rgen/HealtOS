@@ -134,6 +134,19 @@ async def raw_rows(sessions, spec) -> list[RawHealthData]:
         return list((await session.scalars(query.order_by(RawHealthData.first_seen_at))).all())
 
 
+async def counted_rows(sessions, spec=HEART) -> list[RawHealthData]:
+    """The rows readers count: live, and not superseded by a live row (held_elsewhere)."""
+    from app.models.identity import held_elsewhere
+
+    async with sessions() as session:
+        query = select(RawHealthData).where(
+            RawHealthData.data_type == spec.name,
+            RawHealthData.source_deleted_at.is_(None),
+            ~held_elsewhere(RawHealthData.id),
+        )
+        return list((await session.scalars(query.order_by(RawHealthData.first_seen_at))).all())
+
+
 async def count(sessions, model) -> int:
     async with sessions() as session:
         return await session.scalar(select(func.count()).select_from(model)) or 0

@@ -121,7 +121,8 @@ async def test_one_backfill_at_a_time_and_writers_share_the_data_type_lock(pg_se
 
 async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions) -> None:
     """Review 2: cycles of any length, links hiding a named record, links across data types
-    or devices, links behind a deleted row, chain cycles, and tampered constraints or rules."""
+    or devices, chain cycles, and tampered constraints or rules; a link behind a deleted row
+    is a note (the row counts again)."""
     band = [await legacy(pg_sessions, HEART, heart(60 + n, at=T0 + n * HOUR), T0) for n in range(3)]
     watch = await legacy(pg_sessions, HEART, heart(90, name=WATCH), T0)
     step = await legacy(pg_sessions, STEPS, steps(5), T0)
@@ -161,7 +162,10 @@ async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions
         "CREATE RULE keep_quiet AS ON DELETE TO raw_health_data_identity DO INSTEAD NOTHING",
     )
     async with pg_sessions() as session:
-        _, errors, _ = await verify_identities(session)
+        _, errors, notes = await verify_identities(session)
+    # A live row linked to a deleted one is not hidden: readers count it again (B1).
+    assert any("1 superseded row(s) count again" in note for note in notes)
+    assert not any("behind a deleted one" in error for error in errors)
     text_ = "\n".join(errors)
     for expected in (
         f"supersession of raw row {band[0]} forms a cycle",
@@ -169,7 +173,6 @@ async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions
         f"supersession of raw row {named} hides a record with a Google id",
         f"supersession of raw row {step} does not match its rows",
         f"supersession of raw row {named} links two different records",
-        f"supersession of raw row {alive} hides a live record behind a deleted one",
         f"supersession of raw row {alive} links two different sources",
         "source chain of heart-rate from a forms a cycle",
         "constraint missing: raw_source_chains.uq_raw_source_chains_data_type",

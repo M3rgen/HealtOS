@@ -1,9 +1,9 @@
 """The ``analytics_*`` views as migration 20261021_0012 defines them (PostgreSQL).
 
-They show what the dashboard counts: rows of a quarantined, source-deleted or superseded raw
-record are left out. ``health-mirror verify`` compares the views in the database with these
-definitions (app/services/identity.py, ``verify_views``); the migration keeps its own frozen
-copy and tests/test_identity_keys.py compares the two.
+They show what the dashboard counts: rows of a quarantined or source-deleted raw record, and
+rows superseded by a live row, are left out. ``health-mirror verify`` compares the views in the
+database with these definitions (app/services/identity.py, ``verify_views``); the migration
+keeps its own frozen copy and tests/test_identity_keys.py compares the two.
 """
 
 from __future__ import annotations
@@ -33,18 +33,23 @@ NORMALIZED_TABLES = {
 
 def view_select(table: str) -> str:
     """The ``SELECT`` of ``analytics_<table>``: like the dashboard, a normalized row counts
-    unless it is quarantined or its raw record (same key) is marked deleted at the source or
-    superseded. The data type keeps the lookup on the raw table's key."""
+    unless it is quarantined, its raw record (same key) is marked deleted at the source, or
+    that record is superseded by a row that is not marked deleted (``held_elsewhere``). Both
+    lookups are index probes: the raw table's (data_type, google_data_point_id) key and the
+    supersessions' (old_google_data_point_id, data_type) index."""
     types = NORMALIZED_TABLES[table]
-    same_type = (
-        f"r.data_type = {table}.data_type"
-        if not types
-        else "r.data_type IN (" + ", ".join(f"'{name}'" for name in types) + ")"
-    )
+    if types:
+        names = ", ".join(f"'{name}'" for name in types)
+        raw_type, link_type = f"r.data_type IN ({names})", f"s.data_type IN ({names})"
+    else:
+        raw_type, link_type = (f"{alias}.data_type = {table}.data_type" for alias in "rs")
     return (
         f"SELECT * FROM {table} WHERE is_quarantined = false "
         f"AND NOT EXISTS (SELECT 1 FROM raw_health_data r "
-        f"WHERE {same_type} AND r.google_data_point_id = {table}.google_data_point_id "
-        f"AND (r.source_deleted_at IS NOT NULL OR EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
-        "WHERE s.old_raw_id = r.id)))"
+        f"WHERE {raw_type} AND r.google_data_point_id = {table}.google_data_point_id "
+        "AND r.source_deleted_at IS NOT NULL) "
+        f"AND NOT EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
+        "JOIN raw_health_data h ON h.id = s.new_raw_id "
+        f"WHERE {link_type} AND s.old_google_data_point_id = {table}.google_data_point_id "
+        "AND h.source_deleted_at IS NULL)"
     )

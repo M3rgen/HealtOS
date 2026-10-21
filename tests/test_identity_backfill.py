@@ -270,12 +270,10 @@ async def test_a_device_seen_alongside_keeps_a_rename_undecided(sessions) -> Non
     assert report.chains == []
     [case] = report.ambiguous
     assert case["source"] == "FITBIT / Example Band / DERIVED"
-    assert "alongside" in case["why"] and case["candidates"] == ["FITBIT / Example Watch / DERIVED"]
-    assert sorted(pair["why"] for pair in report.kept_apart) == [
-        "not decided as one device (see ambiguous)",
-        "seen together (overlapping sightings): two devices",
-        "seen together (overlapping sightings): two devices",
-    ]
+    assert "alongside" in case["why"]
+    assert [found["source"] for found in case["candidates"]] == ["FITBIT / Example Watch / DERIVED"]
+    # One instant each returned with two values: not enough to establish two devices.
+    assert [pair["established"] for pair in report.kept_apart] == [False, False, False]
     result = await identity_backfill(sessions)
     assert await links(sessions) == {} and not result["heart-rate"].linked
     assert result["heart-rate"].distinct_sources == 2
@@ -303,7 +301,7 @@ async def test_backfill_never_links_across_fingerprints_with_two_candidates(sess
     [case] = report["heart-rate"].ambiguous
     assert case["source"] == "FITBIT / Example Band / DERIVED"
     assert case["why"] == "more than one source of its class ended before it"
-    assert case["candidates"] == [
+    assert [found["source"] for found in case["candidates"]] == [
         "FITBIT / Example Band Pro / DERIVED",
         "FITBIT / Example Watch / DERIVED",
     ]

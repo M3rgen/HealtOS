@@ -22,6 +22,7 @@ from identity_records import (
     T0,
     chains,
     count,
+    counted_rows,
     heart,
     legacy,
     mark,
@@ -264,31 +265,36 @@ async def test_a_resumed_fetch_never_renames_a_device_seen_before_the_crash(sess
     assert await chains(sessions) == []
 
 
-async def test_a_contradicted_chain_is_no_longer_used_and_verify_notes_it(sessions, clock):
-    """The old name returns after the chain was decided: a contradiction event, the chain is
-    no longer applied (the old name's records go to their own rows), the links made under it
-    stay valid and verify reports a note, not an error."""
-    from app.models.identity import RawSourceChainEvent
+async def test_an_old_name_coming_back_keeps_the_chain_and_counts_once(sessions, clock):
+    """Review B3: the old name returns after the chain was decided. That is no contradiction
+    (a name can change back): the chain stays in use, each record Google returns in either
+    form with the same value is counted once, and verify stays green without notes."""
     from app.services.identity import verify_identities
 
     old = await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
     await identity_backfill(sessions)
     clock.now = T0 + 7 * HOUR
-    await store(sessions, HEART, heart(60, name=NEW_NAME))
+    await store(
+        sessions, HEART, heart(60, name=NEW_NAME), heart(65, at=T0 + 7 * HOUR, name=NEW_NAME)
+    )
     await reconcile(sessions)
     assert old in await superseded_ids(sessions)
     clock.now = T0 + 30 * HOUR
-    stats = await store(sessions, HEART, heart(70, at=T0 + 30 * HOUR))  # the old name again
-    assert stats.inserted == 1
-    assert await count(sessions, RawSourceChainEvent) == 1
-    clock.advance(minutes=1)
-    later = heart(71, at=T0 + 2 * HOUR, name=NEW_NAME)
-    await legacy(sessions, HEART, heart(71, at=T0 + 2 * HOUR), T0, last=T0 + HOUR)
-    assert (await store(sessions, HEART, later)).inserted == 1  # the chain is not applied
+    fetched_since = clock.now
+    # The whole window again, in the old name: both records.
+    stats = await store(sessions, HEART, heart(60), heart(65, at=T0 + 7 * HOUR))
+    assert (stats.inserted, stats.updated) == (0, 2)
+    assert await mark(sessions, HEART, T0 - HOUR, T0 + 8 * HOUR, fetched_since) == 0
+    await reconcile(sessions)
+    assert visible(await counted_rows(sessions)) == [(OLD_NAME, 60), (OLD_NAME, 65)]
+    # And back again: still one row per record.
+    clock.advance(hours=1)
+    stats = await store(sessions, HEART, heart(60, name=NEW_NAME))
+    assert (stats.inserted, stats.updated) == (0, 1)
+    assert len(visible(await counted_rows(sessions))) == 2
     async with sessions() as session:
         _, errors, notes = await verify_identities(session)
-    assert errors == []
-    assert len(notes) == 1 and "contradicted" in notes[0]
+    assert errors == [] and notes == []
 
 
 async def test_marking_defers_while_a_rename_is_undecided(sessions, clock) -> None:

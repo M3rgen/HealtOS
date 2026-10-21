@@ -95,10 +95,10 @@ async def test_a_row_changed_after_resolution_is_resolved_again(
 
     await store(pg_sessions, HEART, heart(60))
     [row] = await raw_rows(pg_sessions, HEART)
-    original = storage._lock_targets
+    original = storage._lock_rows
     calls = []
 
-    async def meanwhile(session, spec, resolution):
+    async def meanwhile(session, spec, google_ids, resolution):
         if not calls:
             changed = heart(62)
             await execute(
@@ -108,9 +108,9 @@ async def test_a_row_changed_after_resolution_is_resolved_again(
                 f"payload_hash = '{payload_hash(changed)}' WHERE id = '{row.id}'",
             )
         calls.append(1)
-        await original(session, spec, resolution)
+        return await original(session, spec, google_ids, resolution)
 
-    monkeypatch.setattr(storage, "_lock_targets", meanwhile)
+    monkeypatch.setattr(storage, "_lock_rows", meanwhile)
     # The migration's fileConfig disables existing loggers while the database is set up.
     monkeypatch.setattr(logging.getLogger("app.services.storage"), "disabled", False)
     with caplog.at_level(logging.INFO, logger="app.services.storage"):
@@ -181,10 +181,10 @@ async def linked_chain(sessions) -> None:
     await identity_backfill(sessions)
 
 
-async def test_sightings_only_widen_and_a_contradiction_is_a_note(pg_sessions) -> None:
+async def test_sightings_only_widen_and_an_old_name_seen_again_is_no_error(pg_sessions) -> None:
     """Re-review 2 (tampering): sightings cannot be deleted or narrowed. The old name seen
-    again (a widening) contradicts the chain: verify notes it; the links made under it stay
-    valid (they are judged against the chain recorded when they were made)."""
+    again (a widening) is no contradiction (B3: a name can change back): the chain stays in
+    use, verify reports neither an error nor a note."""
     await linked_chain(pg_sessions)
     assert await problems(pg_sessions) == ([], [])
     for statement in (
@@ -201,9 +201,7 @@ async def test_sightings_only_widen_and_a_contradiction_is_a_note(pg_sessions) -
         "UPDATE raw_source_sightings SET last_seen_at = last_seen_at + interval '1 day' "
         "WHERE label LIKE '%Example Band Pro%'",
     )
-    errors, notes = await problems(pg_sessions)
-    assert errors == []
-    assert len(notes) == 1 and "contradicted" in notes[0]
+    assert await problems(pg_sessions) == ([], [])
 
 
 async def test_verify_detects_forged_chains_hidden_rows_views_and_swapped_tables(

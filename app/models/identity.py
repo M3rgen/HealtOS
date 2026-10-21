@@ -10,21 +10,28 @@ a returning record through it. Rows stored since 0012 need none: their id
 
 ``raw_health_data_supersessions`` links a duplicate row that was archived under an older id
 of the same record to the row that holds the record now. A superseded row is kept with its
-payload, versions, ``source_deleted_at`` and events (it is history), but it no longer counts:
-dashboards, Umay and the ``analytics_*`` views skip it, as they skip a source deletion.
+payload, versions, ``source_deleted_at`` and events (it is history), and it no longer counts
+while its holder is live: dashboards, Umay and the ``analytics_*`` views skip it, as they skip a
+source deletion (``held_elsewhere``). When the holder is marked deleted at the source, a live
+superseded row counts again: a link never hides a live record behind a deleted one.
 
 ``raw_source_chains`` records which source fingerprints are one device seen before and after
 a change (a ``displayName`` rename, a dropped package suffix): one row per link ``from -> to``,
 decided per data type and stable source class by the reconciler from the sources' sighting
-timelines (app/services/source_chains.py), with the spans it was decided on as ``evidence``.
-``raw_source_chain_events`` records when a later sighting contradicted a link (the old form
-was seen again): from then on the link is no longer used for new pairings, while the
-supersessions made under it stay.
+timelines (app/services/source_chains.py), with the spans it was decided on as ``evidence``,
+or by the owner (``health-mirror identity-decide link``). A link joins the two forms into one
+device in both directions: the old form coming back later does not undo it.
+``raw_source_chain_events`` records when a link was *refuted* (the two forms turned out to be
+two devices): from then on it is no longer used, while the supersessions made under it stay.
 
-``raw_source_pairs`` records two fingerprints returned together for one key: proof of two
-distinct sources, which deletion marking needs (a renamed device never shows both forms).
+``raw_source_pairs`` records evidence of two distinct sources: a key returned in one response
+under two fingerprints with two different readings (one record has one value). Two
+fingerprints with at least ``PAIR_KEYS`` such keys are *established distinct*.
 
-These five tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
+``raw_source_decisions`` records the owner's decisions about two fingerprints (link, reject or
+confirm a chain; mark a pair distinct or not distinct). The latest decision per question wins.
+
+These six tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
 ``ENABLE ALWAYS``). ``raw_source_sightings`` - when each source fingerprint was first and last
 seen, by the database clock - may only widen: no ``DELETE`` or ``TRUNCATE``, and an ``UPDATE``
 may only move ``first_seen_at`` earlier, ``last_seen_at`` later and ``complete`` to true.
@@ -43,6 +50,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -57,10 +65,10 @@ from sqlalchemy import (
     func,
     select,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, aliased, mapped_column
 
 from app.db.base import Base
-from app.models.state import RawJSON
+from app.models.state import RawHealthData, RawJSON
 
 # Its after_create DDL defines healthos_refuse_change(), which the triggers below call.
 import app.models.raw_versions  # noqa: E402, F401  isort: skip
@@ -70,15 +78,29 @@ SUPERSESSION_TABLE = "raw_health_data_supersessions"
 CHAIN_TABLE = "raw_source_chains"
 CHAIN_EVENT_TABLE = "raw_source_chain_events"
 PAIR_TABLE = "raw_source_pairs"
+DECISION_TABLE = "raw_source_decisions"
 SIGHTING_TABLE = "raw_source_sightings"
 RECONCILE_TABLE = "identity_reconcile_state"
 # The append-only tables of this revision.
-IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE, CHAIN_EVENT_TABLE, PAIR_TABLE)
+IDENTITY_TABLES = (
+    IDENTITY_TABLE,
+    SUPERSESSION_TABLE,
+    CHAIN_TABLE,
+    CHAIN_EVENT_TABLE,
+    PAIR_TABLE,
+    DECISION_TABLE,
+)
 # Every table whose rows verify protects (the sightings may only widen).
 GUARDED_TABLES = (*IDENTITY_TABLES, SIGHTING_TABLE)
-# Who decides a chain: a full run of identity-backfill, or the incremental reconciler.
-DECIDERS = ("backfill", "reconciler")
-CONTRADICTED = "contradicted"
+# Who decides a chain: a full run of identity-backfill, the incremental reconciler, or the
+# owner (identity-decide link, with its decision row).
+DECIDERS = ("backfill", "reconciler", "owner")
+# A chain whose two forms turned out to be two devices (raw_source_chain_events).
+REFUTED = "refuted"
+# The owner's decisions (raw_source_decisions): about a chain from -> to, or about a pair.
+CHAIN_DECISIONS = ("link", "reject", "confirm")
+PAIR_DECISIONS = ("distinct", "not-distinct")
+DECISIONS = (*CHAIN_DECISIONS, *PAIR_DECISIONS)
 # Why a row was superseded (app.parsers.identity.supersession_reason).
 REASONS = (
     "display-name-change",
@@ -159,7 +181,7 @@ class RawSourceChain(Base):
 
 
 class RawSourceChainEvent(Base):
-    """A later sighting contradicted a chain link: it is no longer used for new pairings."""
+    """A chain link was refuted (its two forms are two devices): it is no longer used."""
 
     __tablename__ = CHAIN_EVENT_TABLE
     __table_args__ = (PrimaryKeyConstraint("data_type", "from_fingerprint", "event"),)
@@ -167,9 +189,9 @@ class RawSourceChainEvent(Base):
     data_type: Mapped[str] = mapped_column(String(128), nullable=False)
     from_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     to_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
-    # CONTRADICTED.
+    # REFUTED.
     event: Mapped[str] = mapped_column(String(32), nullable=False)
-    # JSON: both spans when the contradiction was seen.
+    # JSON: both spans and the evidence (or decision) when the link was refuted.
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -178,23 +200,61 @@ class RawSourceChainEvent(Base):
 
 
 class RawSourcePair(Base):
-    """Two fingerprints were returned together for one v2 key: two distinct sources.
+    """One key that one Google response returned under two fingerprints with two different
+    readings: evidence of two distinct sources.
 
-    One record has one source at a time, so a renamed device (or one whose old name comes
-    back) never shows both forms for the same key in one fetch; two devices that recorded at
-    one instant do. Written by every page (both in it) and by a full identity-backfill (two
-    rows of one key last seen within the chain gap of each other)."""
+    One record has one value: a renamed device (or one whose old name comes back) never
+    returns two values for one record, two devices that measured one instant do. Written by
+    a page that holds both (one response), and by a full identity-backfill (two rows of one
+    key stored or last seen by the same page). A pair is *established distinct* with at least
+    ``PAIR_KEYS`` keys (app/services/source_chains.py); a few more are never recorded."""
 
     __tablename__ = PAIR_TABLE
     __table_args__ = (
-        PrimaryKeyConstraint("data_type", "first_fingerprint", "second_fingerprint"),
+        PrimaryKeyConstraint(
+            "data_type", "first_fingerprint", "second_fingerprint", "identity_key"
+        ),
         CheckConstraint("first_fingerprint < second_fingerprint", name="ordered"),
     )
 
     data_type: Mapped[str] = mapped_column(String(128), nullable=False)
     first_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     second_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The v2 key (RecordIdentity.key) returned under both.
+    identity_key: Mapped[str] = mapped_column(String(100), nullable=False)
     seen_together_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RawSourceDecision(Base):
+    """The owner's decision about two source fingerprints (``health-mirror identity-decide``).
+
+    ``link``, ``reject``, ``confirm``: about the chain ``first -> second`` (record it; stop
+    using it; reviewed, keep it). ``distinct``, ``not-distinct``: about the pair (two devices;
+    the evidence of two devices is to be ignored). The latest row per question wins."""
+
+    __tablename__ = DECISION_TABLE
+    __table_args__ = (
+        CheckConstraint("first_fingerprint <> second_fingerprint", name="distinct_sources"),
+        CheckConstraint(
+            "decision IN ('link', 'reject', 'confirm', 'distinct', 'not-distinct')",
+            name="known_decision",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True
+    )
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    first_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    second_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    first_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    second_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -252,6 +312,21 @@ def superseded(raw_id):
     return (
         select(RawHealthDataSupersession.old_raw_id)
         .where(RawHealthDataSupersession.old_raw_id == raw_id)
+        .exists()
+    )
+
+
+def held_elsewhere(raw_id):
+    """``EXISTS`` clause: ``raw_id`` was superseded by a row that is not marked deleted at the
+    source. Readers skip exactly these rows (the holder counts their record); a superseded row
+    whose holder was marked deleted counts again when it is live itself, so a link can never
+    hide a live record behind a deleted one."""
+    holder = aliased(RawHealthData)
+    link = RawHealthDataSupersession
+    return (
+        select(link.old_raw_id)
+        .join(holder, holder.id == link.new_raw_id)
+        .where(link.old_raw_id == raw_id, holder.source_deleted_at.is_(None))
         .exists()
     )
 

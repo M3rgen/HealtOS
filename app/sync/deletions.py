@@ -7,22 +7,25 @@ that fetch, is marked with ``source_deleted_at``. Nothing is deleted or overwrit
 the record comes back, ``store_records`` clears the mark again.
 
 "Not seen" is decided per record identity, not per row (app.services.identity.
-present_records). A row is not marked while, in the same fetch, a row with its v2 key was
-seen
+present_records). A row is not marked while, in the same fetch, a row with its v2 key *and the
+same reading* was seen
 
-* of the *same device* - the same source fingerprint, or one of its decided chain
-  (app/services/source_chains.py): a duplicate of the record under another id; or
-* of a fingerprint not yet *decided distinct* from the row's (the two were never seen
-  together): possibly the same device renamed, which only the reconciler decides. The mark is
-  deferred, never guessed; once the reconciler has linked the two, the old row is superseded
-  instead.
+* that it is linked with (the row holding its record, or another duplicate of it), or of the
+  *same device* - the same source fingerprint, or one joined to it by a usable chain
+  (app/services/source_chains.py): the record under another id; or
+* of a fingerprint not *established distinct* from the row's (never returned with another
+  value for one key): possibly the same device renamed, which only the reconciler or the
+  owner decides. The mark is deferred, never guessed.
 
-A row of a fingerprint decided distinct (seen alongside the row's own) never keeps a
-candidate: of two devices that recorded at one instant, one can be deleted alone.
+A row of a fingerprint established distinct never keeps a candidate: of two devices that
+recorded at one instant, one can be deleted alone. Nor does a row of the device with another
+value: the candidate then holds a value Google no longer returns.
 
-Superseded rows are skipped (they no longer count, and their record is decided through the
-row that holds it). Candidates are read and decided in chunks, so a long window never sits
-in memory at once.
+Superseded rows are candidates too: their holder stands for them while it is live, but a row
+that counts again because its holder was marked (or would) must be marked when its record is
+gone. Candidates are read and decided in chunks, so a long window never sits in memory at once;
+the marks are written at the end, in key order like ``store_records``' row locks, so a page
+written meanwhile and this check never wait for each other in a circle.
 """
 
 from __future__ import annotations
@@ -44,7 +47,6 @@ from app.google_health.data_types import (
     RecordKind,
     query_time,
 )
-from app.models.identity import superseded
 from app.models.state import RawHealthData
 from app.services.identity import among, present_records
 from app.services.source_chains import lock_data_type
@@ -118,13 +120,15 @@ async def mark_source_deletions(
     marked = kept = deferred = 0
     now = datetime.now(UTC)
     cursor: tuple | None = None
+    missing: list[tuple[str, Any]] = []
     while True:
         query = select(
             RawHealthData.id,
             RawHealthData.raw_json,
             RawHealthData.source_start_time,
             column,
-        ).where(*unseen, ~superseded(RawHealthData.id))
+            RawHealthData.google_data_point_id,
+        ).where(*unseen)
         if cursor is not None:
             query = query.where(tuple_(column, RawHealthData.id) > cursor)
         chunk = (
@@ -138,28 +142,42 @@ async def mark_source_deletions(
         presence = await present_records(
             session,
             spec,
-            [(raw_id, raw_json, start) for raw_id, raw_json, start, _ in chunk],
+            [(raw_id, raw_json, start) for raw_id, raw_json, start, _, _ in chunk],
             fetched_since,
         )
         kept += len(presence.present)
         deferred += len(presence.deferred)
         spared = presence.present | presence.deferred
-        missing = sorted(raw_id for raw_id, *_ in chunk if raw_id not in spared)
-        if missing:
-            result = await session.execute(
-                update(RawHealthData)
-                .where(*unseen, among(session, RawHealthData.id, missing))
-                .values(source_deleted_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as Result.
-            marked += cast(CursorResult[Any], result).rowcount or 0
+        missing.extend(
+            (google_id, raw_id) for raw_id, _, _, _, google_id in chunk if raw_id not in spared
+        )
         if len(chunk) < CHUNK:
             break
+    # Locked in key order, like store_records: no circular wait with a page written meanwhile.
+    missing.sort()
+    postgresql = session.get_bind().dialect.name == "postgresql"
+    for offset in range(0, len(missing), CHUNK):
+        ids = [raw_id for _, raw_id in missing[offset : offset + CHUNK]]
+        if postgresql:
+            await session.execute(
+                select(RawHealthData.id)
+                .where(*unseen, among(session, RawHealthData.id, ids))
+                .order_by(RawHealthData.google_data_point_id)
+                .with_for_update()
+            )
+        result = await session.execute(
+            update(RawHealthData)
+            .where(*unseen, among(session, RawHealthData.id, ids))
+            .values(source_deleted_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as Result.
+        marked += cast(CursorResult[Any], result).rowcount or 0
     if kept:
         event(logger, "SOURCE_DELETIONS_KEPT_BY_IDENTITY", data_type=spec.name, count=kept)
     if deferred:
-        # Possibly renamed: the reconciler decides (identity-backfill, nightly).
+        # Possibly renamed: the reconciler or the owner decides (identity-backfill, nightly;
+        # identity-decide).
         event(logger, "SOURCE_DELETIONS_DEFERRED", data_type=spec.name, count=deferred)
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)

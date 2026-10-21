@@ -22,7 +22,9 @@ from app.models.raw_versions import RawApiResponse
 from app.models.state import RawHealthData
 from app.parsers import normalize
 from app.parsers.common import payload_hash, temporal
-from app.services.identity import add_aliases, resolve_ids
+from app.services import source_chains
+from app.services.identity import add_aliases, among, resolve_ids
+from app.services.source_chains import record_evidence, record_sightings
 
 logger = logging.getLogger(__name__)
 
@@ -130,14 +132,18 @@ async def store_records(
     origin = source or current_source()
     response_ids = await insert_responses(session, responses)
     response_id = response_ids[-1] if response_ids else None
+    # When Google returned the records (the sources' sightings): the response's fetch time.
+    fetched_at = responses[-1].fetched_at if responses else None
     digests = [payload_hash(record) for record in records]
     if session.get_bind().dialect.name != "postgresql":
         # One writer at a time (tests): nothing to collide with.
-        return await _store(session, spec, records, digests, origin, response_id)
+        return await _store(session, spec, records, digests, origin, response_id, fetched_at)
     for _ in range(WRITE_ATTEMPTS):
         try:
             async with session.begin_nested():
-                return await _store(session, spec, records, digests, origin, response_id)
+                return await _store(
+                    session, spec, records, digests, origin, response_id, fetched_at
+                )
         except _Collision:
             event(logger, "RECORD_BATCH_RESOLVED_AGAIN", data_type=spec.name)
     raise RuntimeError(
@@ -146,28 +152,30 @@ async def store_records(
     )
 
 
-async def _lock_targets(session: AsyncSession, spec: DataTypeSpec, resolution) -> None:
-    """Lock the rows the page writes onto (key order, like the upserts) and check that each
-    still holds the payload it was resolved against."""
-    if not resolution.expected or session.get_bind().dialect.name != "postgresql":
-        return
-    from app.services.identity import among
-
+async def _lock_rows(session: AsyncSession, spec: DataTypeSpec, google_ids: list[str], resolution):
+    """Lock the existing rows the page writes onto (key order, like the upserts; PostgreSQL)
+    and check that each still holds the payload it was resolved against. Returns
+    google id -> (raw id, payload hash)."""
     table = RawHealthData
-    current = dict(
-        (
-            await session.execute(
-                select(table.id, table.payload_hash)
-                .where(among(session, table.id, sorted(resolution.expected)))
-                .order_by(table.google_data_point_id)
-                .with_for_update()
+    found: dict[str, tuple] = {}
+    postgresql = session.get_bind().dialect.name == "postgresql"
+    for offset in range(0, len(google_ids), 5000):
+        query = (
+            select(table.google_data_point_id, table.id, table.payload_hash)
+            .where(
+                table.data_type == spec.name,
+                among(session, table.google_data_point_id, google_ids[offset : offset + 5000]),
             )
+            .order_by(table.google_data_point_id)
         )
-        .tuples()
-        .all()
-    )
+        if postgresql:
+            query = query.with_for_update()
+        for google_id, raw_id, digest in (await session.execute(query)).tuples():
+            found[google_id] = (raw_id, digest)
+    current = {raw_id: digest for raw_id, digest in found.values()}
     if any(current.get(raw_id) != digest for raw_id, digest in resolution.expected.items()):
         raise _Collision
+    return found
 
 
 async def _store(
@@ -177,13 +185,10 @@ async def _store(
     digests: Sequence[str],
     origin: str,
     response_id: int | None,
+    fetched_at: datetime | None,
 ) -> StoreStats:
     stats = StoreStats()
     resolution = await resolve_ids(session, spec, records, digests)
-    await _lock_targets(session, spec, resolution)
-    # After the data type's lock and the row locks: a writer that waited never stamps an
-    # older time than a fetch that began while it waited.
-    now = datetime.now(UTC)
     # Per record id, the distinct consecutive payloads of this page, in page order.
     by_id: dict[str, list[tuple]] = {}
     duplicates = 0
@@ -199,16 +204,13 @@ async def _store(
             event(logger, "RECORD_BATCH_DUPLICATE_CONFLICT", data_type=spec.name)
         sequence.append((record, google_id, digest, start, end, timezone))
 
-    existing_hashes: dict[str, str] = {}
-    google_ids = list(by_id)
-    for offset in range(0, len(google_ids), 5000):
-        rows = await session.execute(
-            select(RawHealthData.google_data_point_id, RawHealthData.payload_hash).where(
-                RawHealthData.data_type == spec.name,
-                RawHealthData.google_data_point_id.in_(google_ids[offset : offset + 5000]),
-            )
-        )
-        existing_hashes.update(rows.tuples().all())
+    google_ids = sorted(by_id)
+    existing = await _lock_rows(session, spec, google_ids, resolution)
+    # After the data type's lock and the row locks: a writer that waited never stamps an
+    # older time than a fetch that began while it waited.
+    now = datetime.now(UTC)
+    existing_hashes = {google_id: digest for google_id, (_, digest) in existing.items()}
+    raw_ids = {google_id: raw_id for google_id, (raw_id, _) in existing.items()}
     created = sorted(google_id for google_id in by_id if google_id in resolution.created)
     if any(google_id in existing_hashes for google_id in created):
         raise _Collision
@@ -217,8 +219,9 @@ async def _store(
             _raw_row(spec, by_id[google_id][0], now, origin, response_id) for google_id in created
         ]
         inserted = await _insert_new(session, rows)
-        if inserted != set(created):
+        if set(inserted) != set(created):
             raise _Collision
+        raw_ids.update(inserted)
 
     # One INSERT ... ON CONFLICT statement may not touch the same row twice on
     # PostgreSQL, so the n-th payload of every record goes into the n-th statement (the
@@ -258,10 +261,24 @@ async def _store(
         if rows:
             rows.sort(key=lambda row: row["google_data_point_id"])
             await _upsert_raw_many(session, rows)
-    await add_aliases(session, spec.name, resolution.new_aliases)
+    await add_aliases(session, spec.name, resolution.new_aliases, raw_ids)
     for model, values in normalized_values.items():
         values.sort(key=lambda row: (row.get("data_type", ""), row["google_data_point_id"]))
         await _upsert_normalized_many(session, model, values)
+    if resolution.state is not None:
+        # Late in the transaction: the sightings row of a source is the one row every writer
+        # of the data type shares, so it is held for as short as possible.
+        seen_at = fetched_at or await source_chains.database_now(session)
+        await record_evidence(
+            session, spec.name, resolution.state.chains, resolution.evidence, seen_at
+        )
+        await record_sightings(
+            session,
+            spec.name,
+            resolution.seen,
+            seen_at,
+            history_known=resolution.state.history_known,
+        )
     if records:
         event(
             logger,
@@ -274,23 +291,24 @@ async def _store(
             duplicates=duplicates,
             versions_kept=stats.versions_kept,
             chained=resolution.chained,
+            kept_apart=resolution.kept_apart,
         )
     return stats
 
 
-async def _insert_new(session: AsyncSession, rows: list[dict]) -> set[str]:
-    """Insert new rows; the ids that were inserted (one another writer created first is not)."""
+async def _insert_new(session: AsyncSession, rows: list[dict]) -> dict[str, object]:
+    """Insert new rows; google id -> raw id of those inserted (one another writer created
+    first is not)."""
     table = RawHealthData.__table__
-    inserted: set[str] = set()
-    for offset in range(0, len(rows), 1000):
-        statement = (
-            dialect_insert(session, table)
-            .values(rows[offset : offset + 1000])
-            .on_conflict_do_nothing(index_elements=["data_type", "google_data_point_id"])
-            .returning(table.c.google_data_point_id)
-        )
-        inserted.update((await session.execute(statement)).scalars().all())
-    return inserted
+    # One cached statement, many parameter sets (batched into multi-row VALUES by the driver
+    # layer): compiling a 1,000-row VALUES list per page costs more than the insert.
+    statement = (
+        dialect_insert(session, table)
+        .on_conflict_do_nothing(index_elements=["data_type", "google_data_point_id"])
+        .returning(table.c.google_data_point_id, table.c.id)
+    )
+    result = await session.execute(statement, rows)
+    return dict(result.tuples().all())
 
 
 def _raw_row(

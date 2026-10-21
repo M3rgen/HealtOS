@@ -3,30 +3,36 @@
 ``resolve_ids`` decides, for one page of records, under which ``google_data_point_id`` each
 is written. A record with a Google ``name`` keeps it. The others are grouped by v2 key
 (app/parsers/identity.py) and source fingerprint. The write path never *decides* whether two
-fingerprints are one device; it only applies what the reconciler decided
-(app/services/source_chains.py). Every group is written onto
+fingerprints are one device; it only applies what the reconciler or the owner decided
+(app/services/source_chains.py: a *device* is a fingerprint and every one joined to it by
+usable chain links, either way). Every group is written onto
 
-1. a row that holds this key from this *same* fingerprint (a returning record, civil times
-   added, a grown interval) - the row that holds it now when the row was merged into another
-   of the same fingerprint; or
-2. else, along a decided, never contradicted chain, the row of a *predecessor* fingerprint
-   (a renamed device, a dropped package suffix) whose reading is the same - it gets the new
-   payload as a new version, so nothing is archived twice; or
-3. else a new row ``synthetic:v2s:<hash of key and fingerprint>``: an unknown fingerprint
+1. the row that holds this key from this *same* fingerprint and is not superseded (a
+   returning record, civil times added, a grown interval, a revised value); or
+2. when the fingerprint's own rows are all superseded (merged by the reconciler into a row
+   of the device): the row that holds them, when it is the same device and holds the same
+   reading (it gets this form as a new version; a deletion mark on it is cleared); else
+   the own row itself when that row would count (its holder is marked deleted, or this page
+   writes the holder with the same reading); else a new row (a different value is never
+   hidden behind another row); or
+3. else the row of another fingerprint of the device that holds this key and the same
+   reading (a rename, a dropped package suffix, the old name come back): a new version; or
+4. else a new row ``synthetic:v2s:<hash of key and fingerprint>``: an unknown fingerprint
    always gets rows of its own. A renamed device is then counted twice until the reconciler
    links the rows (nightly); a genuinely distinct device is never hidden.
 
 Stored rows are found by id only (no scan): the record's v1 id (rows archived before v2), the
-v2s id of the key and fingerprint (rows stored since), and the alias table (rows whose own id
-is neither, aliased by the reconciler). A payload of one fingerprint is never written onto a
-row that holds another fingerprint, except by rule 2. ``store_records`` locks the rows it
+v2s ids of the key and each fingerprint of the device (rows stored since), and the alias table
+(rows whose own id is neither). A payload is never written onto a row of another device, nor
+onto a row of the device that measured something else. ``store_records`` locks the rows it
 writes onto and re-resolves when one changed meanwhile, and creates new rows with ``ON
 CONFLICT DO NOTHING`` (re-resolving when another writer created the row first).
 
 ``present_records`` decides, for deletion marking, whether an unseen row's record is still
-returned under another row: by its own fingerprint or a decided chain (present), by a
-fingerprint not yet decided distinct from it (deferred: possibly a rename the reconciler has
-not decided yet), or not at all (missing).
+returned: with the same reading under a row it is linked with or a row of its device
+(present), with the same reading under a fingerprint not established distinct from it
+(deferred: possibly a rename nobody decided yet), or not at all (missing: also when the
+device returned the key with another value - the row holds a value no longer returned).
 """
 
 from __future__ import annotations
@@ -38,17 +44,26 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import any_, bindparam, func, select, text
+from sqlalchemy import (
+    String,
+    any_,
+    bindparam,
+    case,
+    func,
+    literal,
+    null,
+    select,
+    text,
+    union_all,
+)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.core.logging import event
-from app.core.timeutil import as_utc
 from app.google_health.data_types import DataTypeSpec
 from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
 from app.models.state import RawHealthData
-from app.parsers.common import source_id
+from app.parsers.common import google_name, source_id
 from app.parsers.identity import (
     RecordIdentity,
     new_record_id,
@@ -58,14 +73,7 @@ from app.parsers.identity import (
     spare_record_id,
     specific_key,
 )
-from app.services.source_chains import (
-    Chains,
-    load_chains,
-    lock_data_type,
-    record_contradictions,
-    record_pairs,
-    record_sightings,
-)
+from app.services.source_chains import Chains, SourceState, load_state, lock_data_type
 
 logger = logging.getLogger(__name__)
 
@@ -118,25 +126,67 @@ async def rows_by_key(
     return found
 
 
+async def _find(
+    session: AsyncSession, data_type: str, keys: set[str], google_ids: set[str]
+) -> tuple[dict[str, uuid.UUID], dict[str, uuid.UUID]]:
+    """(alias key -> raw id, google id -> raw id) in one statement per chunk."""
+    alias: dict[str, uuid.UUID] = {}
+    by_id: dict[str, uuid.UUID] = {}
+    keys_left, ids_left = sorted(keys), sorted(google_ids)
+    table = RawHealthDataIdentity
+    while keys_left or ids_left:
+        key_chunk, keys_left = keys_left[:_CHUNK], keys_left[_CHUNK:]
+        id_chunk, ids_left = ids_left[:_CHUNK], ids_left[_CHUNK:]
+        parts = []
+        if key_chunk:
+            parts.append(
+                select(literal("a", String), table.identity_key, table.raw_id).where(
+                    table.data_type == data_type, among(session, table.identity_key, key_chunk)
+                )
+            )
+        if id_chunk:
+            parts.append(
+                select(
+                    literal("r", String), RawHealthData.google_data_point_id, RawHealthData.id
+                ).where(
+                    RawHealthData.data_type == data_type,
+                    among(session, RawHealthData.google_data_point_id, id_chunk),
+                )
+            )
+        statement = union_all(*parts) if len(parts) > 1 else parts[0]
+        for kind, name, raw_id in (await session.execute(statement)).tuples():
+            (alias if kind == "a" else by_id)[name] = raw_id
+    return alias, by_id
+
+
 async def successors(session: AsyncSession, raw_ids: Iterable[uuid.UUID]) -> dict:
-    """raw id -> the row that holds its record now (itself unless superseded)."""
+    """raw id -> the row that holds its record now (itself unless superseded). Two steps per
+    statement (one is the norm)."""
     result = {raw_id: raw_id for raw_id in raw_ids}
+    link = RawHealthDataSupersession
+    second = aliased(RawHealthDataSupersession)
     frontier = sorted(set(result.values()))
     for _ in range(MAX_CHAIN):
         step: dict[uuid.UUID, uuid.UUID] = {}
+        further: list[uuid.UUID] = []
         for chunk in _chunks(frontier):
             rows = await session.execute(
-                select(
-                    RawHealthDataSupersession.old_raw_id, RawHealthDataSupersession.new_raw_id
-                ).where(among(session, RawHealthDataSupersession.old_raw_id, chunk))
+                select(link.old_raw_id, link.new_raw_id, second.new_raw_id)
+                .outerjoin(second, second.old_raw_id == link.new_raw_id)
+                .where(among(session, link.old_raw_id, chunk))
             )
-            step.update(rows.tuples().all())
+            for old, new, beyond in rows.tuples():
+                step[old] = beyond if beyond is not None else new
+                if beyond is not None:
+                    further.append(beyond)
         if not step:
             break
         for start, current in result.items():
             if current in step:
                 result[start] = step[current]
-        frontier = sorted(set(step.values()))
+        if not further:
+            break
+        frontier = sorted(set(further))
     return result
 
 
@@ -168,8 +218,16 @@ class Resolution:
     expected: dict[uuid.UUID, str] = field(default_factory=dict)
     # google_data_point_ids of the rows this page creates.
     created: set[str] = field(default_factory=set)
-    # Records written onto a predecessor fingerprint's row along a decided chain.
+    # Records written onto a row of another fingerprint of their device.
     chained: int = 0
+    # Records kept on a row of their own because the device's row measured something else.
+    kept_apart: int = 0
+    # The page's sources: fingerprint -> (stable class, label, dataSource); recorded as
+    # sightings late in the transaction (storage), with the response time.
+    seen: dict[str, tuple[str, str, object]] = field(default_factory=dict)
+    # Keys returned under two fingerprints with two readings: (fingerprint, fingerprint, key).
+    evidence: list[tuple[str, str, str]] = field(default_factory=list)
+    state: SourceState | None = None
 
 
 @dataclass
@@ -180,7 +238,8 @@ class _Group:
     source: str
     identity: RecordIdentity
     indexes: list[int] = field(default_factory=list)
-    readings: set[str | None] = field(default_factory=set)
+    # The reading of its last record (what its row holds after the page).
+    reading: str | None = None
 
 
 _LIGHT = (
@@ -196,25 +255,29 @@ async def _load_rows(
     session: AsyncSession, spec: DataTypeSpec, raw_ids: set[uuid.UUID], known: dict[str, tuple]
 ) -> dict[uuid.UUID, StoredRow]:
     """The rows, with their identity and reading. ``known``: payload hash -> (identity,
-    reading) of the page's records; a row holding exactly such a payload is not parsed."""
+    reading) of the page's records; a row holding exactly such a payload is not read whole."""
+    from app.core.timeutil import as_utc
+
     found: dict[uuid.UUID, StoredRow] = {}
+    digests = sorted(known)
     for chunk in _chunks(sorted(raw_ids)):
-        rows = await session.execute(select(*_LIGHT).where(among(session, RawHealthData.id, chunk)))
-        for raw_id, google_id, digest, seen, deleted in rows.tuples():
+        payload = RawHealthData.raw_json
+        if digests:
+            payload = case(
+                (among(session, RawHealthData.payload_hash, digests), null()),
+                else_=RawHealthData.raw_json,
+            )
+        rows = await session.execute(
+            select(*_LIGHT, payload).where(among(session, RawHealthData.id, chunk))
+        )
+        for raw_id, google_id, digest, seen, deleted, raw_json in rows.tuples():
             row = StoredRow(raw_id, google_id, digest, as_utc(seen), deleted is not None)
             if digest in known:
                 row.identity, row.reading = known[digest]
+            else:
+                row.identity = record_identity(spec, raw_json)
+                row.reading = reading(spec, raw_json)
             found[raw_id] = row
-    unparsed = sorted(raw_id for raw_id, row in found.items() if row.identity is None)
-    for chunk in _chunks(unparsed):
-        rows = await session.execute(
-            select(RawHealthData.id, RawHealthData.raw_json).where(
-                among(session, RawHealthData.id, chunk)
-            )
-        )
-        for raw_id, raw_json in rows.tuples():
-            found[raw_id].identity = record_identity(spec, raw_json)
-            found[raw_id].reading = reading(spec, raw_json)
     return found
 
 
@@ -228,7 +291,6 @@ async def resolve_ids(
     ids = [source_id(spec, record) for record in records]
     resolution = Resolution(ids)
     groups: dict[tuple[str, str], _Group] = {}
-    seen: dict[str, tuple[str, str, object]] = {}
     known: dict[str, tuple] = {}
     for index, record in enumerate(records):
         identity = record_identity(spec, record)
@@ -236,100 +298,150 @@ async def resolve_ids(
             continue
         assert isinstance(record, dict)
         data_source = record.get("dataSource")
-        seen.setdefault(identity.source, (identity.stable, source_label(data_source), data_source))
+        resolution.seen.setdefault(
+            identity.source, (identity.stable, source_label(data_source), data_source)
+        )
         group = groups.setdefault(
             (identity.key, identity.source), _Group(identity.key, identity.source, identity)
         )
         group.indexes.append(index)
-        value = reading(spec, record)
-        group.readings.add(value)
-        known[digests[index]] = (identity, value)
+        group.reading = reading(spec, record)
+        known[digests[index]] = (identity, group.reading)
     if not groups:
         return resolution
 
     await lock_data_type(session, spec.name, exclusive=False)
-    # The page's sources are seen now (the database clock).
-    now = await record_sightings(session, spec.name, seen)
-    chains = await load_chains(session, spec.name, seen)
-    for old, new in await record_contradictions(session, spec.name, chains, now):
-        event(
-            logger,
-            "SOURCE_CHAIN_CONTRADICTED",
-            data_type=spec.name,
-            old=chains.spans[old].label,
-            new=chains.spans[new].label,
-        )
-    earlier = {fingerprint: chains.predecessors(fingerprint) for fingerprint in seen}
-    sources_by_key: dict[str, list[str]] = defaultdict(list)
-    for key, source in groups:
-        sources_by_key[key].append(source)
-    # Two sources in one page for one key: two distinct devices (a record has one source).
-    await record_pairs(
-        session,
-        spec.name,
-        [
-            (left, right)
-            for sources in sources_by_key.values()
-            for index, left in enumerate(sources)
-            for right in sources[index + 1 :]
-        ],
-        now,
-    )
+    state = await load_state(session, spec.name, resolution.seen)
+    resolution.state = state
+    chains = state.chains
+    by_key: dict[str, list[_Group]] = defaultdict(list)
+    for group in groups.values():
+        by_key[group.key].append(group)
+    # One response returned this key under two fingerprints with two values: evidence of
+    # two devices (one record has one value).
+    resolution.evidence = [
+        (left.source, right.source, key)
+        for key, found in by_key.items()
+        for position, left in enumerate(found)
+        for right in found[position + 1 :]
+        if left.reading != right.reading
+    ]
 
+    # First by id only (the record's v1 id and its own v2s id): a returning record of a
+    # known fingerprint is found there, as a rule. Then, for the groups without a current
+    # row of their own, by alias and by the ids of the other fingerprints of the device.
+    rows: dict[uuid.UUID, StoredRow] = {}
+    alias: dict[str, uuid.UUID] = {}
+    by_id: dict[str, uuid.UUID] = {}
+
+    async def look_up(keys: set[str], google_ids: set[str]) -> None:
+        found_alias, found_ids = await _find(session, spec.name, keys, google_ids)
+        alias.update(found_alias)
+        by_id.update(found_ids)
+        found = (set(found_alias.values()) | set(found_ids.values())) - set(rows)
+        if not found:
+            return
+        holders = await successors(session, found)
+        loaded = await _load_rows(session, spec, (found | set(holders.values())) - set(rows), known)
+        for row in loaded.values():
+            row.holder = holders.get(row.raw_id, row.raw_id)
+        rows.update(loaded)
+
+    await look_up(
+        set(),
+        {
+            google_id
+            for group in groups.values()
+            for google_id in (
+                new_record_id(group.identity.specific_key),
+                *(ids[index] for index in group.indexes),
+            )
+        },
+    )
+    settled = {
+        (row.identity.key, row.identity.source)
+        for row in rows.values()
+        if row.identity is not None and row.holder == row.raw_id
+    }
     wanted_keys: set[str] = set()
     wanted_ids: set[str] = set()
-    for group in groups.values():
-        for source in (group.source, *earlier[group.source]):
-            name = specific_key(group.key, source)
-            wanted_keys.add(name)
-            wanted_ids.add(new_record_id(name))
-        wanted_ids.update(ids[index] for index in group.indexes)
-    alias = await aliases(session, spec.name, wanted_keys)
-    by_id = await rows_by_key(session, spec.name, wanted_ids)
-    found = set(alias.values()) | set(by_id.values())
-    holders = await successors(session, found)
-    rows = await _load_rows(session, spec, found | set(holders.values()), known)
-    for raw_id, holder in holders.items():
-        rows[raw_id].holder = holder
-    for row in rows.values():
-        if row.holder is None:
-            row.holder = row.raw_id
+    for name, group in groups.items():
+        if name in settled:
+            continue
+        for source in chains.members(group.source):
+            key = specific_key(group.key, source)
+            wanted_keys.add(key)
+            wanted_ids.add(new_record_id(key))
+    if wanted_keys:
+        await look_up(wanted_keys, wanted_ids - set(by_id))
 
     by_identity: dict[tuple[str, str], list[StoredRow]] = defaultdict(list)
+    rows_of_key: dict[str, list[StoredRow]] = defaultdict(list)
     for row in rows.values():
         if row.identity is not None:
             by_identity[(row.identity.key, row.identity.source)].append(row)
+            rows_of_key[row.identity.key].append(row)
 
     targets: dict[tuple[str, str], StoredRow] = {}
-    # Own rows first: a row of the group's own fingerprint is never taken by a chain.
+    # raw id -> the group writing onto it.
+    claimed: dict[uuid.UUID, _Group] = {}
+
+    def claim(name: tuple[str, str], target: StoredRow) -> None:
+        targets[name] = target
+        claimed[target.raw_id] = groups[name]
+
+    # 1. The fingerprint's own row that holds the record.
     for name in sorted(groups):
-        own = by_identity.get(name, [])
-        current = [row for row in own if row.holder == row.raw_id]
+        current = [row for row in by_identity.get(name, []) if row.holder == row.raw_id]
         if current:
-            targets[name] = max(current, key=lambda row: row.order)
-        elif own:
-            # Merged by the reconciler into a row of another fingerprint, and that old form
-            # was returned again: the record goes back onto its own row (the merge stays).
-            targets[name] = max(own, key=lambda row: row.order)
-    claimed = {row.raw_id for row in targets.values()}
-    # Then decided chains: the row of the closest earlier fingerprint, same reading.
-    for (key, source), group in sorted(groups.items()):
-        if (key, source) in targets:
+            claim(name, max(current, key=lambda row: row.order))
+    fresh_names: set[tuple[str, str]] = set()
+    # 2. Its own rows are all superseded: the row holding them, or the own row if it counts.
+    for name, group in sorted(groups.items()):
+        own = by_identity.get(name, [])
+        if name in targets or not own:
             continue
-        for previous in earlier[source]:
-            matches = [
-                row
-                for row in by_identity.get((key, previous), [])
-                if row.holder == row.raw_id
-                and row.raw_id not in claimed
-                and group.readings == {row.reading}
-            ]
-            if matches:
-                target = max(matches, key=lambda row: row.order)
-                targets[(key, source)] = target
-                claimed.add(target.raw_id)
-                resolution.chained += len(group.indexes)
-                break
+        mine = max(own, key=lambda row: row.order)
+        holder = rows.get(mine.holder) if mine.holder is not None else None
+        same = (
+            holder is not None
+            and holder.identity is not None
+            and holder.identity.key == group.key
+            and chains.same_device(group.source, holder.identity.source)
+        )
+        writer = claimed.get(holder.raw_id) if holder is not None else None
+        if writer is not None:
+            if same and writer.reading == group.reading:
+                # Hidden behind its holder, which this page writes with the same reading.
+                targets[name] = mine
+            else:
+                fresh_names.add(name)
+        elif holder is not None and same and holder.reading == group.reading:
+            claim(name, holder)
+            resolution.chained += len(group.indexes)
+        elif holder is not None and holder.deleted:
+            # The holder is marked deleted: the own row counts again (held_elsewhere).
+            targets[name] = mine
+        else:
+            fresh_names.add(name)
+            resolution.kept_apart += len(group.indexes)
+    # 3. Another fingerprint of the device holds this key with the same reading.
+    for name, group in sorted(groups.items()):
+        if name in targets or name in fresh_names:
+            continue
+        matches = [
+            row
+            for row in rows_of_key.get(group.key, [])
+            if row.holder == row.raw_id
+            and row.raw_id not in claimed
+            and row.identity is not None
+            and row.identity.source != group.source
+            and chains.same_device(group.source, row.identity.source)
+            and row.reading == group.reading
+        ]
+        if matches:
+            claim(name, max(matches, key=lambda row: row.order))
+            resolution.chained += len(group.indexes)
     fresh: list[tuple[_Group, str]] = []
     for name, group in sorted(groups.items()):
         own_key = group.identity.specific_key
@@ -338,9 +450,11 @@ async def resolve_ids(
             fresh.append((group, new_record_id(own_key)))
             continue
         resolution.expected[target.raw_id] = target.payload_hash
+        # Found by the record's own ids (its v1 id, its v2s id) again next time: no alias.
+        own_ids = {new_record_id(own_key), *(ids[index] for index in group.indexes)}
         for index in group.indexes:
             ids[index] = target.google_data_point_id
-        if target.google_data_point_id != new_record_id(own_key) and own_key not in alias:
+        if target.google_data_point_id not in own_ids and own_key not in alias:
             resolution.new_aliases[own_key] = target.google_data_point_id
     if fresh:
         await _new_ids(session, spec, fresh, by_id, ids, resolution)
@@ -355,8 +469,8 @@ async def _new_ids(
     ids: list[str],
     resolution: Resolution,
 ) -> None:
-    """A new row's id must not be one a stored row already has (a chain may have written
-    another fingerprint's payload onto the row of that id): such a record gets a spare id."""
+    """A new row's id must not be one a stored row already has (that row holds another
+    form or value of the record now): such a record gets a spare id."""
     for group, target in fresh:
         if target in by_id:
             taken = await rows_by_key(
@@ -377,13 +491,20 @@ async def _new_ids(
             ids[index] = target
 
 
-async def add_aliases(session: AsyncSession, data_type: str, new_aliases: dict[str, str]) -> int:
-    """Insert ``identity key -> row`` aliases (rows must exist); existing keys are kept."""
+async def add_aliases(
+    session: AsyncSession,
+    data_type: str,
+    new_aliases: dict[str, str],
+    raw_ids: dict[str, uuid.UUID] | None = None,
+) -> int:
+    """Insert ``identity key -> row`` aliases (rows must exist); existing keys are kept.
+    ``raw_ids``: google id -> raw id of the rows, when the caller knows them."""
     if not new_aliases:
         return 0
     from app.services.storage import dialect_insert
 
-    raw_ids = await rows_by_key(session, data_type, new_aliases.values())
+    if raw_ids is None or any(google_id not in raw_ids for google_id in new_aliases.values()):
+        raw_ids = {**(raw_ids or {}), **await rows_by_key(session, data_type, new_aliases.values())}
     values = [
         {
             "data_type": data_type,
@@ -406,10 +527,11 @@ async def add_aliases(session: AsyncSession, data_type: str, new_aliases: dict[s
 
 @dataclass
 class Presence:
-    # Candidates whose record a row of the same device was seen holding.
+    # Candidates whose record (same reading) a row they are linked with, or a row of their
+    # device, was seen holding.
     present: set[uuid.UUID] = field(default_factory=set)
-    # Candidates whose key a source not yet decided distinct was seen with (a possible
-    # rename the reconciler has not decided): not marked now.
+    # Candidates whose record (same reading) a fingerprint not established distinct was seen
+    # holding (a possible rename nobody decided): not marked now.
     deferred: set[uuid.UUID] = field(default_factory=set)
 
 
@@ -421,59 +543,67 @@ async def present_records(
 ) -> Presence:
     """Candidates (raw id, raw_json, stored start) that must not be marked deleted.
 
-    For each candidate, the rows with its v2 key seen at or after ``seen_since`` decide:
+    For each candidate, the rows with its v2 key seen at or after ``seen_since`` *with the
+    same reading* decide:
 
-    * one of the *same device* (the same fingerprint, or one linked to it by a usable chain)
-      - a duplicate of the record under another id: present;
-    * else one of another fingerprint that is not decided distinct from the candidate's (the
-      two were never returned together for one key, so it may be the candidate renamed, or
-      its old name come back): deferred, until the reconciler has decided;
-    * else (none, or only fingerprints once returned together with the candidate's): missing.
-      Of two devices that recorded at one instant, one can be deleted alone.
+    * one it is linked with (the same holder), or of its *device* (the same fingerprint, or
+      one joined to it by a usable chain) - a duplicate of the record under another id:
+      present;
+    * else one of a fingerprint not established distinct from the candidate's (never
+      returned with two values for one key: it may be the candidate renamed, or its old name
+      come back): deferred, until the reconciler or the owner has decided;
+    * else missing. Of two devices that recorded at one instant, one can be deleted alone;
+      and a row whose value its device no longer returns (another reading came back) holds
+      nothing Google still returns.
+
+    Nothing is written here (evidence of two devices comes only from one response, in the
+    write path).
     """
+    from app.core.timeutil import as_utc
+
     presence = Presence()
     identities = {raw_id: record_identity(spec, raw_json) for raw_id, raw_json, _ in candidates}
+    values = {raw_id: reading(spec, raw_json) for raw_id, raw_json, _ in candidates}
     starts = {identity.start for identity in identities.values() if identity and identity.start}
     # A stale stored start (written by an older parser) still finds the other rows.
     starts |= {as_utc(start) for _, _, start in candidates if start is not None}
     if not starts:
         return presence
-    seen_rows: dict[str, set[str]] = defaultdict(set)
+    seen_rows: dict[str, list[tuple[uuid.UUID, str, str | None]]] = defaultdict(list)
     for chunk in _chunks(sorted(starts)):
         rows = await session.execute(
-            select(RawHealthData.raw_json).where(
+            select(RawHealthData.id, RawHealthData.raw_json).where(
                 RawHealthData.data_type == spec.name,
                 among(session, RawHealthData.source_start_time, chunk),
                 RawHealthData.last_seen_at >= seen_since,
             )
         )
-        for (raw_json,) in rows.tuples():
+        for raw_id, raw_json in rows.tuples():
             identity = record_identity(spec, raw_json)
             if identity is not None:
-                seen_rows[identity.key].add(identity.source)
-    sources = {source for found in seen_rows.values() for source in found}
-    sources |= {identity.source for identity in identities.values() if identity}
-    chains = await load_chains(session, spec.name, sources)
-    # Returned together for one key in this fetch: distinct, from now on too.
-    together = {
-        (left, right)
-        for found in seen_rows.values()
-        for left in found
-        for right in found
-        if left < right
-    }
-    if together - chains.together:
-        from app.services.source_chains import database_now
-
-        await record_pairs(session, spec.name, together, await database_now(session))
-        chains.together |= together
+                seen_rows[identity.key].append((raw_id, identity.source, reading(spec, raw_json)))
+    if not seen_rows:
+        return presence
+    holders = await successors(
+        session,
+        [*identities, *(raw_id for found in seen_rows.values() for raw_id, _, _ in found)],
+    )
+    chains = (await load_state(session, spec.name)).chains
     for raw_id, identity in identities.items():
         if identity is None:
             continue
-        others = seen_rows.get(identity.key, set())
-        if any(chains.same_device(identity.source, other) for other in others):
+        same_value = [
+            (other_id, source)
+            for other_id, source, value in seen_rows.get(identity.key, [])
+            if value == values[raw_id] and other_id != raw_id
+        ]
+        if any(
+            holders.get(other_id) == holders.get(raw_id)
+            or chains.same_device(identity.source, source)
+            for other_id, source in same_value
+        ):
             presence.present.add(raw_id)
-        elif any(not chains.distinct(identity.source, other) for other in others):
+        elif any(not chains.distinct(identity.source, source) for _, source in same_value):
             presence.deferred.add(raw_id)
     return presence
 
@@ -506,18 +636,11 @@ _LINK_CYCLE_SQL = text(
     " WHERE w.depth < 64 AND w.current_id <> w.start_id)"
     " SELECT DISTINCT start_id FROM walk WHERE current_id = start_id"
 )
-# A record Google named itself is never a duplicate of another row.
-_LINK_NAMED_SQL = text(
-    "SELECT old_raw_id FROM raw_health_data_supersessions "
-    "WHERE old_google_data_point_id NOT LIKE 'synthetic:%'"
-)
-# Linked to a row that was already marked deleted while the linked row was not: the link
-# hid a live record behind a deleted one.
-_LINK_TO_DELETED_SQL = text(
-    "SELECT s.old_raw_id FROM raw_health_data_supersessions s "
+# Live superseded rows whose holder is marked deleted: readers count them again.
+_COUNTED_AGAIN_SQL = text(
+    "SELECT count(*) FROM raw_health_data_supersessions s "
     "JOIN raw_health_data o ON o.id = s.old_raw_id JOIN raw_health_data n ON n.id = s.new_raw_id "
-    "WHERE n.source_deleted_at IS NOT NULL AND n.source_deleted_at <= s.created_at "
-    "AND o.source_deleted_at IS NULL"
+    "WHERE n.source_deleted_at IS NOT NULL AND o.source_deleted_at IS NULL"
 )
 _CHAIN_CYCLE_SQL = text(
     "WITH RECURSIVE walk(data_type, start_fp, current_fp, depth) AS ("
@@ -548,6 +671,7 @@ class _ChainRow:
 
 
 async def _chain_rows(session: AsyncSession) -> dict[str, list[_ChainRow]]:
+    from app.core.timeutil import as_utc
     from app.models.identity import RawSourceChain
 
     found: dict[str, list[_ChainRow]] = defaultdict(list)
@@ -566,39 +690,79 @@ async def _chain_rows(session: AsyncSession) -> dict[str, list[_ChainRow]]:
     return found
 
 
-def _linked_when(rows: list[_ChainRow], left: str, right: str, at: datetime) -> bool:
-    """``left`` and ``right`` were one chain (either way) by the links recorded until ``at``."""
-    following = {row.old: row.new for row in rows if row.created_at <= at}
-    for start, target in ((left, right), (right, left)):
-        current = start
-        for _ in range(64):
-            current = following.get(current, "")
-            if not current:
-                break
-            if current == target:
-                return True
-    return False
+async def _decision_rows(session: AsyncSession) -> dict[int, tuple]:
+    from app.models.identity import RawSourceDecision
+
+    rows = await session.execute(
+        select(
+            RawSourceDecision.id,
+            RawSourceDecision.data_type,
+            RawSourceDecision.decision,
+            RawSourceDecision.first_fingerprint,
+            RawSourceDecision.second_fingerprint,
+        )
+    )
+    return {row[0]: tuple(row[1:]) for row in rows.tuples()}
+
+
+async def identity_tables_missing(session: AsyncSession) -> list[str]:
+    """The tables of migration 20261021_0012 this database lacks (PostgreSQL)."""
+    from app.models.identity import GUARDED_TABLES
+
+    if session.get_bind().dialect.name != "postgresql":
+        return []
+    present = set(
+        (
+            await session.scalars(
+                text(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = current_schema() AND c.relname = ANY(:tables)"
+                ),
+                {"tables": list(GUARDED_TABLES)},
+            )
+        ).all()
+    )
+    return [table for table in GUARDED_TABLES if table not in present]
 
 
 async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list[str]]:
-    """Aliases, supersession links and source chains are consistent with their rows.
+    """Aliases, supersession links, source chains and decisions are consistent.
 
     Returns (aliases, errors, notes). Besides the key checks: no link forms a cycle or
-    points at a superseded row, no link hides a record with a Google id or a live record
-    behind a deleted one, every link joins two rows of one v2 key and either one fingerprint
-    or two that a chain recorded *before the link was made* joins, and every identity-merged
-    event still has its link. Every chain was decided by the reconciler on evidence that
-    satisfies the rule, both its fingerprints have sightings, and those never narrowed
-    since (they only widen). A chain its sightings contradict today (the old form seen again)
-    is a note: it is no longer used for new pairings, and the rows it paired kept every
-    payload as a version.
+    points at a superseded row, no link supersedes a record that carries its own Google id,
+    every link joins two rows of one v2 key whose fingerprints are one, or joined by
+    recorded chain links (at any time: a later link may have given the holder a newer form),
+    and every identity-merged event still has its link. Every chain was decided by the
+    reconciler on evidence that satisfies the rule (or by the owner, with the decision row),
+    both its fingerprints have sightings, and those never narrowed since (they only widen).
+    Notes, not errors: chains refuted or rejected since (no longer used; the rows they linked
+    held equal readings and stay linked), and live superseded rows whose holder was marked
+    deleted (readers count them again).
     """
     from app.models.identity import DECIDERS
     from app.services.identity_backfill import spec_for
     from app.services.raw_history import PROTECTIVE_TRIGGERS
-    from app.services.source_chains import parse_evidence
+    from app.services.source_chains import owner_decision_of, parse_evidence
 
     notes: list[str] = []
+    missing = await identity_tables_missing(session)
+    if missing:
+        revision = None
+        try:
+            async with session.begin_nested():
+                revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
+        except Exception:  # noqa: BLE001 - the revision is only for the message
+            revision = None
+        return (
+            0,
+            [
+                f"the database is at revision {revision or 'unknown'}, without the record "
+                f"identity tables of 20261021_0012 ({', '.join(missing)}): run `alembic upgrade "
+                "head` (docs/RUNBOOK.md, 20261021_0012) before verifying with this version"
+            ],
+            notes,
+        )
     guarded = {table for table, _, _ in PROTECTIVE_TRIGGERS}
     errors: list[str] = await verify_identity_schema(session, guarded)
     count = await session.scalar(select(func.count()).select_from(RawHealthDataIdentity)) or 0
@@ -610,10 +774,6 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
         errors.append(f"supersession of raw row {raw_id} points at a superseded row")
     for (raw_id,) in (await session.execute(_LINK_CYCLE_SQL)).tuples():
         errors.append(f"supersession of raw row {raw_id} forms a cycle")
-    for (raw_id,) in (await session.execute(_LINK_NAMED_SQL)).tuples():
-        errors.append(f"supersession of raw row {raw_id} hides a record with a Google id")
-    for (raw_id,) in (await session.execute(_LINK_TO_DELETED_SQL)).tuples():
-        errors.append(f"supersession of raw row {raw_id} hides a live record behind a deleted one")
     for (raw_id,) in (await session.execute(_MERGED_WITHOUT_LINK_SQL)).tuples():
         errors.append(
             f"raw row {raw_id} has an identity-merged event but no supersession link "
@@ -621,34 +781,56 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
         )
     for data_type, fingerprint in (await session.execute(_CHAIN_CYCLE_SQL)).tuples():
         errors.append(f"source chain of {data_type} from {fingerprint[:12]} forms a cycle")
+    counted_again = await session.scalar(_COUNTED_AGAIN_SQL) or 0
+    if counted_again:
+        notes.append(
+            f"{counted_again} superseded row(s) count again: the row that held each was "
+            "marked deleted at the source while the row itself is live"
+        )
 
     recorded = await _chain_rows(session)
+    decisions = await _decision_rows(session)
     chains: dict[str, Chains] = {}
-    for data_type in sorted(recorded):
-        chains[data_type] = await load_chains(session, data_type)
+    for data_type in sorted({*recorded, *(row[0] for row in decisions.values())}):
+        chains[data_type] = await _verify_chains(session, data_type)
     old_row, new_row = aliased(RawHealthData), aliased(RawHealthData)
     links = (
         select(
             RawHealthDataSupersession.old_raw_id,
             RawHealthDataSupersession.data_type,
-            RawHealthDataSupersession.created_at,
             old_row.raw_json,
             new_row.raw_json,
+            old_row.source_deleted_at,
+            new_row.source_deleted_at,
         )
         .join(old_row, old_row.id == RawHealthDataSupersession.old_raw_id)
         .join(new_row, new_row.id == RawHealthDataSupersession.new_raw_id)
     )
+    differing = 0
     result = await session.stream(links.execution_options(yield_per=1_000))
-    async for raw_id, data_type, created, old_json, new_json in result:
+    async for raw_id, data_type, old_json, new_json, old_deleted, new_deleted in result:
+        if google_name(old_json) is not None:
+            errors.append(f"supersession of raw row {raw_id} hides a record with a Google id")
         spec = spec_for(data_type)
         old, new = record_identity(spec, old_json), record_identity(spec, new_json)
         if old is None or new is None or old.key != new.key:
             errors.append(f"supersession of raw row {raw_id} links two different records")
             continue
-        if old.source != new.source and not _linked_when(
-            recorded.get(data_type, []), old.source, new.source, as_utc(created)
+        if old.source != new.source and not (
+            data_type in chains and chains[data_type].ever_joined(old.source, new.source)
         ):
             errors.append(f"supersession of raw row {raw_id} links two different sources")
+        if (
+            old_deleted is None
+            and new_deleted is None
+            and reading(spec, old_json) != reading(spec, new_json)
+        ):
+            differing += 1
+    if differing:
+        notes.append(
+            f"{differing} live superseded row(s) hold a value their holder no longer has (an "
+            "older value of the record; the next complete fetch of their window marks them)"
+        )
 
     for data_type, rows in sorted(recorded.items()):
         current = chains[data_type]
@@ -656,9 +838,14 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
             name = f"source chain of {data_type} {row.old[:12]} -> {row.new[:12]}"
             if row.decided_by not in DECIDERS:
                 errors.append(f"{name} was not decided by the reconciler ({row.decided_by!r})")
-            decided = parse_evidence(row.evidence)
+            owner = row.decided_by == "owner"
+            decided = parse_evidence(row.evidence, owner=owner)
             if decided is None:
                 errors.append(f"{name} has no evidence that satisfies the chain rule")
+            if owner:
+                decision = decisions.get(owner_decision_of(row.evidence) or -1)
+                if decision != (data_type, "link", row.old, row.new):
+                    errors.append(f"{name} names no owner decision to link them")
             before, after = current.spans.get(row.old), current.spans.get(row.new)
             if before is None or after is None:
                 errors.append(f"{name} has no sightings for both sources (they were removed)")
@@ -671,12 +858,29 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
                 or after.last < decided[1].last
             ):
                 errors.append(f"{name}: the sightings narrowed since it was decided")
-            if current.contradicts(row.old, row.new):
+            if current.rejected(row.old, row.new):
                 notes.append(
-                    f"{name} is contradicted by later sightings (the old form was seen again): "
-                    "it is no longer used for new pairings; the rows it linked stay linked"
+                    f"{name} was rejected by the owner: it is no longer used; the rows it "
+                    "linked held equal readings and stay linked"
                 )
+            elif current.refuted(row.old, row.new):
+                notes.append(
+                    f"{name} is refuted (the two forms returned different values for one "
+                    "record): it is no longer used; the rows it linked stay linked"
+                )
+    for decision_id, (data_type, _, first, second) in sorted(decisions.items()):
+        spans = chains[data_type].spans
+        if first not in spans or second not in spans:
+            errors.append(
+                f"owner decision {decision_id} of {data_type} names a source without sightings"
+            )
     return count, errors, notes
+
+
+async def _verify_chains(session: AsyncSession, data_type: str) -> Chains:
+    from app.services.source_chains import load_chains
+
+    return await load_chains(session, data_type)
 
 
 # The constraints of migration 20261021_0012, as pg_get_constraintdef prints them.
@@ -705,9 +909,22 @@ EXPECTED_CONSTRAINTS = {
         ),
     },
     "raw_source_pairs": {
-        "pk_raw_source_pairs": "PRIMARY KEY (data_type, first_fingerprint, second_fingerprint)",
+        "pk_raw_source_pairs": (
+            "PRIMARY KEY (data_type, first_fingerprint, second_fingerprint, identity_key)"
+        ),
         "ck_raw_source_pairs_ordered": (
             "CHECK (((first_fingerprint)::text < (second_fingerprint)::text))"
+        ),
+    },
+    "raw_source_decisions": {
+        "pk_raw_source_decisions": "PRIMARY KEY (id)",
+        "ck_raw_source_decisions_distinct_sources": (
+            "CHECK (((first_fingerprint)::text <> (second_fingerprint)::text))"
+        ),
+        "ck_raw_source_decisions_known_decision": (
+            "CHECK (((decision)::text = ANY ((ARRAY['link'::character varying, "
+            "'reject'::character varying, 'confirm'::character varying, "
+            "'distinct'::character varying, 'not-distinct'::character varying])::text[])))"
         ),
     },
     "raw_source_chain_events": {
