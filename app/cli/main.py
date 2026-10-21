@@ -95,15 +95,15 @@ async def _chains_to_review(session) -> list[dict]:
     names = (await session.scalars(select(RawSourceChain.data_type).distinct())).all()
     for data_type in sorted(names):
         chains = await load_chains(session, data_type)
-        for old, new in sorted(chains.following.items()):
-            if chains.review(old, new) == "suggested" and chains.usable(old, new):
+        for old, new in sorted(chains.links):
+            if chains.review(old, new) == "suggested" and chains.live(old, new):
                 found.append(
                     {
                         "data_type": data_type,
                         "from": chains.spans[old].label if old in chains.spans else old[:12],
                         "to": chains.spans[new].label if new in chains.spans else new[:12],
                         "fingerprints": [old[:12], new[:12]],
-                        "decided_by": chains.decided_by.get(old),
+                        "decided_by": chains.decided_by.get((old, new)),
                     }
                 )
     return found
@@ -489,6 +489,11 @@ def identity_backfill(
         "total": total.as_dict(),
     }
     typer.echo(json.dumps(report, indent=2))
+    failed = {name: stats.error for name, stats in results.items() if stats.error}
+    if failed:
+        for name, error in sorted(failed.items()):
+            typer.echo(f"identity-backfill: {name} failed (the others ran): {error}", err=True)
+        raise typer.Exit(1)
 
 
 @app.command()

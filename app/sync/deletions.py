@@ -23,9 +23,12 @@ value: the candidate then holds a value Google no longer returns.
 
 Superseded rows are candidates too: their holder stands for them while it is live, but a row
 that counts again because its holder was marked (or would) must be marked when its record is
-gone. Candidates are read and decided in chunks, so a long window never sits in memory at once;
-the marks are written at the end, in key order like ``store_records``' row locks, so a page
-written meanwhile and this check never wait for each other in a circle.
+gone. A superseded row whose holder this fetch saw, unchanged since they were linked with the
+same reading, is the holder's record and is not read again (that would re-read the raw JSON of
+every superseded row on every complete fetch). Candidates are read, decided and marked in
+chunks, so a long window never sits in memory at once; a row another transaction has locked
+(a page writing it: it is being seen) is skipped rather than waited for, so this check never
+waits for a writer, and a writer never waits for it in a circle.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from typing import Any, cast
 
 from sqlalchemy import CursorResult, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.orm import InstrumentedAttribute, aliased
 
 from app.core.logging import event
 from app.google_health.data_types import (
@@ -47,9 +50,10 @@ from app.google_health.data_types import (
     RecordKind,
     query_time,
 )
+from app.models.identity import RawHealthDataSupersession, in_force
 from app.models.state import RawHealthData
 from app.services.identity import among, present_records
-from app.services.source_chains import lock_data_type
+from app.services.source_chains import load_chains, lock_data_type
 
 logger = logging.getLogger(__name__)
 
@@ -117,18 +121,34 @@ async def mark_source_deletions(
         column >= lower,
         column < upper,
     )
+    link, holder = aliased(RawHealthDataSupersession), aliased(RawHealthData)
+    # Superseded by a link in force with the same reading, its holder seen by this fetch and
+    # unchanged since: the holder's record, present.
+    held = (
+        select(link.old_raw_id)
+        .join(holder, holder.id == link.new_raw_id)
+        .where(
+            link.old_raw_id == RawHealthData.id,
+            link.same_reading.is_(True),
+            holder.payload_hash == link.new_payload_hash,
+            holder.last_seen_at >= fetched_since,
+            holder.source_deleted_at.is_(None),
+            in_force(link),
+        )
+        .exists()
+    )
     marked = kept = deferred = 0
     now = datetime.now(UTC)
     cursor: tuple | None = None
-    missing: list[tuple[str, Any]] = []
+    chains = await load_chains(session, spec.name)
+    postgresql = session.get_bind().dialect.name == "postgresql"
     while True:
         query = select(
             RawHealthData.id,
             RawHealthData.raw_json,
             RawHealthData.source_start_time,
             column,
-            RawHealthData.google_data_point_id,
-        ).where(*unseen)
+        ).where(*unseen, ~held)
         if cursor is not None:
             query = query.where(tuple_(column, RawHealthData.id) > cursor)
         chunk = (
@@ -142,37 +162,36 @@ async def mark_source_deletions(
         presence = await present_records(
             session,
             spec,
-            [(raw_id, raw_json, start) for raw_id, raw_json, start, _, _ in chunk],
+            [(raw_id, raw_json, start) for raw_id, raw_json, start, _ in chunk],
             fetched_since,
+            chains,
         )
         kept += len(presence.present)
         deferred += len(presence.deferred)
         spared = presence.present | presence.deferred
-        missing.extend(
-            (google_id, raw_id) for raw_id, _, _, _, google_id in chunk if raw_id not in spared
-        )
+        ids = [raw_id for raw_id, _, _, _ in chunk if raw_id not in spared]
+        if ids and postgresql:
+            # Rows a writer holds are being seen right now: skipped, never waited for.
+            ids = list(
+                (
+                    await session.scalars(
+                        select(RawHealthData.id)
+                        .where(*unseen, among(session, RawHealthData.id, ids))
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+        if ids:
+            result = await session.execute(
+                update(RawHealthData)
+                .where(*unseen, among(session, RawHealthData.id, ids))
+                .values(source_deleted_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as Result.
+            marked += cast(CursorResult[Any], result).rowcount or 0
         if len(chunk) < CHUNK:
             break
-    # Locked in key order, like store_records: no circular wait with a page written meanwhile.
-    missing.sort()
-    postgresql = session.get_bind().dialect.name == "postgresql"
-    for offset in range(0, len(missing), CHUNK):
-        ids = [raw_id for _, raw_id in missing[offset : offset + CHUNK]]
-        if postgresql:
-            await session.execute(
-                select(RawHealthData.id)
-                .where(*unseen, among(session, RawHealthData.id, ids))
-                .order_by(RawHealthData.google_data_point_id)
-                .with_for_update()
-            )
-        result = await session.execute(
-            update(RawHealthData)
-            .where(*unseen, among(session, RawHealthData.id, ids))
-            .values(source_deleted_at=now)
-            .execution_options(synchronize_session=False)
-        )
-        # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as Result.
-        marked += cast(CursorResult[Any], result).rowcount or 0
     if kept:
         event(logger, "SOURCE_DELETIONS_KEPT_BY_IDENTITY", data_type=spec.name, count=kept)
     if deferred:

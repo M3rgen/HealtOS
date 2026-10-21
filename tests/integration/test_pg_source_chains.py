@@ -138,10 +138,11 @@ async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions
     def link(old, new, data_type="heart-rate") -> str:
         return (
             "INSERT INTO raw_health_data_supersessions (old_raw_id, new_raw_id, data_type, "
-            "old_google_data_point_id, new_google_data_point_id, reason) "
+            "old_google_data_point_id, new_google_data_point_id, reason, old_fingerprint, "
+            "new_fingerprint, same_reading, new_payload_hash) "
             f"SELECT o.id, n.id, '{data_type}', o.google_data_point_id, n.google_data_point_id, "
-            f"'duplicate' FROM raw_health_data o, raw_health_data n "
-            f"WHERE o.id = '{old}' AND n.id = '{new}'"
+            "'duplicate', 'f', 'f', true, n.payload_hash FROM raw_health_data o, "
+            f"raw_health_data n WHERE o.id = '{old}' AND n.id = '{new}'"
         )
 
     async with pg_sessions() as session:
@@ -158,7 +159,7 @@ async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions
         "to_label, decided_by, evidence, decided_at) VALUES "
         "('heart-rate', 'a', 'b', 'A', 'B', 'live', '{}', now()), "
         "('heart-rate', 'b', 'a', 'B', 'A', 'live', '{}', now())",
-        "ALTER TABLE raw_source_chains DROP CONSTRAINT uq_raw_source_chains_data_type",
+        "ALTER TABLE raw_source_chains DROP CONSTRAINT uq_raw_source_chains_link",
         "CREATE RULE keep_quiet AS ON DELETE TO raw_health_data_identity DO INSTEAD NOTHING",
     )
     async with pg_sessions() as session:
@@ -169,13 +170,13 @@ async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions
     text_ = "\n".join(errors)
     for expected in (
         f"supersession of raw row {band[0]} forms a cycle",
-        f"supersession of raw row {band[0]} points at a superseded row",
         f"supersession of raw row {named} hides a record with a Google id",
         f"supersession of raw row {step} does not match its rows",
         f"supersession of raw row {named} links two different records",
         f"supersession of raw row {alive} links two different sources",
-        "source chain of heart-rate from a forms a cycle",
-        "constraint missing: raw_source_chains.uq_raw_source_chains_data_type",
+        "source chains of heart-rate: live links from a close a cycle",
+        "raw_source_devices of heart-rate does not match its live chains",
+        "constraint missing: raw_source_chains.uq_raw_source_chains_link",
         "rule keep_quiet on guarded table raw_health_data_identity",
     ):
         assert expected in text_, (expected, errors)

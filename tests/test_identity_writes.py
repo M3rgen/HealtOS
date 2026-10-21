@@ -389,7 +389,9 @@ async def test_a_stale_stored_start_is_kept_by_marking_and_linked_by_the_backfil
     report = await identity_backfill(sessions, batch_size=1)
     assert report["swim-lengths-data"].start_mismatches == 1
     async with sessions() as session:
-        link = await session.get(RawHealthDataSupersession, stale)
+        link = await session.scalar(
+            select(RawHealthDataSupersession).where(RawHealthDataSupersession.old_raw_id == stale)
+        )
     assert link is not None and link.reason == "interval-shape-change"
 
 

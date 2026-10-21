@@ -9,11 +9,17 @@ a returning record through it. Rows stored since 0012 need none: their id
 (``synthetic:v2s:<hash>``) is computed from the key and the fingerprint.
 
 ``raw_health_data_supersessions`` links a duplicate row that was archived under an older id
-of the same record to the row that holds the record now. A superseded row is kept with its
-payload, versions, ``source_deleted_at`` and events (it is history), and it no longer counts
-while its holder is live: dashboards, Umay and the ``analytics_*`` views skip it, as they skip a
-source deletion (``held_elsewhere``). When the holder is marked deleted at the source, a live
-superseded row counts again: a link never hides a live record behind a deleted one.
+of the same record to a row that holds the record now, with the two rows' source fingerprints
+when they were linked. A superseded row is kept with its payload, versions,
+``source_deleted_at`` and events (it is history). A link is *in force* while its two
+fingerprints are one, or one device (``raw_source_devices``); a link whose fingerprints are
+no longer one device (its chain was rejected or refuted, or the owner decided them distinct)
+stays as history but no longer hides anything, and is in force again when the owner joins
+them again. A row that an in-force link joins to a live row no longer counts: dashboards, Umay
+and the ``analytics_*`` views skip it, as they skip a source deletion (``held_elsewhere``).
+When every such holder is marked deleted at the source, a live superseded row counts again: a
+link never hides a live record behind a deleted one. A row may be linked more than once (a
+link no longer in force, then another holder); the newest in-force link names its holder.
 
 ``raw_source_chains`` records which source fingerprints are one device seen before and after
 a change (a ``displayName`` rename, a dropped package suffix): one row per link ``from -> to``,
@@ -22,20 +28,32 @@ timelines (app/services/source_chains.py), with the spans it was decided on as `
 or by the owner (``health-mirror identity-decide link``). A link joins the two forms into one
 device in both directions: the old form coming back later does not undo it.
 ``raw_source_chain_events`` records when a link was *refuted* (the two forms turned out to be
-two devices): from then on it is no longer used, while the supersessions made under it stay.
+two devices). A link is *live* unless the owner's latest decision about it is ``reject`` or
+the two forms are distinct (refuted, or decided so by the owner); only live links make a
+device, and only live links must form chains (one successor and one predecessor each, no
+cycle: checked when a link is recorded or revived, and by verify). A rejected or refuted link
+leaves its fingerprints free for another link.
+
+``raw_source_devices`` logs, per fingerprint that ever had a link, the device it belongs to
+(its smallest fingerprint) whenever that changes; the latest row per fingerprint is current.
+Readers decide whether a link is in force from it alone (index lookups), and verify checks it
+against the links and decisions.
 
 ``raw_source_pairs`` records evidence of two distinct sources: a key returned in one response
-under two fingerprints with two different readings (one record has one value). Two
-fingerprints with at least ``PAIR_KEYS`` such keys are *established distinct*.
+under two fingerprints with two different readings (one record has one value), with when its
+fetch began. Two fingerprints are *established distinct* by evidence from two fetches of which
+the later returned a record newer than the earlier fetch (both still produce new records): one
+response alone, or the same old records returned again, never is (app/services/source_chains.py).
 
 ``raw_source_decisions`` records the owner's decisions about two fingerprints (link, reject or
 confirm a chain; mark a pair distinct or not distinct). The latest decision per question wins.
 
-These six tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
+These seven tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
 ``ENABLE ALWAYS``). ``raw_source_sightings`` - when each source fingerprint was first and last
 seen, by the database clock - may only widen: no ``DELETE`` or ``TRUNCATE``, and an ``UPDATE``
-may only move ``first_seen_at`` earlier, ``last_seen_at`` later and ``complete`` to true.
-``health-mirror verify`` checks all of these triggers like the ones of 0011.
+may only move ``first_seen_at`` earlier, ``last_seen_at`` later and ``complete`` to true (its
+key, class, label and ``dataSource`` never change). ``health-mirror verify`` checks all of
+these triggers like the ones of 0011.
 
 ``identity_reconcile_state`` is bookkeeping: per data type, how far the reconciler got.
 
@@ -63,9 +81,11 @@ from sqlalchemy import (
     UniqueConstraint,
     event,
     func,
+    or_,
     select,
 )
 from sqlalchemy.orm import Mapped, aliased, mapped_column
+from sqlalchemy.sql.naming import conv
 
 from app.db.base import Base
 from app.models.state import RawHealthData, RawJSON
@@ -79,6 +99,7 @@ CHAIN_TABLE = "raw_source_chains"
 CHAIN_EVENT_TABLE = "raw_source_chain_events"
 PAIR_TABLE = "raw_source_pairs"
 DECISION_TABLE = "raw_source_decisions"
+DEVICE_TABLE = "raw_source_devices"
 SIGHTING_TABLE = "raw_source_sightings"
 RECONCILE_TABLE = "identity_reconcile_state"
 # The append-only tables of this revision.
@@ -89,6 +110,7 @@ IDENTITY_TABLES = (
     CHAIN_EVENT_TABLE,
     PAIR_TABLE,
     DECISION_TABLE,
+    DEVICE_TABLE,
 )
 # Every table whose rows verify protects (the sightings may only widen).
 GUARDED_TABLES = (*IDENTITY_TABLES, SIGHTING_TABLE)
@@ -135,19 +157,28 @@ class RawHealthDataIdentity(Base):
 class RawHealthDataSupersession(Base):
     __tablename__ = SUPERSESSION_TABLE
     __table_args__ = (
-        PrimaryKeyConstraint("old_raw_id"),
+        PrimaryKeyConstraint("old_raw_id", "new_raw_id"),
         CheckConstraint("old_raw_id <> new_raw_id", name="distinct_rows"),
         Index("ix_raw_health_data_supersessions_new_raw_id", "new_raw_id"),
         Index("ix_raw_health_data_supersessions_old_key", "old_google_data_point_id", "data_type"),
     )
 
-    # A row is superseded at most once; its successor was not superseded when linked.
+    # A row may be linked again when its links are no longer in force (in_force below);
+    # its holder is the target of its newest in-force link.
     old_raw_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("raw_health_data.id"), nullable=False)
     new_raw_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("raw_health_data.id"), nullable=False)
     data_type: Mapped[str] = mapped_column(String(128), nullable=False)
     old_google_data_point_id: Mapped[str] = mapped_column(String(512), nullable=False)
     new_google_data_point_id: Mapped[str] = mapped_column(String(512), nullable=False)
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The two rows' source fingerprints when they were linked: the link is in force while
+    # they are one, or one device.
+    old_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    new_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Both rows held the same reading when they were linked, and the holder's payload hash
+    # then: while the holder still has it, the superseded row's record is the holder's.
+    same_reading: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    new_payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -158,19 +189,29 @@ class RawSourceChain(Base):
 
     __tablename__ = CHAIN_TABLE
     __table_args__ = (
-        # A fingerprint has at most one successor and one predecessor: a chain, never a tree.
-        PrimaryKeyConstraint("data_type", "from_fingerprint"),
-        UniqueConstraint("data_type", "to_fingerprint"),
+        PrimaryKeyConstraint("id"),
+        # A pair is recorded once (rejected, it can be linked again by a decision). That a
+        # fingerprint has at most one *live* successor and predecessor (a chain, never a
+        # tree) is checked when a link is recorded or revived, and by verify.
+        UniqueConstraint(
+            "data_type",
+            "from_fingerprint",
+            "to_fingerprint",
+            name=conv("uq_raw_source_chains_link"),
+        ),
         CheckConstraint("from_fingerprint <> to_fingerprint", name="distinct_sources"),
     )
 
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True
+    )
     data_type: Mapped[str] = mapped_column(String(128), nullable=False)
     # app.parsers.identity.source_fingerprint of the dataSource before and after the change.
     from_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     to_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     from_label: Mapped[str] = mapped_column(String(255), nullable=False)
     to_label: Mapped[str] = mapped_column(String(255), nullable=False)
-    # DECIDERS: "backfill" (a full run) or "reconciler" (an incremental run).
+    # DECIDERS: "backfill" (a full run), "reconciler" (an incremental run) or "owner".
     decided_by: Mapped[str] = mapped_column(String(16), nullable=False)
     # JSON: both sighting spans as they were when the link was decided, the gap, the rule.
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
@@ -184,16 +225,41 @@ class RawSourceChainEvent(Base):
     """A chain link was refuted (its two forms are two devices): it is no longer used."""
 
     __tablename__ = CHAIN_EVENT_TABLE
-    __table_args__ = (PrimaryKeyConstraint("data_type", "from_fingerprint", "event"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("data_type", "from_fingerprint", "to_fingerprint", "event"),
+    )
 
     data_type: Mapped[str] = mapped_column(String(128), nullable=False)
     from_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     to_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     # REFUTED.
     event: Mapped[str] = mapped_column(String(32), nullable=False)
-    # JSON: both spans and the evidence (or decision) when the link was refuted.
+    # JSON: the evidence (or decision) when the link was refuted.
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RawSourceDevice(Base):
+    """The device a fingerprint belongs to from now on (its smallest fingerprint joined by
+    live chain links), appended whenever that changes; the latest row per fingerprint is
+    current. Readers decide from it whether a supersession is in force."""
+
+    __tablename__ = DEVICE_TABLE
+    __table_args__ = (
+        PrimaryKeyConstraint("id"),
+        Index("ix_raw_source_devices_current", "data_type", "fingerprint", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True
+    )
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    device: Mapped[str] = mapped_column(String(64), nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -206,8 +272,10 @@ class RawSourcePair(Base):
     One record has one value: a renamed device (or one whose old name comes back) never
     returns two values for one record, two devices that measured one instant do. Written by
     a page that holds both (one response), and by a full identity-backfill (two rows of one
-    key stored or last seen by the same page). A pair is *established distinct* with at least
-    ``PAIR_KEYS`` keys (app/services/source_chains.py); a few more are never recorded."""
+    key stored or last seen by the same page). ``seen_together_at`` is when the fetch began
+    (or the page was stored): the rule of *established distinct* needs two fetches
+    (app/services/source_chains.py). Recording stops once a pair is established, and a pair
+    that cannot be established by a key adds no more than ``PAIR_KEYS`` keys."""
 
     __tablename__ = PAIR_TABLE
     __table_args__ = (
@@ -307,26 +375,61 @@ class RawSourceSighting(Base):
     )
 
 
-def superseded(raw_id):
-    """``EXISTS`` clause: the raw row ``raw_id`` was superseded by another row."""
+def device_now(data_type, fingerprint):
+    """Scalar subquery: the device ``fingerprint`` of ``data_type`` belongs to now (the latest
+    ``raw_source_devices`` row; NULL when it never had a link)."""
+    device = aliased(RawSourceDevice)
     return (
-        select(RawHealthDataSupersession.old_raw_id)
-        .where(RawHealthDataSupersession.old_raw_id == raw_id)
-        .exists()
+        select(device.device)
+        .where(device.data_type == data_type, device.fingerprint == fingerprint)
+        .order_by(device.id.desc())
+        .limit(1)
+        .scalar_subquery()
     )
 
 
+def in_force(link=RawHealthDataSupersession):
+    """The supersession ``link`` (the class or an alias) is in force: its two fingerprints
+    are one, or one device now. A link whose fingerprints are no longer one device (a
+    rejected or refuted chain, two devices decided by the owner) hides nothing."""
+    return or_(
+        link.old_fingerprint == link.new_fingerprint,
+        device_now(link.data_type, link.old_fingerprint)
+        == device_now(link.data_type, link.new_fingerprint),
+    )
+
+
+def in_force_sql(link: str) -> str:
+    """``in_force`` as SQL text, for the supersession alias ``link`` (the analytics views)."""
+
+    def device(side: str) -> str:
+        return (
+            f"(SELECT d.device FROM {DEVICE_TABLE} d WHERE d.data_type = {link}.data_type "
+            f"AND d.fingerprint = {link}.{side}_fingerprint ORDER BY d.id DESC LIMIT 1)"
+        )
+
+    return f"({link}.old_fingerprint = {link}.new_fingerprint OR {device('old')} = {device('new')})"
+
+
+def superseded(raw_id):
+    """``EXISTS`` clause: the raw row ``raw_id`` is superseded by another row (an in-force
+    link, whatever the holder's mark)."""
+    link = aliased(RawHealthDataSupersession)
+    return select(link.old_raw_id).where(link.old_raw_id == raw_id, in_force(link)).exists()
+
+
 def held_elsewhere(raw_id):
-    """``EXISTS`` clause: ``raw_id`` was superseded by a row that is not marked deleted at the
-    source. Readers skip exactly these rows (the holder counts their record); a superseded row
-    whose holder was marked deleted counts again when it is live itself, so a link can never
-    hide a live record behind a deleted one."""
+    """``EXISTS`` clause: ``raw_id`` is superseded, by an in-force link, by a row that is not
+    marked deleted at the source. Readers skip exactly these rows (the holder counts their
+    record); a superseded row whose holders were all marked deleted counts again when it is
+    live itself, so a link can never hide a live record behind a deleted one, and a link no
+    longer in force hides nothing."""
     holder = aliased(RawHealthData)
-    link = RawHealthDataSupersession
+    link = aliased(RawHealthDataSupersession)
     return (
         select(link.old_raw_id)
         .join(holder, holder.id == link.new_raw_id)
-        .where(link.old_raw_id == raw_id, holder.source_deleted_at.is_(None))
+        .where(link.old_raw_id == raw_id, holder.source_deleted_at.is_(None), in_force(link))
         .exists()
     )
 
@@ -341,6 +444,8 @@ BEGIN
     IF NEW.data_type IS DISTINCT FROM OLD.data_type
        OR NEW.fingerprint IS DISTINCT FROM OLD.fingerprint
        OR NEW.stable_class IS DISTINCT FROM OLD.stable_class
+       OR NEW.label IS DISTINCT FROM OLD.label
+       OR NEW.data_source IS DISTINCT FROM OLD.data_source
        OR NEW.first_seen_at > OLD.first_seen_at
        OR NEW.last_seen_at < OLD.last_seen_at
        OR (OLD.complete AND NOT NEW.complete) THEN
@@ -420,7 +525,8 @@ _SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
         SIGHTING_TABLE,
         "UPDATE",
         "NEW.data_type IS NOT OLD.data_type OR NEW.fingerprint IS NOT OLD.fingerprint "
-        "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.first_seen_at > OLD.first_seen_at "
+        "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.label IS NOT OLD.label "
+        "OR NEW.data_source IS NOT OLD.data_source OR NEW.first_seen_at > OLD.first_seen_at "
         "OR NEW.last_seen_at < OLD.last_seen_at OR (OLD.complete AND NOT NEW.complete)",
     ),
 )

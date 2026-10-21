@@ -126,8 +126,9 @@ async def store_records(
     cannot make a record look unseen to a fetch that started meanwhile.
 
     ``fetch_started``: when the fetch that returned these records began (its first page; a
-    resumed fetch passes the original start). Kept for the caller's bookkeeping; deletion
-    marking reads it from the fetch itself.
+    resumed fetch passes the original start). Evidence of two devices is noted with it, so the
+    pages of one fetch count as one (app/services/source_chains.py, ``established``);
+    deletion marking reads it from the fetch itself.
     """
     origin = source or current_source()
     response_ids = await insert_responses(session, responses)
@@ -137,12 +138,14 @@ async def store_records(
     digests = [payload_hash(record) for record in records]
     if session.get_bind().dialect.name != "postgresql":
         # One writer at a time (tests): nothing to collide with.
-        return await _store(session, spec, records, digests, origin, response_id, fetched_at)
+        return await _store(
+            session, spec, records, digests, origin, response_id, fetched_at, fetch_started
+        )
     for _ in range(WRITE_ATTEMPTS):
         try:
             async with session.begin_nested():
                 return await _store(
-                    session, spec, records, digests, origin, response_id, fetched_at
+                    session, spec, records, digests, origin, response_id, fetched_at, fetch_started
                 )
         except _Collision:
             event(logger, "RECORD_BATCH_RESOLVED_AGAIN", data_type=spec.name)
@@ -186,6 +189,7 @@ async def _store(
     origin: str,
     response_id: int | None,
     fetched_at: datetime | None,
+    fetch_started: datetime | None = None,
 ) -> StoreStats:
     stats = StoreStats()
     resolution = await resolve_ids(session, spec, records, digests)
@@ -269,8 +273,12 @@ async def _store(
         # Late in the transaction: the sightings row of a source is the one row every writer
         # of the data type shares, so it is held for as short as possible.
         seen_at = fetched_at or await source_chains.database_now(session)
+        fetch = fetch_started or seen_at
         await record_evidence(
-            session, spec.name, resolution.state.chains, resolution.evidence, seen_at
+            session,
+            spec.name,
+            resolution.state.chains,
+            [(*found, fetch) for found in resolution.evidence],
         )
         await record_sightings(
             session,

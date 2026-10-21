@@ -43,10 +43,11 @@ HOUR = timedelta(hours=1)
 MINUTE = timedelta(minutes=1)
 
 
-async def test_deletion_marks_lock_rows_in_key_order_and_insert_nothing_else(pg_sessions, clock):
+async def test_deletion_marks_never_wait_for_a_writer_and_insert_nothing(pg_sessions, clock):
     """Deadlock window: marking inserted raw_source_pairs between chunks of row locks while a
-    page inserted them before its row locks. Now marking takes no lock but the rows it marks,
-    all after deciding, in google_data_point_id order like store_records."""
+    page inserted them before its row locks. Marking inserts nothing, and (review 4: it marks
+    chunk by chunk, so a long window is never held in memory) it locks only rows nobody else
+    holds (SKIP LOCKED): it never waits for a writer, so no circle can form."""
     from app.sync import deletions
 
     for minute in range(6):
@@ -68,10 +69,26 @@ async def test_deletion_marks_lock_rows_in_key_order_and_insert_nothing_else(pg_
         event.remove(engine, "before_cursor_execute", seen)
         deletions.CHUNK = deletions_chunk
     assert not [s for s in statements if s.startswith("INSERT")]
-    locks = [index for index, s in enumerate(statements) if "FOR UPDATE" in s]
-    reads = [index for index, s in enumerate(statements) if "raw_json" in s and "FOR" not in s]
-    assert locks and min(locks) > max(reads)
-    assert all("ORDER BY raw_health_data.google_data_point_id" in statements[i] for i in locks)
+    locks = [s for s in statements if "FOR UPDATE" in s]
+    assert len(locks) == 3 and all("SKIP LOCKED" in s for s in locks)
+
+
+async def test_marking_skips_a_row_a_writer_holds(pg_sessions, clock) -> None:
+    """Review 4: a row another transaction holds (a page writing it, so it is being seen) is
+    skipped, not waited for; the next complete fetch decides it."""
+    await store(pg_sessions, HEART, heart(60), heart(61, at=T0 + MINUTE))
+    fetched_since = clock.advance(hours=1)
+    async with pg_sessions.begin() as writer:
+        await writer.execute(
+            text(
+                "SELECT id FROM raw_health_data WHERE raw_json->'heartRate'->>'beatsPerMinute'"
+                " = '60' FOR UPDATE"
+            )
+        )
+        marked = await asyncio.wait_for(
+            mark(pg_sessions, HEART, T0 - HOUR, T0 + HOUR, fetched_since), 5
+        )
+    assert marked == 1
 
 
 async def test_a_batch_meeting_a_row_lock_backs_off_and_says_so(pg_sessions, monkeypatch):

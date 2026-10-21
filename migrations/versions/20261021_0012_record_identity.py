@@ -4,20 +4,23 @@ Records that Google sends without a `name` were archived under a synthetic id th
 raw interval object and the whole `dataSource`. A device rename, a dropped `.<UUID>` package
 suffix, civil times added to `interval` and a growing in-progress interval each made the same
 record a new row (see app/parsers/identity.py for the v2 key that replaces it). Existing rows
-cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds four
+cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds seven
 append-only tables, a widen-only one and a bookkeeping one:
 
 * `raw_health_data_identity`: fingerprint-specific v2 key -> the raw row that holds the
   record, for rows whose own id does not say so (rows stored before 0012). New writes find a
   record through it (app/services/storage.py); rows stored since get `synthetic:v2s:` ids.
-* `raw_health_data_supersessions`: a duplicate row -> the row that holds its record now, with
-  a reason. Superseded rows stay (payload, versions, `source_deleted_at`, events); readers and
-  the `analytics_*` views skip them.
+* `raw_health_data_supersessions`: a duplicate row -> a row that holds its record, with a
+  reason and both rows' source fingerprints. Superseded rows stay (payload, versions,
+  `source_deleted_at`, events); readers and the `analytics_*` views skip them while the link is
+  in force (its fingerprints are one, or one device in `raw_source_devices`).
 * `raw_source_chains`: per data type, source fingerprint -> the fingerprint the same device has
   after a rename or a dropped package suffix, decided by the reconciler (identity-backfill;
   app/services/source_chains.py) or by the owner (identity-decide). Only fingerprints of one
   chain are ever paired or merged.
 * `raw_source_chain_events`: a chain link was refuted (its two forms are two devices).
+* `raw_source_devices`: the device each chained fingerprint belongs to, logged on every change
+  (the latest row per fingerprint is current).
 * `raw_source_pairs`: a key returned in one response under two fingerprints with two
   different readings (evidence of two distinct sources).
 * `raw_source_decisions`: the owner's decisions about two fingerprints.
@@ -27,14 +30,16 @@ append-only tables, a widen-only one and a bookkeeping one:
 It also adds `fetch_rounds` (bookkeeping): when a sync round or a backfill window fetch began
 at its first page, kept when the fetch resumes from its page token.
 
-The six append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
+The seven append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
 triggers calling 0011's `healthos_refuse_change()`); the sightings refuse `DELETE`,
-`TRUNCATE` and any `UPDATE` that narrows a span (`healthos_sightings_widen_only()`).
+`TRUNCATE` and any `UPDATE` that narrows a span or changes anything but the span and
+`complete` (`healthos_sightings_widen_only()`).
 `health-mirror verify` checks them, their constraints, that no rule or row-level security
 sits on them and that the `analytics_*` views are these. On PostgreSQL the `analytics_*`
 views are replaced (`CREATE OR REPLACE`, same columns) so they show what the dashboard
-counts: rows of a quarantined or source-deleted raw record, and rows superseded by a live row,
-are left out (before, only quarantined ones); SQLite (tests only) keeps the old views.
+counts: rows of a quarantined or source-deleted raw record, and rows superseded by a live row
+through a link in force, are left out (before, only quarantined ones); SQLite (tests only)
+keeps the old views.
 
 Fast: empty tables, their indexes and triggers, view definitions, and one partial index on
 `raw_health_data` (its source-deleted rows, so the views never scan the whole table); no
@@ -70,6 +75,7 @@ CHAIN_TABLE = "raw_source_chains"
 CHAIN_EVENT_TABLE = "raw_source_chain_events"
 PAIR_TABLE = "raw_source_pairs"
 DECISION_TABLE = "raw_source_decisions"
+DEVICE_TABLE = "raw_source_devices"
 SIGHTING_TABLE = "raw_source_sightings"
 RECONCILE_TABLE = "identity_reconcile_state"
 FETCH_ROUND_TABLE = "fetch_rounds"
@@ -80,6 +86,7 @@ IDENTITY_TABLES = (
     CHAIN_EVENT_TABLE,
     PAIR_TABLE,
     DECISION_TABLE,
+    DEVICE_TABLE,
 )
 # Source-deleted raw rows, for the analytics views (a partial index; the only object this
 # revision adds to an existing table).
@@ -94,6 +101,8 @@ BEGIN
     IF NEW.data_type IS DISTINCT FROM OLD.data_type
        OR NEW.fingerprint IS DISTINCT FROM OLD.fingerprint
        OR NEW.stable_class IS DISTINCT FROM OLD.stable_class
+       OR NEW.label IS DISTINCT FROM OLD.label
+       OR NEW.data_source IS DISTINCT FROM OLD.data_source
        OR NEW.first_seen_at > OLD.first_seen_at
        OR NEW.last_seen_at < OLD.last_seen_at
        OR (OLD.complete AND NOT NEW.complete) THEN
@@ -171,7 +180,8 @@ _SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
         SIGHTING_TABLE,
         "UPDATE",
         "NEW.data_type IS NOT OLD.data_type OR NEW.fingerprint IS NOT OLD.fingerprint "
-        "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.first_seen_at > OLD.first_seen_at "
+        "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.label IS NOT OLD.label "
+        "OR NEW.data_source IS NOT OLD.data_source OR NEW.first_seen_at > OLD.first_seen_at "
         "OR NEW.last_seen_at < OLD.last_seen_at OR (OLD.complete AND NOT NEW.complete)",
     ),
 )
@@ -217,9 +227,10 @@ def _view(table: str, *, current_only: bool) -> str:
     if not current_only:
         return sql
     # Like the dashboard: a normalized row counts unless its raw record (same key) is marked
-    # deleted at the source or superseded by a row that is not. Both lookups are index
-    # probes: the raw table's (data_type, google_data_point_id) key and the supersessions'
-    # (old_google_data_point_id, data_type) index.
+    # deleted at the source or superseded, by a link in force, by a row that is not. The
+    # lookups are index probes: the raw table's (data_type, google_data_point_id) key, the
+    # supersessions' (old_google_data_point_id, data_type) index and the devices' (data_type,
+    # fingerprint, id) index.
     types = NORMALIZED_TABLES[table]
     if types:
         names = ", ".join(f"'{name}'" for name in types)
@@ -233,8 +244,19 @@ def _view(table: str, *, current_only: bool) -> str:
         f"AND NOT EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
         "JOIN raw_health_data h ON h.id = s.new_raw_id "
         f"WHERE {link_type} AND s.old_google_data_point_id = {table}.google_data_point_id "
-        "AND h.source_deleted_at IS NULL)"
+        f"AND h.source_deleted_at IS NULL AND {_IN_FORCE})"
     )
+
+
+def _device(side: str) -> str:
+    return (
+        f"(SELECT d.device FROM {DEVICE_TABLE} d WHERE d.data_type = s.data_type "
+        f"AND d.fingerprint = s.{side}_fingerprint ORDER BY d.id DESC LIMIT 1)"
+    )
+
+
+# A link is in force while its two fingerprints are one, or one device now.
+_IN_FORCE = f"(s.old_fingerprint = s.new_fingerprint OR {_device('old')} = {_device('new')})"
 
 
 LOCK_TIMEOUT = "30s"
@@ -297,6 +319,10 @@ def _upgrade(dialect: str) -> None:
         sa.Column("old_google_data_point_id", sa.String(512), nullable=False),
         sa.Column("new_google_data_point_id", sa.String(512), nullable=False),
         sa.Column("reason", sa.String(32), nullable=False),
+        sa.Column("old_fingerprint", sa.String(64), nullable=False),
+        sa.Column("new_fingerprint", sa.String(64), nullable=False),
+        sa.Column("same_reading", sa.Boolean(), nullable=False),
+        sa.Column("new_payload_hash", sa.String(64), nullable=False),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -316,7 +342,9 @@ def _upgrade(dialect: str) -> None:
             ["raw_health_data.id"],
             name="fk_raw_health_data_supersessions_new_raw_id_raw_health_data",
         ),
-        sa.PrimaryKeyConstraint("old_raw_id", name="pk_raw_health_data_supersessions"),
+        sa.PrimaryKeyConstraint(
+            "old_raw_id", "new_raw_id", name="pk_raw_health_data_supersessions"
+        ),
     )
     op.create_index(
         "ix_raw_health_data_supersessions_new_raw_id", SUPERSESSION_TABLE, ["new_raw_id"]
@@ -328,6 +356,12 @@ def _upgrade(dialect: str) -> None:
     )
     op.create_table(
         CHAIN_TABLE,
+        sa.Column(
+            "id",
+            sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+            primary_key=True,
+            autoincrement=True,
+        ),
         sa.Column("data_type", sa.String(128), nullable=False),
         sa.Column("from_fingerprint", sa.String(64), nullable=False),
         sa.Column("to_fingerprint", sa.String(64), nullable=False),
@@ -346,8 +380,10 @@ def _upgrade(dialect: str) -> None:
             "from_fingerprint <> to_fingerprint",
             name=op.f("ck_raw_source_chains_distinct_sources"),
         ),
-        sa.PrimaryKeyConstraint("data_type", "from_fingerprint", name="pk_raw_source_chains"),
-        sa.UniqueConstraint("data_type", "to_fingerprint", name="uq_raw_source_chains_data_type"),
+        sa.PrimaryKeyConstraint("id", name="pk_raw_source_chains"),
+        sa.UniqueConstraint(
+            "data_type", "from_fingerprint", "to_fingerprint", name="uq_raw_source_chains_link"
+        ),
     )
     raw_json = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
     op.create_table(
@@ -383,8 +419,35 @@ def _upgrade(dialect: str) -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint(
-            "data_type", "from_fingerprint", "event", name="pk_raw_source_chain_events"
+            "data_type",
+            "from_fingerprint",
+            "to_fingerprint",
+            "event",
+            name="pk_raw_source_chain_events",
         ),
+    )
+    op.create_table(
+        DEVICE_TABLE,
+        sa.Column(
+            "id",
+            sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+            primary_key=True,
+            autoincrement=True,
+        ),
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("fingerprint", sa.String(64), nullable=False),
+        sa.Column("device", sa.String(64), nullable=False),
+        sa.Column("decided_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_raw_source_devices"),
+    )
+    op.create_index(
+        "ix_raw_source_devices_current", DEVICE_TABLE, ["data_type", "fingerprint", "id"]
     )
     op.create_table(
         PAIR_TABLE,
@@ -520,6 +583,7 @@ def downgrade() -> None:
     # Dropping a table drops its triggers; healthos_refuse_change() belongs to 0011.
     op.drop_table(FETCH_ROUND_TABLE)
     op.drop_table(RECONCILE_TABLE)
+    op.drop_table(DEVICE_TABLE)
     op.drop_table(DECISION_TABLE)
     op.drop_table(PAIR_TABLE)
     op.drop_table(CHAIN_EVENT_TABLE)

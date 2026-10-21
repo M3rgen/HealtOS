@@ -19,20 +19,26 @@ usable chain links, either way). Every group is written onto
    reading (a rename, a dropped package suffix, the old name come back): a new version; or
 4. else a new row ``synthetic:v2s:<hash of key and fingerprint>``: an unknown fingerprint
    always gets rows of its own. A renamed device is then counted twice until the reconciler
-   links the rows (nightly); a genuinely distinct device is never hidden.
+   links the rows (nightly); a genuinely distinct device is never hidden. When that id is
+   taken (its row holds another value of the record now, merged by the reconciler), the row
+   gets the first free *spare* id of the record and fingerprint.
 
 Stored rows are found by id only (no scan): the record's v1 id (rows archived before v2), the
-v2s ids of the key and each fingerprint of the device (rows stored since), and the alias table
-(rows whose own id is neither). A payload is never written onto a row of another device, nor
+v2s ids of the key and each fingerprint of the device (rows stored since), its spare ids when
+its v2s id is taken (in blocks, until one is free: spare ids are given in order, so the row
+written last time is found again and never a second one made), and the alias table (rows whose
+own id is neither). Superseded means superseded by a link *in force* (its two fingerprints one
+device now): a row whose links are no longer in force is its own holder again. A payload is never written onto a row of another device, nor
 onto a row of the device that measured something else. ``store_records`` locks the rows it
 writes onto and re-resolves when one changed meanwhile, and creates new rows with ``ON
 CONFLICT DO NOTHING`` (re-resolving when another writer created the row first).
 
 ``present_records`` decides, for deletion marking, whether an unseen row's record is still
 returned: with the same reading under a row it is linked with or a row of its device
-(present), with the same reading under a fingerprint not established distinct from it
-(deferred: possibly a rename nobody decided yet), or not at all (missing: also when the
-device returned the key with another value - the row holds a value no longer returned).
+(present); not by its device, which returned the key with another value (missing: the row
+holds a value no longer returned); with the same reading under a fingerprint not established
+distinct from its device, or distinct by evidence alone while it looks like a rename
+(deferred: possibly a rename nobody decided yet); or not at all (missing).
 """
 
 from __future__ import annotations
@@ -61,7 +67,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.google_health.data_types import DataTypeSpec
-from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
+from app.models.identity import (
+    RawHealthDataIdentity,
+    RawHealthDataSupersession,
+    in_force_sql,
+)
 from app.models.state import RawHealthData
 from app.parsers.common import google_name, source_id
 from app.parsers.identity import (
@@ -73,14 +83,22 @@ from app.parsers.identity import (
     spare_record_id,
     specific_key,
 )
-from app.services.source_chains import Chains, SourceState, load_state, lock_data_type
+from app.services.source_chains import (
+    Chains,
+    SourceState,
+    load_chains,
+    load_state,
+    lock_data_type,
+)
 
 logger = logging.getLogger(__name__)
 
-# Supersession links are followed at most this far (the reconciler never links to a row that
-# is superseded, nor supersedes a row that others point to, so one step is the norm).
+# Supersession links are followed at most this far (the reconciler links every row of a
+# device to one holder, so one step is the norm).
 MAX_CHAIN = 16
 _CHUNK = 5000
+# Spare ids of one record and fingerprint are looked up this many at a time.
+SPARE_BLOCK = 8
 
 
 def _chunks(values: Sequence) -> Iterable[Sequence]:
@@ -159,34 +177,44 @@ async def _find(
     return alias, by_id
 
 
-async def successors(session: AsyncSession, raw_ids: Iterable[uuid.UUID]) -> dict:
-    """raw id -> the row that holds its record now (itself unless superseded). Two steps per
-    statement (one is the norm)."""
+async def successors(session: AsyncSession, raw_ids: Iterable[uuid.UUID], chains: Chains) -> dict:
+    """raw id -> the row that holds its record now: the target of its newest link in force
+    (``chains``: its two fingerprints are one device), followed; itself when it has none."""
     result = {raw_id: raw_id for raw_id in raw_ids}
     link = RawHealthDataSupersession
-    second = aliased(RawHealthDataSupersession)
+    step: dict[uuid.UUID, uuid.UUID | None] = {}
+    visited = {raw_id: {raw_id} for raw_id in result}
     frontier = sorted(set(result.values()))
     for _ in range(MAX_CHAIN):
-        step: dict[uuid.UUID, uuid.UUID] = {}
-        further: list[uuid.UUID] = []
-        for chunk in _chunks(frontier):
+        for chunk in _chunks([raw_id for raw_id in frontier if raw_id not in step]):
+            newest: dict[uuid.UUID, tuple] = {}
             rows = await session.execute(
-                select(link.old_raw_id, link.new_raw_id, second.new_raw_id)
-                .outerjoin(second, second.old_raw_id == link.new_raw_id)
-                .where(among(session, link.old_raw_id, chunk))
+                select(
+                    link.old_raw_id,
+                    link.new_raw_id,
+                    link.old_fingerprint,
+                    link.new_fingerprint,
+                    link.created_at,
+                ).where(among(session, link.old_raw_id, chunk))
             )
-            for old, new, beyond in rows.tuples():
-                step[old] = beyond if beyond is not None else new
-                if beyond is not None:
-                    further.append(beyond)
-        if not step:
-            break
+            for old, new, old_source, new_source, created in rows.tuples():
+                if not chains.in_force(old_source, new_source):
+                    continue
+                rank = (created, str(new))
+                if old not in newest or rank > newest[old][0]:
+                    newest[old] = (rank, new)
+            for raw_id in chunk:
+                step[raw_id] = newest[raw_id][1] if raw_id in newest else None
+        further: set[uuid.UUID] = set()
         for start, current in result.items():
-            if current in step:
-                result[start] = step[current]
+            target = step.get(current)
+            if target is not None and target not in visited[start]:
+                visited[start].add(target)
+                result[start] = target
+                further.add(target)
         if not further:
             break
-        frontier = sorted(set(further))
+        frontier = sorted(further)
     return result
 
 
@@ -341,7 +369,7 @@ async def resolve_ids(
         found = (set(found_alias.values()) | set(found_ids.values())) - set(rows)
         if not found:
             return
-        holders = await successors(session, found)
+        holders = await successors(session, found, chains)
         loaded = await _load_rows(session, spec, (found | set(holders.values())) - set(rows), known)
         for row in loaded.values():
             row.holder = holders.get(row.raw_id, row.raw_id)
@@ -358,6 +386,29 @@ async def resolve_ids(
             )
         },
     )
+    # A record whose own v2s id is taken by a row that is not its current row (superseded, or
+    # holding another form now) was given spare ids: they are found the same way, by id, in
+    # blocks (spare ids are taken in order, so the first block with a free one is the last).
+    pending = [
+        group
+        for name, group in groups.items()
+        if (taken := by_id.get(new_record_id(group.identity.specific_key))) is not None
+        and not _current(rows.get(taken), name)
+    ]
+    attempt = 1
+    while pending:
+        block = range(attempt, attempt + SPARE_BLOCK)
+        await look_up(
+            set(),
+            {spare_record_id(group.identity, number) for group in pending for number in block}
+            - set(by_id),
+        )
+        pending = [
+            group
+            for group in pending
+            if all(spare_record_id(group.identity, number) in by_id for number in block)
+        ]
+        attempt += SPARE_BLOCK
     settled = {
         (row.identity.key, row.identity.source)
         for row in rows.values()
@@ -457,34 +508,36 @@ async def resolve_ids(
         if target.google_data_point_id not in own_ids and own_key not in alias:
             resolution.new_aliases[own_key] = target.google_data_point_id
     if fresh:
-        await _new_ids(session, spec, fresh, by_id, ids, resolution)
+        _new_ids(fresh, by_id, ids, resolution)
     return resolution
 
 
-async def _new_ids(
-    session: AsyncSession,
-    spec: DataTypeSpec,
+def _current(row: StoredRow | None, name: tuple[str, str]) -> bool:
+    """``row`` holds the record ``name`` (key, fingerprint) and is not superseded."""
+    return (
+        row is not None
+        and row.identity is not None
+        and (row.identity.key, row.identity.source) == name
+        and row.holder == row.raw_id
+    )
+
+
+def _new_ids(
     fresh: list[tuple[_Group, str]],
     by_id: dict[str, uuid.UUID],
     ids: list[str],
     resolution: Resolution,
 ) -> None:
     """A new row's id must not be one a stored row already has (that row holds another
-    form or value of the record now): such a record gets a spare id."""
+    form or value of the record now): such a record gets the first free spare id (the
+    stored spare ids of the record were looked up by ``resolve_ids``)."""
     for group, target in fresh:
         if target in by_id:
-            taken = await rows_by_key(
-                session,
-                spec.name,
-                [spare_record_id(group.identity, attempt) for attempt in range(1, 9)],
-            )
-            for attempt in range(1, 9):
-                candidate = spare_record_id(group.identity, attempt)
-                if candidate not in taken and candidate not in resolution.created:
-                    target = candidate
-                    break
-            else:  # pragma: no cover - eight rows of one record and fingerprint
-                raise RuntimeError(f"no free id for a record of {spec.name}")
+            number = 1
+            while (target := spare_record_id(group.identity, number)) in by_id or (
+                target in resolution.created
+            ):
+                number += 1
             resolution.new_aliases.setdefault(group.identity.specific_key, target)
         resolution.created.add(target)
         for index in group.indexes:
@@ -530,7 +583,7 @@ class Presence:
     # Candidates whose record (same reading) a row they are linked with, or a row of their
     # device, was seen holding.
     present: set[uuid.UUID] = field(default_factory=set)
-    # Candidates whose record (same reading) a fingerprint not established distinct was seen
+    # Candidates whose record (same reading) a fingerprint that may be their device was seen
     # holding (a possible rename nobody decided): not marked now.
     deferred: set[uuid.UUID] = field(default_factory=set)
 
@@ -540,24 +593,25 @@ async def present_records(
     spec: DataTypeSpec,
     candidates: Sequence[tuple[uuid.UUID, object, datetime | None]],
     seen_since: datetime,
+    chains: Chains | None = None,
 ) -> Presence:
     """Candidates (raw id, raw_json, stored start) that must not be marked deleted.
 
-    For each candidate, the rows with its v2 key seen at or after ``seen_since`` *with the
-    same reading* decide:
+    For each candidate, the rows with its v2 key seen at or after ``seen_since`` decide:
 
-    * one it is linked with (the same holder), or of its *device* (the same fingerprint, or
-      one joined to it by a usable chain) - a duplicate of the record under another id:
-      present;
-    * else one of a fingerprint not established distinct from the candidate's (never
-      returned with two values for one key: it may be the candidate renamed, or its old name
-      come back): deferred, until the reconciler or the owner has decided;
-    * else missing. Of two devices that recorded at one instant, one can be deleted alone;
-      and a row whose value its device no longer returns (another reading came back) holds
-      nothing Google still returns.
+    * one *with the same reading* it is linked with (the same holder through links in force),
+      or of its *device* (the same fingerprint, or one joined to it by live chain links) - a
+      duplicate of the record under another id: present;
+    * else, when its device returned the key with *another* reading: missing - the row holds
+      a value its device no longer returns (one device returns one value per record, so a
+      same reading under another fingerprint is another device's);
+    * else one with the same reading of a fingerprint not established distinct from the
+      candidate's device, or distinct by evidence alone while their sightings only touch (it
+      looks like a rename): deferred, until the reconciler or the owner has decided;
+    * else missing. Of two devices that recorded at one instant, one can be deleted alone.
 
-    Nothing is written here (evidence of two devices comes only from one response, in the
-    write path).
+    Nothing is written here (evidence of two devices comes only from responses, in the
+    write path). ``chains``: the data type's chains with every span (loaded when not given).
     """
     from app.core.timeutil import as_utc
 
@@ -584,18 +638,19 @@ async def present_records(
                 seen_rows[identity.key].append((raw_id, identity.source, reading(spec, raw_json)))
     if not seen_rows:
         return presence
+    if chains is None:
+        chains = await load_chains(session, spec.name)
     holders = await successors(
         session,
         [*identities, *(raw_id for found in seen_rows.values() for raw_id, _, _ in found)],
+        chains,
     )
-    chains = (await load_state(session, spec.name)).chains
     for raw_id, identity in identities.items():
         if identity is None:
             continue
+        others = [found for found in seen_rows.get(identity.key, []) if found[0] != raw_id]
         same_value = [
-            (other_id, source)
-            for other_id, source, value in seen_rows.get(identity.key, [])
-            if value == values[raw_id] and other_id != raw_id
+            (other_id, source) for other_id, source, value in others if value == values[raw_id]
         ]
         if any(
             holders.get(other_id) == holders.get(raw_id)
@@ -603,7 +658,16 @@ async def present_records(
             for other_id, source in same_value
         ):
             presence.present.add(raw_id)
-        elif any(not chains.distinct(identity.source, source) for _, source in same_value):
+        elif any(
+            chains.same_device(identity.source, source) and value != values[raw_id]
+            for _, source, value in others
+        ):
+            continue
+        elif any(
+            not chains.distinct(identity.source, source)
+            or chains.looks_like_rename(identity.source, source)
+            for _, source in same_value
+        ):
             presence.deferred.add(raw_id)
     return presence
 
@@ -622,37 +686,26 @@ _LINK_MISMATCH_SQL = text(
     "OR o.google_data_point_id <> s.old_google_data_point_id "
     "OR n.google_data_point_id <> s.new_google_data_point_id"
 )
-# A link to a row that is itself superseded: every cycle, of any length, contains one.
-_LINK_TARGET_SUPERSEDED_SQL = text(
-    "SELECT a.old_raw_id FROM raw_health_data_supersessions a "
-    "JOIN raw_health_data_supersessions b ON b.old_raw_id = a.new_raw_id"
-)
+# Every cycle of links, of any state (a cycle in force would hide all its rows).
 _LINK_CYCLE_SQL = text(
     "WITH RECURSIVE walk(start_id, current_id, depth) AS ("
     " SELECT old_raw_id, new_raw_id, 1 FROM raw_health_data_supersessions"
-    " UNION ALL"
+    " UNION"
     " SELECT w.start_id, s.new_raw_id, w.depth + 1 FROM walk w"
     " JOIN raw_health_data_supersessions s ON s.old_raw_id = w.current_id"
     " WHERE w.depth < 64 AND w.current_id <> w.start_id)"
     " SELECT DISTINCT start_id FROM walk WHERE current_id = start_id"
 )
-# Live superseded rows whose holder is marked deleted: readers count them again.
+# Live rows superseded only by links in force whose holders are all marked deleted: readers
+# count them again.
 _COUNTED_AGAIN_SQL = text(
-    "SELECT count(*) FROM raw_health_data_supersessions s "
-    "JOIN raw_health_data o ON o.id = s.old_raw_id JOIN raw_health_data n ON n.id = s.new_raw_id "
-    "WHERE n.source_deleted_at IS NOT NULL AND o.source_deleted_at IS NULL"
+    "SELECT count(DISTINCT s.old_raw_id) FROM raw_health_data_supersessions s "
+    "JOIN raw_health_data o ON o.id = s.old_raw_id "
+    f"WHERE o.source_deleted_at IS NULL AND {in_force_sql('s')} "
+    "AND NOT EXISTS (SELECT 1 FROM raw_health_data_supersessions s2 "
+    "JOIN raw_health_data h ON h.id = s2.new_raw_id WHERE s2.old_raw_id = s.old_raw_id "
+    f"AND h.source_deleted_at IS NULL AND {in_force_sql('s2')})"
 )
-_CHAIN_CYCLE_SQL = text(
-    "WITH RECURSIVE walk(data_type, start_fp, current_fp, depth) AS ("
-    " SELECT data_type, from_fingerprint, to_fingerprint, 1 FROM raw_source_chains"
-    " UNION ALL"
-    " SELECT w.data_type, w.start_fp, c.to_fingerprint, w.depth + 1 FROM walk w"
-    " JOIN raw_source_chains c ON c.data_type = w.data_type AND c.from_fingerprint = w.current_fp"
-    " WHERE w.depth < 64 AND w.current_fp <> w.start_fp)"
-    " SELECT DISTINCT data_type, start_fp FROM walk WHERE current_fp = start_fp"
-)
-
-
 # Every identity-merged event (raw_health_data_events, guarded by 0011) has its link: a
 # supersession table that was emptied or swapped for an empty copy shows up here.
 _MERGED_WITHOUT_LINK_SQL = text(
@@ -683,7 +736,7 @@ async def _chain_rows(session: AsyncSession) -> dict[str, list[_ChainRow]]:
             RawSourceChain.decided_by,
             RawSourceChain.evidence,
             RawSourceChain.created_at,
-        )
+        ).order_by(RawSourceChain.id)
     )
     for data_type, old, new, decided_by, evidence, created in rows.tuples():
         found[data_type].append(_ChainRow(old, new, decided_by, evidence, as_utc(created)))
@@ -727,18 +780,20 @@ async def identity_tables_missing(session: AsyncSession) -> list[str]:
 
 
 async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list[str]]:
-    """Aliases, supersession links, source chains and decisions are consistent.
+    """Aliases, supersession links, source chains, devices and decisions are consistent.
 
-    Returns (aliases, errors, notes). Besides the key checks: no link forms a cycle or
-    points at a superseded row, no link supersedes a record that carries its own Google id,
-    every link joins two rows of one v2 key whose fingerprints are one, or joined by
-    recorded chain links (at any time: a later link may have given the holder a newer form),
-    and every identity-merged event still has its link. Every chain was decided by the
-    reconciler on evidence that satisfies the rule (or by the owner, with the decision row),
-    both its fingerprints have sightings, and those never narrowed since (they only widen).
-    Notes, not errors: chains refuted or rejected since (no longer used; the rows they linked
-    held equal readings and stay linked), and live superseded rows whose holder was marked
-    deleted (readers count them again).
+    Returns (aliases, errors, notes). Besides the key checks: no links form a cycle (in any
+    state), no link supersedes a record that carries its own Google id, every link joins two
+    rows of one v2 key, and its two recorded fingerprints - and the rows' forms now - are one
+    or were joined by recorded chain links (at any time: a later link may have given the
+    holder a newer form); every identity-merged event still has its link. Every chain was
+    decided by the reconciler on evidence that satisfies the rule (or by the owner, with the
+    decision row), both its fingerprints have sightings, and those never narrowed since (they
+    only widen); the live chains never fork or cycle; and ``raw_source_devices`` - what
+    readers count by - says for every fingerprint the device its live chains make. Notes, not
+    errors: chains rejected or refuted (their links no longer hide anything), links no longer
+    in force, live superseded rows whose holders were marked deleted (readers count them
+    again), and rows whose holder is itself superseded.
     """
     from app.models.identity import DECIDERS
     from app.services.identity_backfill import spec_for
@@ -770,8 +825,6 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
         errors.append(f"identity alias {data_type}/{key} does not match its raw row")
     for (raw_id,) in (await session.execute(_LINK_MISMATCH_SQL)).tuples():
         errors.append(f"supersession of raw row {raw_id} does not match its rows")
-    for (raw_id,) in (await session.execute(_LINK_TARGET_SUPERSEDED_SQL)).tuples():
-        errors.append(f"supersession of raw row {raw_id} points at a superseded row")
     for (raw_id,) in (await session.execute(_LINK_CYCLE_SQL)).tuples():
         errors.append(f"supersession of raw row {raw_id} forms a cycle")
     for (raw_id,) in (await session.execute(_MERGED_WITHOUT_LINK_SQL)).tuples():
@@ -779,36 +832,45 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
             f"raw row {raw_id} has an identity-merged event but no supersession link "
             "(the supersession table lost rows or was replaced)"
         )
-    for data_type, fingerprint in (await session.execute(_CHAIN_CYCLE_SQL)).tuples():
-        errors.append(f"source chain of {data_type} from {fingerprint[:12]} forms a cycle")
     counted_again = await session.scalar(_COUNTED_AGAIN_SQL) or 0
     if counted_again:
         notes.append(
-            f"{counted_again} superseded row(s) count again: the row that held each was "
+            f"{counted_again} superseded row(s) count again: every row that held each was "
             "marked deleted at the source while the row itself is live"
         )
 
     recorded = await _chain_rows(session)
     decisions = await _decision_rows(session)
     chains: dict[str, Chains] = {}
-    for data_type in sorted({*recorded, *(row[0] for row in decisions.values())}):
+    for data_type in sorted(
+        {*recorded, *(row[0] for row in decisions.values()), *await _device_types(session)}
+    ):
         chains[data_type] = await _verify_chains(session, data_type)
     old_row, new_row = aliased(RawHealthData), aliased(RawHealthData)
+    link = RawHealthDataSupersession
     links = (
         select(
-            RawHealthDataSupersession.old_raw_id,
-            RawHealthDataSupersession.data_type,
+            link.old_raw_id,
+            link.new_raw_id,
+            link.data_type,
+            link.old_fingerprint,
+            link.new_fingerprint,
             old_row.raw_json,
             new_row.raw_json,
             old_row.source_deleted_at,
             new_row.source_deleted_at,
         )
-        .join(old_row, old_row.id == RawHealthDataSupersession.old_raw_id)
-        .join(new_row, new_row.id == RawHealthDataSupersession.new_raw_id)
+        .join(old_row, old_row.id == link.old_raw_id)
+        .join(new_row, new_row.id == link.new_raw_id)
     )
-    differing = 0
+    differing = void = 0
+    # Rows superseded in force, and the rows they point at (a holder superseded itself).
+    superseded_rows: set[uuid.UUID] = set()
+    targets: set[uuid.UUID] = set()
     result = await session.stream(links.execution_options(yield_per=1_000))
-    async for raw_id, data_type, old_json, new_json, old_deleted, new_deleted in result:
+    async for row in result:
+        raw_id, holder_id, data_type, old_source, new_source = row[:5]
+        old_json, new_json, old_deleted, new_deleted = row[5:]
         if google_name(old_json) is not None:
             errors.append(f"supersession of raw row {raw_id} hides a record with a Google id")
         spec = spec_for(data_type)
@@ -816,10 +878,18 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
         if old is None or new is None or old.key != new.key:
             errors.append(f"supersession of raw row {raw_id} links two different records")
             continue
-        if old.source != new.source and not (
-            data_type in chains and chains[data_type].ever_joined(old.source, new.source)
+        current = chains.get(data_type) or Chains()
+        if not (
+            current.ever_joined(old_source, new_source)
+            and current.ever_joined(old.source, old_source)
+            and current.ever_joined(new.source, new_source)
         ):
             errors.append(f"supersession of raw row {raw_id} links two different sources")
+        if not current.in_force(old_source, new_source):
+            void += 1
+            continue
+        superseded_rows.add(raw_id)
+        targets.add(holder_id)
         if (
             old_deleted is None
             and new_deleted is None
@@ -831,7 +901,28 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
             f"{differing} live superseded row(s) hold a value their holder no longer has (an "
             "older value of the record; the next complete fetch of their window marks them)"
         )
+    if void:
+        notes.append(
+            f"{void} supersession(s) are no longer in force (their two sources are no longer one "
+            "device: a chain was rejected or refuted, or the owner decided them distinct); the "
+            "rows they linked count on their own"
+        )
+    stacked = len(targets & superseded_rows)
+    if stacked:
+        notes.append(
+            f"{stacked} holder row(s) are superseded themselves (readers follow both links)"
+        )
 
+    for data_type, current in sorted(chains.items()):
+        for problem in current.problems():
+            errors.append(f"source chains of {data_type}: {problem} (a chain never forks)")
+        wrong = current.devices_to_log()
+        if wrong:
+            errors.append(
+                f"raw_source_devices of {data_type} does not match its live chains for "
+                f"{len(wrong)} source(s) (e.g. {sorted(wrong)[0][:12]}): readers would count "
+                "supersessions wrongly"
+            )
     for data_type, rows in sorted(recorded.items()):
         current = chains[data_type]
         for row in rows:
@@ -860,13 +951,14 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
                 errors.append(f"{name}: the sightings narrowed since it was decided")
             if current.rejected(row.old, row.new):
                 notes.append(
-                    f"{name} was rejected by the owner: it is no longer used; the rows it "
-                    "linked held equal readings and stay linked"
+                    f"{name} was rejected by the owner: it is no longer used, and the rows it "
+                    "linked count on their own unless another chain joins their sources"
                 )
             elif current.refuted(row.old, row.new):
                 notes.append(
-                    f"{name} is refuted (the two forms returned different values for one "
-                    "record): it is no longer used; the rows it linked stay linked"
+                    f"{name} is refuted (two devices: different values for one record, or the "
+                    "owner's decision): it is no longer used, and the rows it linked count on "
+                    "their own"
                 )
     for decision_id, (data_type, _, first, second) in sorted(decisions.items()):
         spans = chains[data_type].spans
@@ -875,6 +967,12 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
                 f"owner decision {decision_id} of {data_type} names a source without sightings"
             )
     return count, errors, notes
+
+
+async def _device_types(session: AsyncSession) -> list[str]:
+    from app.models.identity import RawSourceDevice
+
+    return list((await session.scalars(select(RawSourceDevice.data_type).distinct())).all())
 
 
 async def _verify_chains(session: AsyncSession, data_type: str) -> Chains:
@@ -892,7 +990,7 @@ EXPECTED_CONSTRAINTS = {
         ),
     },
     "raw_health_data_supersessions": {
-        "pk_raw_health_data_supersessions": "PRIMARY KEY (old_raw_id)",
+        "pk_raw_health_data_supersessions": "PRIMARY KEY (old_raw_id, new_raw_id)",
         "ck_raw_health_data_supersessions_distinct_rows": "CHECK ((old_raw_id <> new_raw_id))",
         "fk_raw_health_data_supersessions_old_raw_id_raw_health_data": (
             "FOREIGN KEY (old_raw_id) REFERENCES raw_health_data(id)"
@@ -902,8 +1000,8 @@ EXPECTED_CONSTRAINTS = {
         ),
     },
     "raw_source_chains": {
-        "pk_raw_source_chains": "PRIMARY KEY (data_type, from_fingerprint)",
-        "uq_raw_source_chains_data_type": "UNIQUE (data_type, to_fingerprint)",
+        "pk_raw_source_chains": "PRIMARY KEY (id)",
+        "uq_raw_source_chains_link": "UNIQUE (data_type, from_fingerprint, to_fingerprint)",
         "ck_raw_source_chains_distinct_sources": (
             "CHECK (((from_fingerprint)::text <> (to_fingerprint)::text))"
         ),
@@ -928,21 +1026,35 @@ EXPECTED_CONSTRAINTS = {
         ),
     },
     "raw_source_chain_events": {
-        "pk_raw_source_chain_events": "PRIMARY KEY (data_type, from_fingerprint, event)",
+        "pk_raw_source_chain_events": (
+            "PRIMARY KEY (data_type, from_fingerprint, to_fingerprint, event)"
+        ),
+    },
+    "raw_source_devices": {
+        "pk_raw_source_devices": "PRIMARY KEY (id)",
     },
     "raw_source_sightings": {
         "pk_raw_source_sightings": "PRIMARY KEY (data_type, fingerprint)",
     },
 }
+# Keys and checks only: NOT NULL constraints (pg_constraint lists them from PostgreSQL 18 on)
+# and triggers are verified elsewhere.
 _CONSTRAINTS_SQL = text(
     "SELECT c.relname, k.conname, pg_get_constraintdef(k.oid), k.convalidated, k.condeferrable "
     "FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid "
     "JOIN pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE n.nspname = current_schema() AND c.relname = ANY(:tables)"
+    "WHERE n.nspname = current_schema() AND c.relname = ANY(:tables) "
+    "AND k.contype IN ('p', 'u', 'c', 'f', 'x')"
 )
 _RULES_SQL = text(
     "SELECT tablename, rulename FROM pg_rules "
     "WHERE schemaname = current_schema() AND tablename = ANY(:tables)"
+)
+_VIEW_COLUMNS_SQL = text(
+    "SELECT c.relname, a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = current_schema() AND c.relkind = 'v' AND c.relname = ANY(:views) "
+    "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY c.relname, a.attnum"
 )
 # Row-level security on a guarded table can hide rows from readers and verify alike.
 _ROW_SECURITY_SQL = text(
@@ -1007,17 +1119,38 @@ async def verify_identity_schema(session: AsyncSession, guarded: Iterable[str]) 
 
 async def verify_views(session: AsyncSession) -> list[str]:
     """The ``analytics_*`` views of 0012 were not redefined: each is compared with what this
-    server makes of the expected definition (a temporary view, in a rolled-back savepoint)."""
+    server makes of the expected definition (a temporary view, in a rolled-back savepoint).
+
+    ``SELECT *`` is expanded when a view is created, so a column added to a normalized table
+    later is not in its view: the expected definition selects the view's own columns, and
+    only the conditions (what is counted) must match."""
     from app.services.analytics_views import NORMALIZED_TABLES, view_select
 
     errors: list[str] = []
     views = [f"analytics_{table}" for table in NORMALIZED_TABLES]
+    columns: dict[str, list[str]] = defaultdict(list)
+    for view, column in (await session.execute(_VIEW_COLUMNS_SQL, {"views": views})).tuples():
+        columns[view].append(column)
     savepoint = await session.begin_nested()
     try:
         for table in NORMALIZED_TABLES:
-            await session.execute(
-                text(f"CREATE TEMP VIEW healthos_expected_{table} AS {view_select(table)}")
-            )
+            expected = view_select(table)
+            own = columns.get(f"analytics_{table}")
+            if own:
+                listed = ", ".join(f'{table}."{column}"' for column in own)
+                expected = expected.replace(
+                    f"SELECT * FROM {table}", f"SELECT {listed} FROM {table}", 1
+                )
+            try:
+                async with session.begin_nested():
+                    await session.execute(
+                        text(f"CREATE TEMP VIEW healthos_expected_{table} AS {expected}")
+                    )
+            except Exception:  # noqa: BLE001 - a column the table lacks: redefined
+                errors.append(
+                    f"analytics view analytics_{table} was redefined: its columns are not "
+                    f"columns of {table} (recreate it from migration 20261021_0012)"
+                )
         found = dict((await session.execute(_VIEWS_SQL, {"views": views})).tuples().all())
     finally:
         await savepoint.rollback()
@@ -1026,7 +1159,7 @@ async def verify_views(session: AsyncSession) -> list[str]:
         expected = found.get(f"healthos_expected_{table}")
         if actual is None:
             errors.append(f"analytics view missing: analytics_{table}")
-        elif " ".join(actual.split()) != " ".join((expected or "").split()):
+        elif expected is not None and " ".join(actual.split()) != " ".join(expected.split()):
             errors.append(
                 f"analytics view analytics_{table} was redefined: it no longer counts what the "
                 "dashboard counts (recreate it from migration 20261021_0012)"

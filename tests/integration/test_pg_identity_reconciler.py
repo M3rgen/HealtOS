@@ -31,7 +31,7 @@ from app.models.state import RawHealthData
 from app.parsers.common import payload_hash, source_id, temporal
 from app.services import identity_backfill as reconciler
 from app.services.identity import verify_identities
-from app.services.identity_backfill import LockUnavailable, identity_backfill
+from app.services.identity_backfill import identity_backfill
 from app.services.raw_history import verify_guards
 from app.services.source_chains import lock_data_type
 from app.services.storage import store_records
@@ -152,8 +152,9 @@ async def test_aliases_of_a_large_batch_stay_under_the_parameter_limit(pg_sessio
 
 
 async def test_a_busy_lock_backs_off_and_gives_up_clearly(pg_sessions, monkeypatch) -> None:
-    """Re-review 2 (low): a batch waits at most LOCK_TIMEOUT for the exclusive lock (never
-    queueing writers behind it for long), retries, then refuses with a clear message."""
+    """Re-review 2 (low): a batch tries for the exclusive lock (never queueing writers behind
+    it for long), retries, then gives up with a clear message - for that data type only: the
+    run goes on with the others (review 4) and reports the failure."""
     await legacy(pg_sessions, HEART, heart(60), T0)
     pauses: list[float] = []
 
@@ -163,10 +164,12 @@ async def test_a_busy_lock_backs_off_and_gives_up_clearly(pg_sessions, monkeypat
     monkeypatch.setattr(reconciler, "LOCK_TIMEOUT", "200ms")
     monkeypatch.setattr(reconciler, "LOCK_ATTEMPTS", 3)
     monkeypatch.setattr(reconciler, "_pause", pause)
+    await legacy(pg_sessions, STEPS, steps(5), T0)
     async with pg_sessions.begin() as writer:
         await lock_data_type(writer, HEART.name, exclusive=False)  # a long sync page
-        with pytest.raises(LockUnavailable, match="could not get the identity lock"):
-            await identity_backfill(pg_sessions, data_types=["heart-rate"])
+        report = await identity_backfill(pg_sessions, data_types=["heart-rate", "steps"])
+        assert "could not get the identity lock" in (report["heart-rate"].error or "")
+        assert report["steps"].error is None and report["steps"].rows == 1
         # The batch backed off: writers of the data type go ahead.
         await asyncio.wait_for(store(pg_sessions, HEART, heart(61, at=T0 + HOUR)), 5)
     assert pauses == [2, 4, 8]

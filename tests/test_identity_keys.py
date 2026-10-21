@@ -187,6 +187,10 @@ async def test_identity_tables_are_append_only_on_sqlite(sessions) -> None:
                 old_google_data_point_id="o",
                 new_google_data_point_id="n",
                 reason="display-name-change",
+                old_fingerprint="a" * 64,
+                new_fingerprint="b" * 64,
+                same_reading=True,
+                new_payload_hash="c" * 64,
             )
         )
     for statement in (
@@ -208,6 +212,10 @@ async def test_identity_tables_are_append_only_on_sqlite(sessions) -> None:
                     old_google_data_point_id="a",
                     new_google_data_point_id="a",
                     reason="duplicate",
+                    old_fingerprint="a" * 64,
+                    new_fingerprint="a" * 64,
+                    same_reading=True,
+                    new_payload_hash="c" * 64,
                 )
             )
 

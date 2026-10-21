@@ -343,6 +343,10 @@ async def test_backfill_counts_only_links_it_inserted_and_genuine_deletions(
                     old_google_data_point_id=row.google_data_point_id,
                     new_google_data_point_id=holder.google_data_point_id,
                     reason=reason,
+                    old_fingerprint=row.identity.source,
+                    new_fingerprint=holder.identity.source,
+                    same_reading=True,
+                    new_payload_hash=holder.payload_hash,
                 )
             )
             await session.flush()
@@ -373,9 +377,11 @@ async def test_after_still_settles_stale_start_rows_before_it(sessions, clock) -
     assert stale in await links(sessions)
 
 
-def test_status_shows_the_reconciler_and_incremental_runs_skip_without_a_full_run(
+def test_status_shows_the_reconciler_and_incremental_runs_do_a_first_full_pass(
     tmp_path, monkeypatch
 ) -> None:
+    """Review 4 (minor): the nightly run skipped a data type that never had a full run, for
+    good; it now runs its first full pass and says so."""
     import asyncio
 
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -399,7 +405,8 @@ def test_status_shows_the_reconciler_and_incremental_runs_skip_without_a_full_ru
         assert nightly.exit_code == 0, nightly.output
         report = json.loads(nightly.stdout)
         assert report["data_types"]["steps"]["skipped"].startswith("no full identity-backfill")
-        assert report["total"]["superseded"] == 0
+        assert report["data_types"]["steps"]["mode"] == "full"
+        assert report["total"]["superseded"] > 0
         full = CliRunner().invoke(cli.app, ["identity-backfill", "--data-type", "steps"])
         assert full.exit_code == 0, full.output
         again = CliRunner().invoke(
@@ -407,7 +414,9 @@ def test_status_shows_the_reconciler_and_incremental_runs_skip_without_a_full_ru
         )
         assert json.loads(again.stdout)["data_types"]["steps"]["skipped"] is None
         status = json.loads(CliRunner().invoke(cli.app, ["status"]).stdout)
-        [steps_state] = status["identity_reconcile"]
+        [steps_state] = [
+            state for state in status["identity_reconcile"] if state["data_type"] == "steps"
+        ]
         assert steps_state["data_type"] == "steps" and steps_state["full_run_at"]
         assert steps_state["last_mode"] == "incremental" and steps_state["last_error"] is None
         assert steps_state["last_result"]["skipped"] is None

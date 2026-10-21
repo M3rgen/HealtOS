@@ -1,27 +1,39 @@
 """The owner's decisions about source fingerprints (``health-mirror identity-decide``).
 
 The reconciler decides a chain only when the sightings leave no doubt
-(app/services/source_chains.py); everything else is listed as ``ambiguous`` or ``kept_apart``
-in its report and in ``health-mirror status``, and every chain it decided is listed under
-``review`` until the owner confirms or rejects it. This module records what the owner decides,
-append-only (``raw_source_decisions``, with the time and an optional note), and applies it:
+(app/services/source_chains.py); everything else is listed as ``ambiguous``, ``kept_apart`` or
+``review_distinct`` in its report and in ``health-mirror status``, and every chain it decided is
+listed under ``review`` until the owner confirms or rejects it. This module records what the
+owner decides, append-only (``raw_source_decisions``, with the time and an optional note), and
+applies it:
 
 * ``link FROM TO``: the two fingerprints are one device (``FROM`` its earlier form). A chain
-  ``FROM -> TO`` is recorded (``decided_by = owner``, naming the decision); the whole data type
-  is then settled again, so the rows of both forms are linked (equal readings only) and the
-  marks that were deferred between them are decided by the next complete fetch.
-* ``reject FROM TO``: the chain ``FROM -> TO`` is wrong. It is no longer used; the rows it
-  linked stay linked (they measured the same), and from now on each form gets rows of its own.
-* ``confirm FROM TO``: reviewed, the chain is right (it leaves the review list).
-* ``distinct A B``: two devices, whatever the evidence (a chain between them is no longer used).
-* ``not-distinct A B``: ignore the evidence of two devices between them (a stray duplicate);
-  the whole data type is settled again.
+  ``FROM -> TO`` is recorded (``decided_by = owner``, naming the decision), or a chain recorded
+  before and rejected is made live again; the whole data type is then settled again, so the
+  rows of both forms are linked (equal readings only).
+* ``reject FROM TO``: the chain ``FROM -> TO`` is wrong. It is no longer used: the links made
+  under it no longer hide anything (readers count both sides again at once), each form gets
+  rows of its own from now on, and both fingerprints are free for another chain.
+* ``confirm FROM TO``: reviewed, the chain is right (it leaves the review list; a rejected
+  one is live again).
+* ``distinct A B``: two devices, whatever the evidence: a chain between them is no longer used
+  (as after ``reject``).
+* ``not-distinct A B``: ignore the evidence of two devices between them (a stray duplicate):
+  a chain between them refuted by that evidence is live again; the whole data type is settled
+  again.
 
-The latest decision per question wins (a ``link`` after a ``reject`` uses the chain again).
-``--dry-run`` writes nothing and reports what the decision would change. Fingerprints are
-given by their first characters as the report prints them (``fingerprints``; 12 are shown,
-any unique prefix of at least 6 is accepted). ``verify`` checks that every chain the owner
-linked names its decision.
+The latest decision per question wins, so every decision is undone by the opposite one, in
+what readers count too: supersessions are in force only while their two fingerprints are one
+device (app/models/identity.py, ``in_force``). A decision that would make two live chains fork
+or cycle is refused (reject the other chain first). ``--dry-run`` writes nothing, takes no
+lock that writers wait for, and reports what the decision would change. Fingerprints are given
+by their first characters as the report prints them (``fingerprints``; 12 are shown, any
+unique prefix of at least 6 is accepted). ``verify`` checks that every chain the owner linked
+names its decision.
+
+A deletion deferred because a fingerprint might have been the device renamed is decided by the
+next complete fetch of its window after the decision (the decision itself fetches nothing): the
+outcome's ``deletions`` says so.
 """
 
 from __future__ import annotations
@@ -30,23 +42,20 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import aliased
 
 from app.core.logging import event
 from app.models.identity import CHAIN_DECISIONS, DECISIONS, RawHealthDataSupersession
-from app.models.state import RawHealthData
-from app.parsers.identity import record_identity
 from app.services import source_chains
 from app.services.identity_backfill import (
     STATEMENT_TIMEOUT,
     BackfillStats,
     Notice,
+    _full,
     _report,
     analyze_identity_tables,
     relink_data_type,
-    spec_for,
 )
 from app.services.source_chains import (
     Chains,
@@ -61,7 +70,8 @@ logger = logging.getLogger(__name__)
 
 MIN_PREFIX = 6
 # Decisions after which rows may need linking: the whole data type is settled again (after
-# the others too when they let the rule decide a chain).
+# the others too when they join two devices - ``confirm`` of a rejected chain - or let the
+# rule decide a chain).
 RELINK = ("link", "not-distinct")
 
 
@@ -69,11 +79,17 @@ class DecisionRefused(ValueError):
     """The decision does not apply (unknown source, wrong class, a fork, ...)."""
 
 
-def match(chains: Chains, prefix: str) -> str:
+def match(chains: Chains, prefix: str, data_type: str = "") -> str:
     """The fingerprint of the data type that starts with ``prefix``."""
     prefix = prefix.strip().lower()
     if len(prefix) < MIN_PREFIX:
         raise DecisionRefused(f"give at least {MIN_PREFIX} characters of the fingerprint")
+    if not chains.spans:
+        raise DecisionRefused(
+            f"no source of {data_type or 'this data type'} has been seen: check --data-type "
+            "(a Google data type name like heart-rate, as `health-mirror status` lists them) "
+            "or run identity-backfill first"
+        )
     found = [name for name in chains.spans if name.lower().startswith(prefix)]
     if not found:
         raise DecisionRefused(f"no source of this data type has a fingerprint {prefix}...")
@@ -93,32 +109,59 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
             "the two sources differ in their stable fields (platform, recording method, device "
             "form factor or manufacturer, package without suffix): they never share a record"
         )
-    linked = chains.following.get(first) == second
-    if decision in ("reject", "confirm") and not linked:
+    recorded = (first, second) in chains.links
+    if decision in ("reject", "confirm") and not recorded:
         raise DecisionRefused(f"there is no chain {first[:12]} -> {second[:12]} to {decision}")
-    if decision == "link" and not linked:
-        if first in chains.following:
+    pair = _pair(first, second)
+    if decision in ("link", "confirm"):
+        if chains.pair_decisions.get(pair) == "distinct":
             raise DecisionRefused(
-                f"{first[:12]} already continues as {chains.following[first][:12]} (a chain "
-                "never forks): reject that chain first"
+                "you decided these two sources are distinct devices; if they are one device, "
+                "decide not-distinct first"
             )
-        if second in chains.preceding:
+        if chains.pair_decisions.get(pair) is None and (
+            source_chains.established(chains.evidence.get(pair, ()))
+            or (first, second) in chains.refuted_events
+        ):
             raise DecisionRefused(
-                f"{second[:12]} already continues {chains.preceding[second][:12]}: reject that "
-                "chain first"
+                "these two sources returned different values for one record in separate "
+                "fetches (two devices); if you are sure they are one device, decide "
+                "not-distinct first"
             )
-        if chains.reaches(second, first):
-            raise DecisionRefused("linking them would close a cycle of chains")
-    if (
-        decision == "link"
-        and len(chains.evidence.get(_pair(first, second), ())) >= (source_chains.PAIR_KEYS)
-        and chains.pair_decisions.get(_pair(first, second)) != "not-distinct"
-    ):
-        raise DecisionRefused(
-            "these two sources returned different values for one record "
-            f"{len(chains.evidence[_pair(first, second)])} or more times (two devices); if you "
-            "are sure they are one device, decide not-distinct first"
-        )
+        if chains.same_device(first, second) and not chains.live(first, second):
+            raise DecisionRefused(
+                f"{first[:12]} and {second[:12]} are already one device through other chains"
+            )
+    if decision == "distinct" and chains.same_device(first, second):
+        direct = [link for link in ((first, second), (second, first)) if chains.live(*link)]
+        if not direct:
+            raise DecisionRefused(
+                "these two sources are one device through other chains: reject the wrong "
+                "chain between them instead"
+            )
+    if decision in ("link", "confirm", "not-distinct"):
+        planned = chains.copy()
+        planned.decide(decision, first, second)
+        if decision == "link" and not recorded:
+            planned.add(first, second)
+        problems = planned.problems()
+        if problems:
+            following, preceding = chains.following, chains.preceding
+            other = following.get(first) if following.get(first) not in (None, second) else None
+            earlier = preceding.get(second) if preceding.get(second) not in (None, first) else None
+            if other is not None:
+                reason = (
+                    f"{first[:12]} already continues as {other[:12]} (a live chain; a chain "
+                    "never forks): reject that chain first"
+                )
+            elif earlier is not None:
+                reason = (
+                    f"{second[:12]} already continues {earlier[:12]} (a live chain): reject "
+                    "that chain first"
+                )
+            else:
+                reason = "; ".join(problems)
+            raise DecisionRefused(f"the chains would no longer be chains: {reason}")
 
 
 def _pair(first: str, second: str) -> tuple[str, str]:
@@ -133,6 +176,8 @@ class Outcome:
     second: dict
     dry_run: bool
     decision_id: int | None = None
+    # The two sources' chain after the decision (live, rejected or refuted), when recorded.
+    chain: str | None = None
     # Supersession links between rows of the two sources (they stay whatever is decided).
     links_between: int = 0
     stats: BackfillStats = field(default_factory=BackfillStats)
@@ -145,7 +190,13 @@ class Outcome:
             "from": self.first,
             "to": self.second,
             "decision_id": self.decision_id,
+            "chain": self.chain,
             "links_between_their_rows": self.links_between,
+            "deletions": (
+                "a deletion left undecided because one of these sources might be the other "
+                "renamed is decided by the next complete fetch of its window (the daily "
+                "deletion check, or `health-mirror backfill` of that window)"
+            ),
             "effect": {
                 name: value
                 for name, value in self.stats.as_dict().items()
@@ -161,6 +212,7 @@ class Outcome:
                     "review",
                     "ambiguous",
                     "kept_apart",
+                    "review_distinct",
                     "refuted",
                 )
             },
@@ -168,23 +220,20 @@ class Outcome:
 
 
 async def _links_between(session: AsyncSession, data_type: str, first: str, second: str) -> int:
-    spec = spec_for(data_type)
-    old_row, new_row = aliased(RawHealthData), aliased(RawHealthData)
-    rows = await session.stream(
-        select(old_row.raw_json, new_row.raw_json)
-        .select_from(RawHealthDataSupersession)
-        .join(old_row, old_row.id == RawHealthDataSupersession.old_raw_id)
-        .join(new_row, new_row.id == RawHealthDataSupersession.new_raw_id)
-        .where(RawHealthDataSupersession.data_type == data_type)
-        .execution_options(yield_per=1_000)
+    """Supersessions between rows of the two sources (any state)."""
+    link = RawHealthDataSupersession
+    return (
+        await session.scalar(
+            select(func.count()).where(
+                link.data_type == data_type,
+                or_(
+                    and_(link.old_fingerprint == first, link.new_fingerprint == second),
+                    and_(link.old_fingerprint == second, link.new_fingerprint == first),
+                ),
+            )
+        )
+        or 0
     )
-    wanted = {first, second}
-    found = 0
-    async for old_json, new_json in rows:
-        old, new = record_identity(spec, old_json), record_identity(spec, new_json)
-        if old is not None and new is not None and {old.source, new.source} == wanted:
-            found += 1
-    return found
 
 
 async def decide_sources(
@@ -205,7 +254,8 @@ async def decide_sources(
     ``DecisionRefused`` (nothing written) or ``BackfillRunning``."""
     async with sessions() as session:
         chains = await load_chains(session, data_type)
-    first, second = match(chains, first_prefix), match(chains, second_prefix)
+    first = match(chains, first_prefix, data_type)
+    second = match(chains, second_prefix, data_type)
     check(chains, decision, first, second)
     outcome = Outcome(
         decision,
@@ -217,19 +267,24 @@ async def decide_sources(
     async with sessions() as session:
         outcome.links_between = await _links_between(session, data_type, first, second)
 
+    joined: list[bool] = []
+
     async def apply(session: AsyncSession, current: Chains) -> None:
         # Under the exclusive lock: the chains may have changed since they were read.
         check(current, decision, first, second)
+        before = current.members(first)
+        joined.append(False)
         if dry_run:
             current.decide(decision, first, second)
-            if decision == "link" and current.following.get(first) != second:
+            if decision == "link" and (first, second) not in current.links:
                 current.add(first, second)
+            joined[-1] = current.members(first) > before
             return
         now = await source_chains.database_now(session)
         outcome.decision_id = await record_decision(
             session, data_type, current, decision, first, second, note=note, now=now
         )
-        if decision == "link" and current.following.get(first) != second:
+        if decision == "link" and (first, second) not in current.links:
             inserted = await insert_chain(
                 session,
                 data_type,
@@ -242,6 +297,7 @@ async def decide_sources(
             )
             if not inserted:
                 raise DecisionRefused("another chain of these sources was recorded meanwhile")
+        joined[-1] = current.members(first) > before
         event(
             logger,
             "SOURCE_DECISION_RECORDED",
@@ -252,12 +308,12 @@ async def decide_sources(
             decision_id=outcome.decision_id,
         )
 
-    async with backfill_lock(sessions):
+    async with backfill_lock(sessions, dry_run=dry_run):
         outcome.stats = await relink_data_type(
             sessions,
             data_type,
             apply,
-            link=decision in RELINK,
+            link=lambda: decision in RELINK or any(joined),
             batch_size=batch_size,
             dry_run=dry_run,
             statement_timeout=statement_timeout,
@@ -266,6 +322,9 @@ async def decide_sources(
         )
         if not dry_run:
             await analyze_identity_tables(sessions)
+    for entry in outcome.stats.chains:
+        if _full(chains, entry) == [first, second]:
+            outcome.chain = entry.get("state")
     return outcome
 
 
@@ -275,15 +334,7 @@ async def list_sources(sessions: async_sessionmaker, data_type: str) -> dict[str
     chain rule would leave open now."""
     async with sessions() as session:
         chains = await load_chains(session, data_type)
-    planned = Chains(
-        dict(chains.following),
-        spans=chains.spans,
-        decided_by=dict(chains.decided_by),
-        evidence={pair: set(keys) for pair, keys in chains.evidence.items()},
-        chain_decisions=dict(chains.chain_decisions),
-        pair_decisions=dict(chains.pair_decisions),
-        refuted_events=set(chains.refuted_events),
-    )
+    planned = chains.copy()
     decision = decide_chains(planned)
     stats = BackfillStats(mode="sources")
     _report(chains, None, set(), decision.ambiguous, [], stats)
@@ -310,6 +361,7 @@ async def list_sources(sessions: async_sessionmaker, data_type: str) -> dict[str
         "chains": stats.chains,
         "review": stats.review,
         "kept_apart": stats.kept_apart,
+        "review_distinct": stats.review_distinct,
         "would_link": [
             {"from": chains.spans[old].label, "to": chains.spans[new].label}
             for old, new in decision.links

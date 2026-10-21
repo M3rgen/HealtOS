@@ -324,8 +324,9 @@ async def test_rows_seen_minutes_apart_are_not_two_devices(sessions, clock) -> N
 
 async def test_one_stray_co_sighting_does_not_make_two_devices(sessions, clock) -> None:
     """B5: one key returned in one response under both names with two values is evidence,
-    not proof; three such keys establish two devices. Equal values are no evidence (one
-    measurement). The owner can set the evidence aside."""
+    not proof; equal values are no evidence (one measurement). Two devices are established
+    only by keys from two fetches, the later one returning a record newer than the first
+    fetch (review 4: one response is never enough). The owner can set the evidence aside."""
     await store(sessions, HEART, heart(60), heart(61, name=WATCH), heart(70, at=T0 + MINUTE))
     await store(
         sessions, HEART, heart(72, at=T0 + 2 * MINUTE), heart(72, at=T0 + 2 * MINUTE, name=WATCH)
@@ -338,6 +339,12 @@ async def test_one_stray_co_sighting_does_not_make_two_devices(sessions, clock) 
     for minute in (3, 4):
         at = T0 + minute * MINUTE
         await store(sessions, HEART, heart(60, at=at), heart(90, at=at, name=WATCH))
+    async with sessions() as session:
+        chains = await load_chains(session, "heart-rate")
+    assert not chains.distinct(OLD, watch)  # three keys, one fetch
+    clock.advance(hours=1)
+    at = clock.now - MINUTE  # recorded after the first fetch: both still record
+    await store(sessions, HEART, heart(60, at=at), heart(91, at=at, name=WATCH))
     async with sessions() as session:
         chains = await load_chains(session, "heart-rate")
     assert chains.distinct(OLD, watch)
@@ -422,21 +429,33 @@ async def test_deletions_are_split_into_genuine_and_suspicious(sessions) -> None
 # --- B8: a second device does not block a rename --------------------------------------------
 
 
-async def test_a_watch_worn_alongside_does_not_block_the_bands_rename(sessions) -> None:
-    """B8: a watch recorded alongside the band, before and after its rename (one page held
-    both, with different values, for three instants each time). It is established distinct
-    from both names, so it no longer blocks the band's chain: the renamed band is counted
-    once, the watch once."""
-    for minute in range(3):
+async def worn_together(sessions, band: str, minutes, seen, watch_last=None) -> None:
+    """One page (stored at ``seen``) with the band and a watch, different values."""
+    for minute in minutes:
         at = T0 + minute * MINUTE
-        await legacy(sessions, HEART, heart(60 + minute, at=at), T0, last=T0 + HOUR)
-        await legacy(sessions, HEART, heart(90 + minute, at=at, name=WATCH), T0, last=T0 + 9 * HOUR)
+        await legacy(sessions, HEART, heart(60 + minute % 30, at=at, name=band), seen)
+        await legacy(
+            sessions, HEART, heart(90 + minute % 30, at=at, name=WATCH), seen, last=watch_last
+        )
+
+
+async def test_a_watch_worn_alongside_does_not_block_the_bands_rename(sessions) -> None:
+    """B8: a watch recorded alongside the band, before and after its rename (pages held
+    both, with different values, in two fetches each time, the later one with newer records).
+    It is established distinct from both names, so it no longer blocks the band's chain: the
+    renamed band is counted once, the watch once."""
+    await worn_together(sessions, OLD_NAME, range(3), T0 + 3 * MINUTE)
+    await worn_together(sessions, OLD_NAME, range(5, 8), T0 + 8 * MINUTE)
+    for minute in (*range(3), *range(5, 8)):  # the old records, renamed
+        at = T0 + minute * MINUTE
         await legacy(sessions, HEART, heart(60 + minute, at=at, name=NEW_NAME), T0 + 9 * HOUR)
+    await worn_together(sessions, NEW_NAME, range(541, 544), T0 + 9 * HOUR + 4 * MINUTE)
+    await worn_together(sessions, NEW_NAME, range(546, 549), T0 + 9 * HOUR + 9 * MINUTE)
     report = (await identity_backfill(sessions))["heart-rate"]
     assert [(chain["from"], chain["to"]) for chain in report.chains] == [
         (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED")
     ]
-    assert len(await counted_rows(sessions)) == 6
+    assert len(await counted_rows(sessions)) == 6 + 6 + 12  # band 12 records, watch 12
     assert await problems(sessions) == ([], [])
 
 
@@ -445,19 +464,17 @@ async def test_deciding_a_watch_distinct_lets_the_rename_chain_and_links_at_once
     together, so nothing proves it another device and the rename stays open. The owner says
     the watch is another device: the rename is chained and its rows linked at once (not by
     the nightly run, which only reads rows written since its checkpoint)."""
-    for minute in range(3):
+    await worn_together(sessions, OLD_NAME, range(3), T0 + 3 * MINUTE)
+    await worn_together(sessions, OLD_NAME, range(5, 8), T0 + 8 * MINUTE, T0 + 10 * HOUR)
+    for minute in (*range(3), *range(5, 8)):
         at = T0 + minute * MINUTE
-        await legacy(sessions, HEART, heart(60 + minute, at=at), T0, last=T0 + HOUR)
-        await legacy(
-            sessions, HEART, heart(90 + minute, at=at, name=WATCH), T0, last=T0 + 10 * HOUR
-        )
         await legacy(sessions, HEART, heart(60 + minute, at=at, name=NEW_NAME), T0 + 9 * HOUR)
     report = (await identity_backfill(sessions))["heart-rate"]
-    assert report.chains == [] and len(await counted_rows(sessions)) == 9
+    assert report.chains == [] and len(await counted_rows(sessions)) == 6 * 3
     watch = source_fingerprint(fitbit(WATCH))
     outcome = await decide_sources(sessions, "heart-rate", "distinct", watch[:12], NEW[:12])
     assert [chain["decided"] for chain in outcome.stats.chains] == ["this run"]
-    assert len(await counted_rows(sessions)) == 6
+    assert len(await counted_rows(sessions)) == 6 * 2
     assert await problems(sessions) == ([], [])
 
 

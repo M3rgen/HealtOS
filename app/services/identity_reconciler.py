@@ -1,13 +1,15 @@
 """The nightly identity reconciler: ``identity-backfill --incremental`` as a scheduler job.
 
-It runs over every archived data type that had a full ``identity-backfill`` (others are
-skipped and say so), decides new source chains, records refuted ones and links the
-duplicate rows written since its checkpoint (app/services/identity_backfill.py). What it leaves
-to the owner (chains to review, ambiguous sources, pairs nothing decided) goes to the log and to
-``health-mirror status``. The result
-of each data type goes to the log and to ``identity_reconcile_state``, which
-``health-mirror status`` shows. Another run of identity-backfill holding the single-run lock
-makes the job skip (logged); a data type whose lock stays busy is retried on the next night.
+It runs over every archived data type: incrementally where a full ``identity-backfill`` ran,
+else the data type's first full pass (``skipped`` says so). It decides new source chains,
+records refuted ones and links the duplicate rows written since its checkpoint
+(app/services/identity_backfill.py). What it leaves to the owner (chains to review, ambiguous
+sources, pairs nothing decided, pairs that look like a rename) goes to the log and to
+``health-mirror status``. The result of each data type goes to the log and to
+``identity_reconcile_state``, which ``health-mirror status`` shows. Another run of
+identity-backfill holding the single-run lock makes the job skip (logged); a data type that
+fails (its lock stays busy) is logged with its error and retried on the next night, while the
+others still run.
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ class IdentityReconciler:
             chains_decided=sum(values["chains_decided"] for values in summary.values()),
             ambiguous=sum(values["ambiguous"] for values in summary.values()),
             review_suggested=sum(values["review_suggested"] for values in summary.values()),
+            review_distinct=sum(values["review_distinct"] for values in summary.values()),
+            failed=sum(1 for values in summary.values() if values["error"]),
             kept_apart_undecided=sum(values["kept_apart_undecided"] for values in summary.values()),
             skipped=sum(1 for values in summary.values() if values["skipped"]),
         )
