@@ -641,7 +641,7 @@ run (`--incremental`, the nightly scheduler job
 keeps them and links the start times of rows created or given a new payload since its
 checkpoint minus one hour, plus exactly the rows whose devices changed: every row of a link
 between two fingerprints that are no longer one device (a refutation; whatever its age, also rows
-archived before 0011), and every row touched since the later of two fingerprints that newly are
+archived before 0011), and every row first seen since the later of two fingerprints that newly are
 was first seen (the start times are read first, in short transactions of their own, as integers;
 no snapshot is held while they are settled); a data type that
 never had a full run gets its first full pass instead and says so (`skipped`). A data type that

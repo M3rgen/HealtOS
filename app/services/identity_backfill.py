@@ -74,6 +74,7 @@ from typing import Any
 from sqlalchemy import func, insert, select, text, tuple_
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from app.core.logging import event
 from app.core.timeutil import as_utc
@@ -1522,9 +1523,9 @@ async def _settle_changed(
     * every row of a link between two fingerprints that are no longer one device (``lapsed``:
       a rejected or refuted chain, a ``distinct`` decision), whatever its age - its two sides
       are linked again within each device, so neither counts twice;
-    * every row touched since the later of two fingerprints that are newly one device was
-      first seen (``joined``): each of its rows was written since, also one stored before
-      migration 20261020_0011 (without ``payload_received_at``).
+    * every row first seen since the later of two fingerprints that are newly one device was
+      (``joined``): each of its rows was, also one stored before migration 20261020_0011
+      (without ``payload_received_at``).
 
     The start times are read first, each set in one short transaction (none is held open
     while they are settled), and kept as integers."""
@@ -1591,11 +1592,23 @@ async def _collect_starts(
             )
         )
     if touched is not None:
+        # first_seen_at: the clock the sightings use (the application's, when the page was
+        # stored); a row's source never changes, so every row of the later source was first
+        # seen since it was.
+        # Only start times with another row can need a link (ix_raw_health_data_type_start).
+        other = aliased(RawHealthData)
         queries.append(
             select(RawHealthData.source_start_time).where(
                 RawHealthData.data_type == data_type,
-                RawHealthData.updated_at >= touched,
+                RawHealthData.first_seen_at >= touched,
                 RawHealthData.source_start_time.is_not(None),
+                select(other.id)
+                .where(
+                    other.data_type == data_type,
+                    other.source_start_time == RawHealthData.source_start_time,
+                    other.id != RawHealthData.id,
+                )
+                .exists(),
             )
         )
     if lapsed:

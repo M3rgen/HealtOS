@@ -441,3 +441,20 @@ async def test_the_views_query_requires_a_view(sessions) -> None:
 
     sql = " ".join(str(identity._VIEWS_SQL).split())
     assert "c.relkind = 'v' AND (" in sql
+
+
+async def test_a_link_settles_rows_by_the_clock_the_sightings_use(sessions, clock) -> None:
+    """Decisions settled rows by updated_at (the database clock on insert) against a source's
+    first sighting (the application's fetch time): with the two clocks apart, a link linked
+    nothing. Rows are selected by first_seen_at, the sightings' own clock, and only at start
+    times holding more than one row."""
+    await legacy(sessions, HEART, heart(60, name=A1), T0, last=T0 + HOUR)
+    await identity_backfill(sessions)
+    clock.now = T0 + HOUR + 2 * MINUTE  # a rename within a fetch: left to the owner
+    await store(sessions, HEART, heart(60, name=A2), heart(61, at=clock.now, name=A2))
+    async with sessions.begin() as session:
+        await session.execute(update(RawHealthData).values(updated_at=T0 - 30 * HOUR))
+    assert len(await counted_rows(sessions)) == 3
+    outcome = await decide_sources(sessions, "heart-rate", "link", fp(A1)[:12], fp(A2)[:12])
+    assert outcome.stats.linked == {"display-name-change": 1}
+    assert len(await counted_rows(sessions)) == 2
