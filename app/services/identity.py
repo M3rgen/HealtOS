@@ -28,10 +28,11 @@ v2s ids of the key and each fingerprint of the device (rows stored since), its s
 its v2s id is taken (in blocks, until one is free: spare ids are given in order, so the row
 written last time is found again and never a second one made), and the alias table (rows whose
 own id is neither). Superseded means superseded by a link *in force* (its two fingerprints one
-device now): a row whose links are no longer in force is its own holder again. A payload is never written onto a row of another device, nor
-onto a row of the device that measured something else. ``store_records`` locks the rows it
-writes onto and re-resolves when one changed meanwhile, and creates new rows with ``ON
-CONFLICT DO NOTHING`` (re-resolving when another writer created the row first).
+device now): a row whose links are no longer in force is its own holder again. A payload is
+never written onto a row of another device, nor onto a row of the device that measured
+something else. ``store_records`` locks the rows it writes onto and re-resolves when one
+changed meanwhile, and creates new rows with ``ON CONFLICT DO NOTHING`` (re-resolving when
+another writer created the row first).
 
 ``present_records`` decides, for deletion marking, whether an unseen row's record is still
 returned: with the same reading under a row it is linked with or a row of its device
@@ -179,7 +180,9 @@ async def _find(
 
 async def successors(session: AsyncSession, raw_ids: Iterable[uuid.UUID], chains: Chains) -> dict:
     """raw id -> the row that holds its record now: the target of its newest link in force
-    (``chains``: its two fingerprints are one device), followed; itself when it has none."""
+    (``chains``: its two fingerprints are one device) - a live target before one marked
+    deleted, as readers hide a row behind any live holder - followed; itself when it has
+    none."""
     result = {raw_id: raw_id for raw_id in raw_ids}
     link = RawHealthDataSupersession
     step: dict[uuid.UUID, uuid.UUID | None] = {}
@@ -195,12 +198,15 @@ async def successors(session: AsyncSession, raw_ids: Iterable[uuid.UUID], chains
                     link.old_fingerprint,
                     link.new_fingerprint,
                     link.created_at,
-                ).where(among(session, link.old_raw_id, chunk))
+                    RawHealthData.source_deleted_at.is_(None),
+                )
+                .join(RawHealthData, RawHealthData.id == link.new_raw_id)
+                .where(among(session, link.old_raw_id, chunk))
             )
-            for old, new, old_source, new_source, created in rows.tuples():
+            for old, new, old_source, new_source, created, live in rows.tuples():
                 if not chains.in_force(old_source, new_source):
                     continue
-                rank = (created, str(new))
+                rank = (bool(live), created, str(new))
                 if old not in newest or rank > newest[old][0]:
                     newest[old] = (rank, new)
             for raw_id in chunk:

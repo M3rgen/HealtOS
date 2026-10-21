@@ -52,9 +52,9 @@ Each batch of the second pass is one transaction holding the data type's exclusi
 ``LOCK_TIMEOUT`` and then waits in the queue at most ``QUEUE_TIMEOUT``, and once it holds it
 waits at most ``ROW_LOCK_TIMEOUT`` for any row lock of another transaction; then it backs off
 and retries, so it never queues every writer behind a long sync or import. A dry run takes
-no lock at all and writes nothing. Inserts are ``ON CONFLICT DO NOTHING`` in chunks (far below PostgreSQL's 32,767
-parameters), so a run is idempotent and can be stopped and run again at any time. Only one
-run at a time: a second one refuses at once.
+no lock at all and writes nothing. Inserts are ``ON CONFLICT DO NOTHING`` in chunks (far below
+PostgreSQL's 32,767 parameters), so a run is idempotent and can be stopped and run again at
+any time. Only one run at a time: a second one refuses at once.
 """
 
 from __future__ import annotations
