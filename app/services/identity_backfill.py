@@ -945,6 +945,10 @@ async def _plan_batch(
     def measured(row: _Row) -> str | None:
         return reading(spec, row.raw_json)
 
+    def newest_form(row: _Row) -> str:
+        span = chains.spans.get(row.identity.source)
+        return span.first.isoformat() if span is not None else ""
+
     def add_link(row: _Row, holder: _Row) -> None:
         plan.links.append((row, holder, supersession_reason(spec, row.raw_json, holder.raw_json)))
         edges[row.raw_id].add(holder.raw_id)
@@ -1023,18 +1027,19 @@ async def _plan_batch(
             # only live roots are linked across fingerprints.
             counted = [root for root in roots if root.raw_id not in hidden and not root.deleted]
             if len(counted) > 1:
+                # The row returned last holds the record (a later value under its name is
+                # written onto it, never hidden behind a stale one); of rows returned
+                # together, the device's newest form (the one returned again, as a rule).
                 holder = max(
                     counted,
                     key=lambda row: (
-                        not row.deleted,
-                        # A growing interval: the end returned last holds the record (an
-                        # end Google no longer returns is stale, longer or not), then the
-                        # longer one.
-                        row.last_seen_at if row.identity.shape else _EPOCH,
+                        row.last_seen_at,
+                        newest_form(row),
                         row.identity.shape or "",
                         sum((other.raw_id, row.raw_id) in existing for other in counted),
                         row.raw_id in pointed,
-                        *row.order[1:],
+                        row.first_seen_at,
+                        str(row.raw_id),
                     ),
                 )
                 value = measured(holder)
