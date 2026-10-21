@@ -792,7 +792,9 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 | Duplicate row → row holding its record | `raw_health_data_supersessions` | append-only; the superseded row itself is unchanged |
 | Source fingerprint → the same device after a rename | `raw_source_chains` | append-only (decisions with their evidence) |
 | First/last sighting per source fingerprint | `raw_source_sightings` | widen-only (trigger), written by every page and by `identity-backfill` |
-| Contradicted source chains | `raw_source_chain_events` | append-only (trigger) |
+| Refuted source chains | `raw_source_chain_events` | append-only (trigger) |
+| Evidence of two devices (a key returned with two values in one response) | `raw_source_pairs` | append-only (trigger) |
+| The owner's decisions about sources | `raw_source_decisions` | append-only (trigger); the latest per question wins |
 | Reconciler checkpoints, fetch round starts | `identity_reconcile_state`, `fetch_rounds` | bookkeeping |
 | Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
 | Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only |
@@ -867,9 +869,9 @@ above, and why it is allowed:
 | Write | Table | Verdict |
 |---|---|---|
 | `store_records` UPSERT (`app/services/storage.py`) | `raw_health_data` | onto the row that holds the record's identity (never re-keyed); payload change → kept as a version by trigger first; `last_seen_at`, `source_deleted_at` → `NULL` (logged as an event), `payload_received_at`/`payload_source`/`response_id` change only with the payload; derived `source_*_time`/`source_timezone` |
-| `store_records` aliases and chains (`app/services/identity.py`) | `raw_health_data_identity`, `raw_source_chains` | `INSERT ... ON CONFLICT DO NOTHING` only |
+| `store_records` aliases and evidence (`app/services/identity.py`, `source_chains.py`) | `raw_health_data_identity`, `raw_source_pairs` | `INSERT ... ON CONFLICT DO NOTHING` only |
 | `store_records` sightings (`app/services/source_chains.py`) | `raw_source_sightings` | first/last sighting widened in place (bookkeeping, no received data) |
-| `identity-backfill` and the nightly `identity-reconcile` job (`app/services/identity_backfill.py`) | `raw_health_data_identity`, `raw_health_data_supersessions`, `raw_source_chains`, `raw_source_chain_events`, `raw_health_data_events`, `raw_source_sightings`, `identity_reconcile_state` | inserts only (sightings widened); `raw_health_data` and its versions are only read |
+| `identity-backfill`, the nightly `identity-reconcile` job and `identity-decide` (`app/services/identity_backfill.py`, `identity_decisions.py`) | `raw_health_data_identity`, `raw_health_data_supersessions`, `raw_source_chains`, `raw_source_chain_events`, `raw_source_pairs`, `raw_source_decisions`, `raw_health_data_events`, `raw_source_sightings`, `identity_reconcile_state` | inserts only (sightings widened, marked complete); `raw_health_data` and its versions are only read |
 | `mark_source_deletions` (`app/sync/deletions.py`) | `raw_health_data` | sets `source_deleted_at` only (logged as an event); nothing deleted |
 | import-restored row takes a newer dump payload (`app/services/raw_history.py`) | `raw_health_data` | only rows the import itself created; the old payload is kept as a version by trigger |
 | version renumbering (`import-versions`) | `raw_health_data_versions` | `version` only, in a transaction with `healthos.renumber = '1'` |
@@ -1013,9 +1015,9 @@ Defaults:
 - Daily at 02:00 UTC: re-read the last 7 days.
 - Sunday at 03:00 UTC: re-read the last 90 days.
 - Daily at 02:30 UTC: the identity reconciler (`identity-backfill --incremental`): decides
-  renamed sources and links the duplicate rows written since its last run
-  ([Record identity](#record-identity)). Away from the 03:30 (local) backup; it waits for no
-  sync longer than 10 s at a time.
+  renamed sources and links the duplicate rows written since its last run, and lists what it
+  leaves to the owner in `health-mirror status` ([Record identity](#record-identity)). Away from
+  the 03:30 (local) backup; it waits for no sync longer than 10 s at a time.
 
 These use normal idempotent UPSERTs. Disable in `.env` when another scheduler instance owns the jobs.
 Run either depth manually with `health-mirror reconcile --days 7` or
