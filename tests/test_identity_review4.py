@@ -406,3 +406,39 @@ async def test_sightings_keep_their_label_and_source(sessions) -> None:
             assert "only widens" in str(refused)
         else:  # pragma: no cover - the assertion above is the test
             raise AssertionError(f"{statement} was accepted")
+
+
+async def test_a_watch_against_the_new_name_in_one_re_fetch_does_not_block_the_rename(sessions):
+    """Acceptance m1/s2: the watch was established distinct from the band's old name (two
+    fetches), but its evidence against the new name came from one wide re-fetch of old
+    records, so it blocked the rename (counted twice for good). Distinct from one form and
+    three keys of evidence against the other say it is another device."""
+    from test_identity_review3 import worn_together
+
+    await worn_together(sessions, OLD_NAME, range(3), T0 + 3 * MINUTE)
+    await worn_together(sessions, OLD_NAME, range(5, 8), T0 + 8 * MINUTE, T0 + 10 * HOUR)
+    for minute in range(3):  # the re-fetch: the band's old records renamed, beside the watch
+        at = T0 + minute * MINUTE
+        await legacy(sessions, HEART, heart(60 + minute, at=at, name=NEW_NAME), T0 + 9 * HOUR)
+    for minute in range(3):
+        at = T0 + (60 + minute) * MINUTE
+        await legacy(sessions, HEART, heart(60 + minute, at=at, name=NEW_NAME), T0 + 9 * HOUR)
+        await legacy(sessions, HEART, heart(90 + minute, at=at, name=WATCH), T0 + 9 * HOUR)
+    report = (await identity_backfill(sessions))["heart-rate"]
+    assert [(chain["from"], chain["to"]) for chain in report.chains] == [
+        (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED")
+    ]
+    assert len(await counted_rows(sessions)) == 6 + 3 + 6 + 3  # old 6 of which 3 renamed
+
+
+async def test_a_link_across_a_distinct_form_of_a_device_is_refused(sessions, clock) -> None:
+    """Acceptance f3: linking the band's new name to a watch the owner decided distinct from
+    the band's old name (same device) was accepted. It is refused, naming the pair."""
+    await chained_band_and_a_watch(sessions, clock)
+    await decide_sources(sessions, "heart-rate", "distinct", WATCH_FP[:12], OLD[:12])
+    try:
+        await decide_sources(sessions, "heart-rate", "link", NEW[:12], WATCH_FP[:12])
+    except DecisionRefused as refused:
+        assert "decide not-distinct for them first" in str(refused)
+    else:  # pragma: no cover - the assertion above is the test
+        raise AssertionError("a link across distinct devices was accepted")

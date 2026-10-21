@@ -41,9 +41,12 @@ of one device's chain only when
 5. ``A`` and ``B`` are not established distinct, neither already has a live link the other way
    (a chain never forks or cycles), and no link between them was rejected or refuted.
 
-A fingerprint established distinct from *both* ``A`` and ``B`` (a second watch worn alongside)
-is left out of rules 3 and 4: it is known to be another device, so it says nothing about
-``A -> B``. A fingerprint established distinct from ``B`` is never ``B``'s candidate.
+A fingerprint established distinct from ``A`` or ``B`` and with ``PAIR_KEYS`` keys of evidence
+against the other (from any responses: a second watch worn alongside, its evidence against the
+new name perhaps from one re-fetch of old records) is left out of rules 3 and 4: it is known to
+be another device, so it says nothing about ``A -> B`` (a chain only ever merges equal
+readings; deletions are never marked on that weaker evidence). A fingerprint established
+distinct from ``B`` is never ``B``'s candidate.
 
 Everything else is *ambiguous*: nothing is linked, both keep their rows (visible; at worst
 counted twice), and every run's report and ``health-mirror status`` list the case with why, for
@@ -572,9 +575,23 @@ def decide_chains(chains: Chains) -> Decision:
             }
         )
 
+    def apart(left: str, right: str) -> bool:
+        # Established distinct, or (only to stop blocking a chain, which merges equal readings
+        # alone) ``PAIR_KEYS`` keys with two values in any responses, the owner not saying
+        # otherwise: a second device whose evidence against one form comes from one re-fetch.
+        pair = ordered_pair(left, right)
+        return chains.distinct(left, right) or (
+            chains.pair_decisions.get(pair) != "not-distinct"
+            and len({item.key for item in chains.evidence.get(pair, ())}) >= PAIR_KEYS
+        )
+
     def blocks(other: str, old: str, new: str) -> bool:
-        # A source established distinct from both says nothing about old -> new.
-        return not (chains.distinct(other, old) and chains.distinct(other, new))
+        # A source established distinct from one of them and apart from the other says
+        # nothing about old -> new.
+        return not (
+            (chains.distinct(other, old) and apart(other, new))
+            or (chains.distinct(other, new) and apart(other, old))
+        )
 
     def between(old: str, new: str, members: list[str]) -> list[str]:
         return [

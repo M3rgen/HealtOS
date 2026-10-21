@@ -521,9 +521,11 @@ when
    chain never forks; no cycles: *A* → *B* → *A* is never a chain), and no link between them was
    rejected or refuted (the owner decides that pair again).
 
-A fingerprint **established distinct from both** *A* and *B* (a second watch worn alongside the
-band, before and after its rename) is left out of rules 3 and 4: it is known to be another
-device, so it says nothing about *A* → *B*. One established distinct from *B* is never *B*'s
+A fingerprint **established distinct from** *A* or *B* and with evidence for three keys against
+the other (from any responses: a second watch worn alongside the band, before and after its
+rename, whose evidence against the new name may come from one re-fetch of old records) is left
+out of rules 3 and 4: it is known to be another device, so it says nothing about *A* → *B* (a
+chain merges equal readings only, and no deletion is marked on that weaker evidence). One established distinct from *B* is never *B*'s
 candidate.
 
 A three-step rename *A* → *B* → *C* chains step by step even when *B* only ever returned new

@@ -128,6 +128,20 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
                 "fetches (two devices); if you are sure they are one device, decide "
                 "not-distinct first"
             )
+        apart = sorted(
+            (one, other)
+            for one in chains.members(first)
+            for other in chains.members(second)
+            if (one, other) != (first, second)
+            and _pair(one, other) != pair
+            and chains.pair_distinct(one, other)
+        )
+        if apart and not chains.same_device(first, second):
+            one, other = apart[0]
+            raise DecisionRefused(
+                f"{one[:12]} and {other[:12]} are distinct devices, and they are forms of these "
+                "two sources' devices; if they are one device, decide not-distinct for them first"
+            )
         if chains.same_device(first, second) and not chains.live(first, second):
             raise DecisionRefused(
                 f"{first[:12]} and {second[:12]} are already one device through other chains"
