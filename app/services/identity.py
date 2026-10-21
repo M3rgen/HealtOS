@@ -12,20 +12,22 @@ alone, which readers apply while they are *in force* (their two fingerprints one
 A row is *hidden* exactly when readers skip it (``held_elsewhere``): it has a link in force to
 a row that is neither marked deleted nor quarantined. Every group is written onto
 
-1. its fingerprint's *root* row (one not superseded by a link of the same fingerprint; the
-   one not hidden first, then the live one, then the one seen last) when that row is not
-   hidden, or when the rows hiding it show the same reading (the record is counted there);
+1. a row of its own fingerprint that leaves its reading counted (``_best``: not hidden, or its
+   hiders show the same reading - a growing interval also the same end), the counted one
+   first; spare rows of its own are reused like any other;
 2. else a new row of its own (``synthetic:v2s:<hash of key and fingerprint>``, or the first
    free *spare* id of the record and fingerprint when that id is taken): a reading Google
    returns is never hidden behind a row showing another value.
 
-A new row is linked at once to a row of the same device (another fingerprint joined to its own
-by live chain links) that is counted and shows the same reading, so a decided rename is never
-counted twice; with no such row it counts on its own (an unknown fingerprint, a second device,
-a revised value), never hidden. Stored rows are found by id only: the record's v1 id, its
-``v2s`` id, its spare ids (in blocks, when its ``v2s`` row is not a counted root) and its alias;
-the same for the other fingerprints of its device. ``store_records`` locks the rows it writes
-onto or links to and re-resolves when one changed meanwhile.
+A row the page makes counted (new, or marked deleted until now) holds at once every counted row
+of another fingerprint of its device (joined by live chain links) that shows the same reading
+(``_link_written``), so a decided rename is never counted twice and the row Google returned now
+holds the record; with no such row it counts on its own (an unknown fingerprint, a second
+device, a revised value), never hidden. Stored rows are found by id only: the record's v1 id,
+its ``v2s`` id, its spare ids (in blocks, when none of its rows fits) and its alias; the same for
+the other fingerprints of its device. ``store_records`` locks the rows it relies on (the rows it
+writes onto, every row that could hide them, the rows it links) and re-resolves when one
+changed, was revived or linked meanwhile.
 
 ``present_records`` decides, for deletion marking, whether an unseen row's record is still
 returned: with the same reading under its own device (present); with the same reading under a
@@ -921,7 +923,7 @@ async def present_records(
 
     * one *with the same reading* of its *device* (the same fingerprint, or one joined to it
       by live chain links; every link in force is one of these) - a duplicate of the record
-      under another id: present;
+      under another id - and, for a growing interval, the same end: present;
     * else one with the same reading of a fingerprint that is not *certainly* another device
       - decided distinct by the owner (``Chains.owner_decided_distinct``: a form of each,
       through links the owner reviewed), or established distinct by evidence between these

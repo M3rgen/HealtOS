@@ -17,6 +17,9 @@ same reading* was seen
   value for one key): possibly the same device renamed, which only the reconciler or the
   owner decides. The mark is deferred, never guessed.
 
+A deferred row is kept in ``identity_deferred_deletions`` until a later complete fetch of a
+window that holds it decides it, whatever other windows are fetched meanwhile.
+
 A row of a fingerprint established distinct never keeps a candidate: of two devices that
 recorded at one instant, one can be deleted alone. Nor does a row of the device with another
 value: the candidate then holds a value Google no longer returns.

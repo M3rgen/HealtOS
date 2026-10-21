@@ -27,7 +27,9 @@ applies it:
 Each decision settles again exactly the rows whose devices it changed: the rows of every link
 between two fingerprints that are no longer one device, and every row written since the later
 of two fingerprints that newly are (app/services/identity_backfill.py, ``_settle_changed``).
-The latest decision per question wins, so every decision is undone by the opposite one, in
+A decision records only itself: a chain the rule would decide because of it is left to the
+next reconciler run (``left_to_reconciler`` in the outcome), never recorded inside it. The latest
+decision per question wins, so every decision is undone by the opposite one, in
 what readers count too: supersessions are in force only while their two fingerprints are one
 device (app/models/identity.py, ``in_force``), and links are only ever added. There is no
 decision that forgets an earlier one: ``distinct`` undoes ``not-distinct`` (and the reverse),

@@ -46,7 +46,10 @@ against the other (from any responses: a second watch worn alongside, its eviden
 new name perhaps from one re-fetch of old records) is left out of rules 3 and 4: it is known to
 be another device, so it says nothing about ``A -> B`` (a chain only ever merges equal
 readings; deletions are never marked on that weaker evidence). A fingerprint established
-distinct from ``B`` is never ``B``'s candidate.
+distinct from ``B`` is never ``B``'s candidate; nor is one that *retired before* ``A``
+(established distinct from ``A``, its newest record - ``Span.newest``, the physical time a
+re-fetch of old records does not move - more than ``CHAIN_GAP`` older than ``A``'s): it stopped
+recording while ``A`` went on, and its later sightings are re-fetches of old records.
 
 Everything else is *ambiguous*: nothing is linked, both keep their rows (visible; at worst
 counted twice), and every run's report and ``health-mirror status`` list the case with why, for
@@ -72,9 +75,13 @@ owner confirms or rejects it.
 
 Concurrency: ``store_records`` and deletion marking hold a shared transaction lock per data
 type, a reconciler batch the exclusive one, and only one reconciler runs at a time (a session
-lock); see :func:`lock_data_type` and :func:`backfill_lock`. The reconciler asks for the
-exclusive lock without waiting in the lock queue (so writers never queue behind it) and, only
-when that fails for ``LOCK_TIMEOUT``, waits in the queue for at most ``QUEUE_TIMEOUT``.
+lock, which ``identity-decide`` shares and waits for briefly); see :func:`lock_data_type` and
+:func:`backfill_lock`. Whether two fingerprints' shared keys mostly agree (``agreeing``) is
+counted per key by the reconciler (``raw_source_agreements``); a refutation, and a deletion
+mark on that evidence, waits until every shared key was counted (``agreement_counted``). The
+reconciler asks for the exclusive lock without waiting in the lock queue (so writers never queue
+behind it) and, only when that fails for ``LOCK_TIMEOUT``, waits in the queue for at most
+``QUEUE_TIMEOUT``.
 """
 
 from __future__ import annotations
@@ -141,8 +148,8 @@ ROW_LOCK_TIMEOUT = "2s"
 RULE = (
     "B first seen more than CHAIN_GAP after A last seen; A the only predecessor candidate of "
     "B and B the only successor candidate of A; no other source of the class (unless "
-    "established distinct from both) first seen in between or seen alongside either; A and B "
-    "not established distinct; complete spans"
+    "established distinct from both, or retired before A) first seen in between or seen "
+    "alongside either; A and B not established distinct; complete spans"
 )
 
 

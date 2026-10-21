@@ -183,19 +183,27 @@ source-deleted rows). It replaces the `analytics_*` views so they count what the
 (no source-deleted rows, no rows superseded by a live row through a link in force). See
 [Record identity](REFERENCE.md#record-identity). It copies no rows and alters no existing table.
 The partial index of source-deleted rows is built first, `CONCURRENTLY` and outside any
-transaction: writers are never blocked by it, however large the table. It is not started while
-another session is writing or has held a snapshot open for a while (a running `pg_dump`), since
-it would have to wait for them: the upgrade then prints `ix_raw_health_data_source_deleted is left
-for later` with the statement that builds it, and goes on without it (the `analytics_*` views
-are only slower); `health-mirror verify` notes it until you run that statement
-(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`, also with the app running) after the backup. A
-build that still had to wait gives up after the lock timeout, and an index it left invalid is
-built again by `REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted`.
+transaction: writers are never blocked by it, however large the table. A concurrent build that
+fails (a timeout, a cancel) leaves an invalid index behind, so the upgrade starts it only while no
+other session of the database holds a transaction or snapshot open (however briefly: a `pg_dump`
+just begun counts) or a lock on `raw_health_data` beyond reading it, and gives it no timeout (a
+dump started during the build is waited for; writers are not). Otherwise it prints
+`ix_raw_health_data_source_deleted is left for later` with the statement that builds it, and goes
+on without it (the `analytics_*` views are only slower); `health-mirror verify` notes it until you
+run that statement (`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`, also with the app running, when
+no dump runs). An index left invalid by an interrupted build is not touched by the upgrade; verify
+names it with `REINDEX INDEX CONCURRENTLY ix_raw_health_data_source_deleted`, and names any other
+invalid index on `raw_health_data` (a `..._ccnew` copy of an interrupted rebuild: `DROP INDEX
+CONCURRENTLY` it, it holds no data) - run those yourself when nothing else runs.
 The foreign keys need a SHARE ROW EXCLUSIVE lock on `raw_health_data`, which a running `pg_dump`
-does **not** block (tested), but a writing transaction does: with the app container restarting
-nothing else should write, but stop a CLI `backfill`/`import-versions` first. The upgrade sets
-`lock_timeout = 30s` and otherwise fails with `20261021_0012 could not lock its tables within 30s`,
-changing nothing.
+does **not** block (tested), but a writing transaction does, and replacing the `analytics_*` views
+needs each view for a moment (a long reader of a view holds it). The upgrade creates its tables
+first, then in one attempt replaces the views (waiting at most 100 ms for a reader of each) and
+takes the lock with `NOWAIT`; a failed attempt releases everything and is retried every few hundred
+milliseconds for up to `lock_timeout` (30 s, `-x lock-timeout=...`), so no writer queues behind the
+upgrade; once both are held, the foreign keys are added and it commits (writers wait
+milliseconds). When no attempt succeeds it fails with `20261021_0012 could not lock its tables
+within 30s`, changing nothing: stop a CLI `backfill`/`import-versions` first.
 
 **The model.** The live write path never decides that two `dataSource` forms are one renamed
 device, and it writes a record only onto a row of **its own** fingerprint (a changed payload is a
@@ -275,8 +283,10 @@ Review the dry run before writing anything. Per data type:
   reprocessed old records under the new name, a few with other values). Nothing is merged and no
   deletion is marked because of them; confirm with `identity-decide distinct`, or, if it was a
   rename, decide `not-distinct` and `link`.
-- `deferred_deletions`: rows the last complete fetches did not mark because another source, that
-  may be their device renamed, returned the same reading (`rows_of`, `returned_by`, how many).
+- `deferred_deletions`: rows complete fetches did not mark because another source, that may be
+  their device renamed, returned the same reading (`rows_of`, `returned_by`, how many, since
+  when; one row each in `identity_deferred_deletions` until a later complete fetch of their
+  window decides them).
   Decide that pair: `distinct` (two devices: the next complete fetch marks them) or `not-distinct`
   and `link` (one device: they stay, counted once).
 - `refuted`: chains whose two forms turned out to be two devices (no longer used: the rows they
@@ -293,8 +303,10 @@ Review the dry run before writing anything. Per data type:
   count); `distinct_sources` the keys held by two devices; `conflicts` (rows of one device left
   double because linking them would close a cycle of links; listed in `status`) should be 0;
   `start_mismatches` rows with a stale stored start (settled last); `agreement` per pair of
-  sources with evidence of two devices, how many records both hold with the same reading and how
-  many with two.
+  sources with evidence of two devices, how many records this run settled that both hold with
+  the same reading and how many with two (the counts over every record both hold, kept per
+  record in `raw_source_agreements`, decide whether the pair is two devices; a chain is refuted
+  only when all of them were counted).
 
 Then:
 
@@ -347,7 +359,15 @@ linked or confirmed (a chain only the reconciler suggested may be wrong). A deci
 make one source continue as two (or close a cycle) is refused, naming the chain to reject first.
 A deletion left undecided between two sources is decided by the next complete fetch of its window
 after your decision (the daily deletion check, or a `backfill` of that window); the decision itself
-fetches nothing.
+fetches nothing. A decision records only itself: a chain it makes possible (say `distinct` leaves
+a retired watch the only candidate before a new name) is listed under `left_to_reconciler` and
+decided by the next nightly run, listed for review like any other. For a chain the reconciler
+suggested, `confirm` after `reject` restores what is counted but marks the chain reviewed
+(`confirmed`); if the reconciler linked one of the freed sources elsewhere meanwhile, `confirm` is
+refused naming that chain (reject it first). A decision waits up to a minute while a reconciler
+batch run holds the single-run lock, then is refused naming it; run it again after
+`health-mirror status` shows the run finished. If a decision or a nightly run fails after devices
+changed, the rows still to settle are kept (`pending_settle`) and the next run settles them.
 
 The next morning, `health-mirror status` shows `last_mode: incremental` with a fresh
 `last_finished_at` per data type, its `last_result` with the counts and an `open` section
