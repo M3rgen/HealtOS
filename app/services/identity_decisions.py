@@ -149,8 +149,12 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
                 "two sources' devices; if they are one device, decide not-distinct for them first"
             )
         if chains.same_device(first, second) and not chains.live(first, second):
+            path = _live_path(chains, first, second)
+            named = ", ".join(f"{old[:12]} -> {new[:12]}" for old, new in path)
             raise DecisionRefused(
-                f"{first[:12]} and {second[:12]} are already one device through other chains"
+                f"{first[:12]} and {second[:12]} are already one device through other chains "
+                f"({named}); this would close a cycle: reject the chain {path[0][0][:12]} -> "
+                f"{path[0][1][:12]} (or another of them) first"
             )
     if decision == "distinct" and chains.same_device(first, second):
         direct = [link for link in ((first, second), (second, first)) if chains.live(*link)]
@@ -195,6 +199,24 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
             else:
                 reason = "; ".join(problems)
             raise DecisionRefused(f"the chains would no longer be chains: {reason}")
+
+
+def _live_path(chains: Chains, first: str, second: str) -> list[tuple[str, str]]:
+    """The live links that join ``first`` to ``second`` (either way), in order."""
+    edges: dict[str, list[tuple[str, tuple[str, str]]]] = {}
+    for old, new in sorted(chains.links):
+        if chains.live(old, new):
+            edges.setdefault(old, []).append((new, (old, new)))
+            edges.setdefault(new, []).append((old, (old, new)))
+    paths: dict[str, list[tuple[str, str]]] = {first: []}
+    frontier = [first]
+    while frontier:
+        current = frontier.pop(0)
+        for following, link in edges.get(current, []):
+            if following not in paths:
+                paths[following] = [*paths[current], link]
+                frontier.append(following)
+    return paths.get(second) or [(first, second)]
 
 
 def _pair(first: str, second: str) -> tuple[str, str]:
