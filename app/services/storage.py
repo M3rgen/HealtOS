@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from itertools import pairwise
 from typing import cast as cast_type
 
-from sqlalchemy import Table, Text, and_, case, cast, insert, select
+from sqlalchemy import Table, Text, and_, case, cast, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +84,14 @@ async def store_page(
     )
 
 
+class _Collision(Exception):
+    """A row this page writes onto changed, or a row it creates was created, meanwhile."""
+
+
+# A page re-resolves this often when a concurrent writer of the same records got there first.
+WRITE_ATTEMPTS = 4
+
+
 async def store_records(
     session: AsyncSession,
     spec: DataTypeSpec,
@@ -105,19 +113,77 @@ async def store_records(
     ``raw_api_responses`` first, in this same transaction, and each new payload is linked
     to the last of them (``response_id``), so a crash keeps both or neither.
 
-    ``fetch_started`` is when the fetch that returned these records began (default: now, a
-    fetch of one page). Whether a source "was seen in this fetch" is judged against it when
-    deciding that two source fingerprints are one renamed device (app/services/identity.py).
+    Records without a Google id are written onto the row that holds their identity
+    (app/services/identity.py). The rows written onto are locked and checked against what
+    the resolution read; new rows are created with ``ON CONFLICT DO NOTHING``. When another
+    writer changed or created one of them meanwhile, the page is resolved again (inside a
+    savepoint), so a payload is never written onto a row that holds another source.
+
+    The time written to ``last_seen_at`` is read after the data type's lock was granted, and
+    ``last_seen_at`` never moves backwards (``GREATEST``): a writer that waited for the lock
+    cannot make a record look unseen to a fetch that started meanwhile.
+
+    ``fetch_started``: when the fetch that returned these records began (its first page; a
+    resumed fetch passes the original start). Kept for the caller's bookkeeping; deletion
+    marking reads it from the fetch itself.
     """
-    stats = StoreStats()
-    now = datetime.now(UTC)
     origin = source or current_source()
     response_ids = await insert_responses(session, responses)
     response_id = response_ids[-1] if response_ids else None
-    # Records without a Google id are written onto the row that holds their identity
-    # (app/services/identity.py), whatever key that row was first stored under.
     digests = [payload_hash(record) for record in records]
-    resolution = await resolve_ids(session, spec, records, digests, now, fetch_started)
+    if session.get_bind().dialect.name != "postgresql":
+        # One writer at a time (tests): nothing to collide with.
+        return await _store(session, spec, records, digests, origin, response_id)
+    for _ in range(WRITE_ATTEMPTS):
+        try:
+            async with session.begin_nested():
+                return await _store(session, spec, records, digests, origin, response_id)
+        except _Collision:
+            event(logger, "RECORD_BATCH_RESOLVED_AGAIN", data_type=spec.name)
+    raise RuntimeError(
+        f"{spec.name}: a concurrent writer kept changing the rows of this page; "
+        "nothing of it was stored (the next sync fetches it again)"
+    )
+
+
+async def _lock_targets(session: AsyncSession, spec: DataTypeSpec, resolution) -> None:
+    """Lock the rows the page writes onto (key order, like the upserts) and check that each
+    still holds the payload it was resolved against."""
+    if not resolution.expected or session.get_bind().dialect.name != "postgresql":
+        return
+    from app.services.identity import among
+
+    table = RawHealthData
+    current = dict(
+        (
+            await session.execute(
+                select(table.id, table.payload_hash)
+                .where(among(session, table.id, sorted(resolution.expected)))
+                .order_by(table.google_data_point_id)
+                .with_for_update()
+            )
+        )
+        .tuples()
+        .all()
+    )
+    if any(current.get(raw_id) != digest for raw_id, digest in resolution.expected.items()):
+        raise _Collision
+
+
+async def _store(
+    session: AsyncSession,
+    spec: DataTypeSpec,
+    records: Sequence[object],
+    digests: Sequence[str],
+    origin: str,
+    response_id: int | None,
+) -> StoreStats:
+    stats = StoreStats()
+    resolution = await resolve_ids(session, spec, records, digests)
+    await _lock_targets(session, spec, resolution)
+    # After the data type's lock and the row locks: a writer that waited never stamps an
+    # older time than a fetch that began while it waited.
+    now = datetime.now(UTC)
     # Per record id, the distinct consecutive payloads of this page, in page order.
     by_id: dict[str, list[tuple]] = {}
     duplicates = 0
@@ -143,14 +209,28 @@ async def store_records(
             )
         )
         existing_hashes.update(rows.tuples().all())
+    created = sorted(google_id for google_id in by_id if google_id in resolution.created)
+    if any(google_id in existing_hashes for google_id in created):
+        raise _Collision
+    if created:
+        rows = [
+            _raw_row(spec, by_id[google_id][0], now, origin, response_id) for google_id in created
+        ]
+        inserted = await _insert_new(session, rows)
+        if inserted != set(created):
+            raise _Collision
 
     # One INSERT ... ON CONFLICT statement may not touch the same row twice on
-    # PostgreSQL, so the n-th payload of every record goes into the n-th statement.
+    # PostgreSQL, so the n-th payload of every record goes into the n-th statement (the
+    # first payload of a new row is in already).
     rounds: list[list[dict]] = []
     normalized_values = defaultdict(list)
+    new_rows = set(created)
     for google_id, sequence in by_id.items():
         for position, item in enumerate(sequence):
-            if position == len(rounds):
+            if position == 0 and google_id in new_rows:
+                continue
+            while len(rounds) <= position:
                 rounds.append([])
             rounds[position].append(_raw_row(spec, item, now, origin, response_id))
         existing_hash = existing_hashes.get(google_id)
@@ -175,8 +255,9 @@ async def store_records(
     # rows in key order, so two overlapping pages wait for each other instead of
     # deadlocking.
     for rows in rounds:
-        rows.sort(key=lambda row: row["google_data_point_id"])
-        await _upsert_raw_many(session, rows)
+        if rows:
+            rows.sort(key=lambda row: row["google_data_point_id"])
+            await _upsert_raw_many(session, rows)
     await add_aliases(session, spec.name, resolution.new_aliases)
     for model, values in normalized_values.items():
         values.sort(key=lambda row: (row.get("data_type", ""), row["google_data_point_id"]))
@@ -192,8 +273,24 @@ async def store_records(
             unchanged=stats.unchanged,
             duplicates=duplicates,
             versions_kept=stats.versions_kept,
+            chained=resolution.chained,
         )
     return stats
+
+
+async def _insert_new(session: AsyncSession, rows: list[dict]) -> set[str]:
+    """Insert new rows; the ids that were inserted (one another writer created first is not)."""
+    table = RawHealthData.__table__
+    inserted: set[str] = set()
+    for offset in range(0, len(rows), 1000):
+        statement = (
+            dialect_insert(session, table)
+            .values(rows[offset : offset + 1000])
+            .on_conflict_do_nothing(index_elements=["data_type", "google_data_point_id"])
+            .returning(table.c.google_data_point_id)
+        )
+        inserted.update((await session.execute(statement)).scalars().all())
+    return inserted
 
 
 def _raw_row(
@@ -239,6 +336,7 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
         return
     table = RawHealthData.__table__
     statement = dialect_insert(session, table)
+    highest = func.greatest if session.get_bind().dialect.name == "postgresql" else func.max
     # The payload is overwritten in place; when its hash or stored text changes, the
     # trigger of migration 20261020_0011 has already copied the replaced row into
     # raw_health_data_versions. When and how a payload arrived only changes with it.
@@ -252,7 +350,8 @@ async def _upsert_raw_many(session: AsyncSession, rows: list[dict]) -> None:
         "source_timezone": statement.excluded.source_timezone,
         "raw_json": statement.excluded.raw_json,
         "payload_hash": statement.excluded.payload_hash,
-        "last_seen_at": statement.excluded.last_seen_at,
+        # Never backwards: a writer that waited must not make the record look older.
+        "last_seen_at": highest(table.c.last_seen_at, statement.excluded.last_seen_at),
         "source_deleted_at": None,
         "payload_received_at": case(
             (unchanged, table.c.payload_received_at),

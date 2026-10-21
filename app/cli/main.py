@@ -41,6 +41,13 @@ def status() -> None:
             jobs = await session.execute(
                 select(BackfillJob.status, func.count()).group_by(BackfillJob.status)
             )
+            from app.models.identity import IdentityReconcileState
+
+            identity = (
+                await session.scalars(
+                    select(IdentityReconcileState).order_by(IdentityReconcileState.data_type)
+                )
+            ).all()
             return {
                 "raw_records": raw_count,
                 "sync": [
@@ -52,6 +59,21 @@ def status() -> None:
                     for row in sync_rows
                 ],
                 "backfill": {row[0].value: row[1] for row in jobs},
+                # The identity reconciler (identity-backfill; nightly --incremental).
+                "identity_reconcile": [
+                    {
+                        "data_type": row.data_type,
+                        "full_run_at": str(row.full_run_at) if row.full_run_at else None,
+                        "checkpoint_at": str(row.checkpoint_at) if row.checkpoint_at else None,
+                        "last_finished_at": (
+                            str(row.last_finished_at) if row.last_finished_at else None
+                        ),
+                        "last_mode": row.last_mode,
+                        "last_result": json.loads(row.last_result) if row.last_result else None,
+                        "last_error": row.last_error,
+                    }
+                    for row in identity
+                ],
             }
 
     typer.echo(json.dumps(run(command()), indent=2))
@@ -367,18 +389,25 @@ def identity_backfill(
     dry_run: bool = typer.Option(False, "--dry-run", help="Report only; write nothing."),
     data_type: list[str] | None = DATA_TYPES_OPTION,
     after: datetime | None = AFTER_OPTION,
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        help="Only rows changed since each data type's checkpoint (what the nightly job runs).",
+    ),
     statement_timeout: str = typer.Option(
         "120s", help="PostgreSQL statement_timeout for each batch (e.g. 120s, 5min)."
     ),
 ) -> None:
     """Decide source chains, add v2 aliases and link duplicate rows of a record (idempotent).
 
-    The report lists, per data type, every chain (from -> to source, gap in seconds) and
-    every pair of sources that share records but are kept apart; review both after a dry run.
+    The only command that decides that two sources are one renamed device. The report lists,
+    per data type, every chain (from -> to source, gap in seconds), the sources the rule left
+    open (``ambiguous``, with why), contradicted chains, and the pairs of sources that share
+    records but are kept apart; review them after a dry run (docs/RUNBOOK.md).
     """
     import re
 
-    from app.services.identity_backfill import BackfillStats
+    from app.services.identity_backfill import BackfillStats, LockUnavailable
     from app.services.identity_backfill import identity_backfill as run_backfill
     from app.services.source_chains import BackfillRunning
 
@@ -388,10 +417,14 @@ def identity_backfill(
         )
 
     def progress(name: str, stats: BackfillStats, reached: datetime) -> None:
+        resume = (
+            ""
+            if incremental
+            else f" (resume: --data-type {name} --after {reached.strftime('%Y-%m-%dT%H:%M:%S')})"
+        )
         typer.echo(
             f"{name}: {stats.rows} rows, {sum(stats.linked.values())} superseded, "
-            f"up to {reached.isoformat()} (resume: --data-type {name} "
-            f"--after {reached.strftime('%Y-%m-%dT%H:%M:%S')})",
+            f"up to {reached.isoformat()}{resume}",
             err=True,
         )
 
@@ -403,11 +436,12 @@ def identity_backfill(
                 batch_size=batch_size,
                 dry_run=dry_run,
                 after=after.replace(tzinfo=UTC) if after else None,
+                incremental=incremental,
                 statement_timeout=statement_timeout,
                 progress=progress,
             )
         )
-    except BackfillRunning as exc:
+    except (BackfillRunning, LockUnavailable) as exc:
         typer.echo(f"identity-backfill refused: {exc}", err=True)
         raise typer.Exit(1) from exc
     total = BackfillStats()

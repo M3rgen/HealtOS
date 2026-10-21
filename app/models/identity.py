@@ -1,25 +1,36 @@
 """Stable identities of raw records and the duplicates they replace (migration 20261021_0012).
 
-``raw_health_data_identity`` maps a record's v2 identity key (app/parsers/identity.py) to
-the raw row that holds it. A raw row's ``google_data_point_id`` can never change (the frozen
-identity trigger of 0011), so rows stored under a v1 id are not re-keyed: an alias row
-points the v2 key at them, and ``store_records`` writes a returning record onto that row.
+``raw_health_data_identity`` maps a record's fingerprint-specific v2 key
+(``RecordIdentity.specific_key``, app/parsers/identity.py) to the raw row that holds it, for
+rows whose own id does not say so: a raw row's ``google_data_point_id`` can never change (the
+frozen identity trigger of 0011), so rows stored under a v1 id are not re-keyed; the reconciler
+(``health-mirror identity-backfill``) gives each of them an alias, and ``store_records`` finds
+a returning record through it. Rows stored since 0012 need none: their id
+(``synthetic:v2s:<hash>``) is computed from the key and the fingerprint.
 
 ``raw_health_data_supersessions`` links a duplicate row that was archived under an older id
 of the same record to the row that holds the record now. A superseded row is kept with its
 payload, versions, ``source_deleted_at`` and events (it is history), but it no longer counts:
 dashboards, Umay and the ``analytics_*`` views skip it, as they skip a source deletion.
 
-Both tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
-``ENABLE ALWAYS``) and ``health-mirror verify`` checks those triggers like the ones of 0011.
 ``raw_source_chains`` records which source fingerprints are one device seen before and after
 a change (a ``displayName`` rename, a dropped package suffix): one row per link ``from -> to``,
-decided per data type from the sources' sighting timelines (app/services/source_chains.py).
-It is append-only too. ``raw_source_sightings`` is the bookkeeping those decisions read: when
-each source fingerprint was first and last seen. It is derived (like
-``raw_health_data.last_seen_at``, updated in place on every fetch) and rebuilt by
-``health-mirror identity-backfill`` from the raw rows and their versions; it holds no received
-data.
+decided per data type and stable source class by the reconciler from the sources' sighting
+timelines (app/services/source_chains.py), with the spans it was decided on as ``evidence``.
+``raw_source_chain_events`` records when a later sighting contradicted a link (the old form
+was seen again): from then on the link is no longer used for new pairings, while the
+supersessions made under it stay.
+
+``raw_source_pairs`` records two fingerprints returned together for one key: proof of two
+distinct sources, which deletion marking needs (a renamed device never shows both forms).
+
+These five tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
+``ENABLE ALWAYS``). ``raw_source_sightings`` - when each source fingerprint was first and last
+seen, by the database clock - may only widen: no ``DELETE`` or ``TRUNCATE``, and an ``UPDATE``
+may only move ``first_seen_at`` earlier, ``last_seen_at`` later and ``complete`` to true.
+``health-mirror verify`` checks all of these triggers like the ones of 0011.
+
+``identity_reconcile_state`` is bookkeeping: per data type, how far the reconciler got.
 
 The trigger SQL is duplicated, frozen, in the migration; tests/test_identity_keys.py compares
 the two.
@@ -37,6 +48,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     PrimaryKeyConstraint,
     String,
     Text,
@@ -56,9 +68,17 @@ import app.models.raw_versions  # noqa: E402, F401  isort: skip
 IDENTITY_TABLE = "raw_health_data_identity"
 SUPERSESSION_TABLE = "raw_health_data_supersessions"
 CHAIN_TABLE = "raw_source_chains"
+CHAIN_EVENT_TABLE = "raw_source_chain_events"
+PAIR_TABLE = "raw_source_pairs"
 SIGHTING_TABLE = "raw_source_sightings"
-# The append-only tables of this revision (the sightings are bookkeeping, not guarded).
-IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE)
+RECONCILE_TABLE = "identity_reconcile_state"
+# The append-only tables of this revision.
+IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE, CHAIN_EVENT_TABLE, PAIR_TABLE)
+# Every table whose rows verify protects (the sightings may only widen).
+GUARDED_TABLES = (*IDENTITY_TABLES, SIGHTING_TABLE)
+# Who decides a chain: a full run of identity-backfill, or the incremental reconciler.
+DECIDERS = ("backfill", "reconciler")
+CONTRADICTED = "contradicted"
 # Why a row was superseded (app.parsers.identity.supersession_reason).
 REASONS = (
     "display-name-change",
@@ -80,7 +100,7 @@ class RawHealthDataIdentity(Base):
     )
 
     data_type: Mapped[str] = mapped_column(String(128), nullable=False)
-    # "v2:<UTC start, to the second>:<sha256>"; "v2s:..." for a source kept apart.
+    # "v2s:<UTC start, to the second>:<sha256 of key and fingerprint>".
     identity_key: Mapped[str] = mapped_column(String(100), nullable=False)
     raw_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("raw_health_data.id"), nullable=False)
     # The raw row's key when the alias was written (it never changes).
@@ -128,9 +148,9 @@ class RawSourceChain(Base):
     to_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     from_label: Mapped[str] = mapped_column(String(255), nullable=False)
     to_label: Mapped[str] = mapped_column(String(255), nullable=False)
-    # "backfill" or "live" (a page of a fetch, app.services.identity).
+    # DECIDERS: "backfill" (a full run) or "reconciler" (an incremental run).
     decided_by: Mapped[str] = mapped_column(String(16), nullable=False)
-    # JSON: both sighting spans, the gap, keys shared, the rule's tolerance.
+    # JSON: both sighting spans as they were when the link was decided, the gap, the rule.
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -138,8 +158,73 @@ class RawSourceChain(Base):
     )
 
 
+class RawSourceChainEvent(Base):
+    """A later sighting contradicted a chain link: it is no longer used for new pairings."""
+
+    __tablename__ = CHAIN_EVENT_TABLE
+    __table_args__ = (PrimaryKeyConstraint("data_type", "from_fingerprint", "event"),)
+
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    from_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    to_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # CONTRADICTED.
+    event: Mapped[str] = mapped_column(String(32), nullable=False)
+    # JSON: both spans when the contradiction was seen.
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RawSourcePair(Base):
+    """Two fingerprints were returned together for one v2 key: two distinct sources.
+
+    One record has one source at a time, so a renamed device (or one whose old name comes
+    back) never shows both forms for the same key in one fetch; two devices that recorded at
+    one instant do. Written by every page (both in it) and by a full identity-backfill (two
+    rows of one key last seen within the chain gap of each other)."""
+
+    __tablename__ = PAIR_TABLE
+    __table_args__ = (
+        PrimaryKeyConstraint("data_type", "first_fingerprint", "second_fingerprint"),
+        CheckConstraint("first_fingerprint < second_fingerprint", name="ordered"),
+    )
+
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    second_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    seen_together_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class IdentityReconcileState(Base):
+    """How far the reconciler got for a data type (bookkeeping, not guarded)."""
+
+    __tablename__ = RECONCILE_TABLE
+
+    data_type: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Rows changed (updated_at) since this database time, minus the safety overlap, are
+    # what the next incremental run reads. Set by every successful run to its start.
+    checkpoint_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When a full run (identity-backfill without --incremental) last completed.
+    full_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_mode: Mapped[str | None] = mapped_column(String(16))
+    # JSON summary of the last run (links, chains, ambiguous sources, rows read).
+    last_result: Mapped[str | None] = mapped_column(Text)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    runs: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class RawSourceSighting(Base):
-    """When a source fingerprint of a data type was first and last seen (derived)."""
+    """When a source fingerprint of a data type was first and last seen (may only widen)."""
 
     __tablename__ = SIGHTING_TABLE
     __table_args__ = (PrimaryKeyConstraint("data_type", "fingerprint"),)
@@ -174,6 +259,24 @@ def superseded(raw_id):
 # --- guards ------------------------------------------------------------------------------
 # The function healthos_refuse_change() comes from migration 20261020_0011.
 
+SIGHTINGS_FUNCTION = "healthos_sightings_widen_only"
+FUNCTION_BODIES = {
+    SIGHTINGS_FUNCTION: f"""
+BEGIN
+    IF NEW.data_type IS DISTINCT FROM OLD.data_type
+       OR NEW.fingerprint IS DISTINCT FROM OLD.fingerprint
+       OR NEW.stable_class IS DISTINCT FROM OLD.stable_class
+       OR NEW.first_seen_at > OLD.first_seen_at
+       OR NEW.last_seen_at < OLD.last_seen_at
+       OR (OLD.complete AND NOT NEW.complete) THEN
+        RAISE EXCEPTION USING MESSAGE =
+            '{SIGHTING_TABLE} only widens: ' || TG_OP || ' refused';
+    END IF;
+    RETURN NEW;
+END
+""",
+}
+
 # trigger -> (table, timing/events/level, function)
 _PG_TRIGGERS = {}
 for _table in IDENTITY_TABLES:
@@ -187,6 +290,21 @@ for _table in IDENTITY_TABLES:
         f"BEFORE TRUNCATE ON {_table} FOR EACH STATEMENT",
         "healthos_refuse_change",
     )
+_PG_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
+    SIGHTING_TABLE,
+    f"BEFORE UPDATE ON {SIGHTING_TABLE} FOR EACH ROW",
+    SIGHTINGS_FUNCTION,
+)
+_PG_TRIGGERS[f"{SIGHTING_TABLE}_no_delete"] = (
+    SIGHTING_TABLE,
+    f"BEFORE DELETE ON {SIGHTING_TABLE} FOR EACH ROW",
+    "healthos_refuse_change",
+)
+_PG_TRIGGERS[f"{SIGHTING_TABLE}_no_truncate"] = (
+    SIGHTING_TABLE,
+    f"BEFORE TRUNCATE ON {SIGHTING_TABLE} FOR EACH STATEMENT",
+    "healthos_refuse_change",
+)
 
 PROTECTIVE_TRIGGERS = tuple(
     (table, trigger, function) for trigger, (table, _, function) in _PG_TRIGGERS.items()
@@ -196,21 +314,48 @@ PG_TRIGGER_SQL = {
     for trigger, (table, definition, function) in _PG_TRIGGERS.items()
 }
 
+
+def _sqlite_refusal(name: str, table: str, operation: str, when: str = "") -> str:
+    condition = f"\nWHEN {when}" if when else ""
+    message = (
+        f"{table} only widens: {operation} refused"
+        if when
+        else f"{table} keeps every record: {operation} refused"
+    )
+    return f"""CREATE TRIGGER {name}
+BEFORE {operation} ON {table}{condition}
+BEGIN
+    SELECT RAISE(ABORT, '{message}');
+END"""
+
+
 _SQLITE_TRIGGERS = {}
 for _table in IDENTITY_TABLES:
     for _operation in ("UPDATE", "DELETE"):
         _name = f"{_table}_no_{_operation.lower()}"
-        _SQLITE_TRIGGERS[_name] = (
-            _table,
-            f"""CREATE TRIGGER {_name}
-BEFORE {_operation} ON {_table}
-BEGIN
-    SELECT RAISE(ABORT, '{_table} keeps every record: {_operation} refused');
-END""",
-        )
+        _SQLITE_TRIGGERS[_name] = (_table, _sqlite_refusal(_name, _table, _operation))
+_SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_no_delete"] = (
+    SIGHTING_TABLE,
+    _sqlite_refusal(f"{SIGHTING_TABLE}_no_delete", SIGHTING_TABLE, "DELETE"),
+)
+_SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
+    SIGHTING_TABLE,
+    _sqlite_refusal(
+        f"{SIGHTING_TABLE}_widen_only",
+        SIGHTING_TABLE,
+        "UPDATE",
+        "NEW.data_type IS NOT OLD.data_type OR NEW.fingerprint IS NOT OLD.fingerprint "
+        "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.first_seen_at > OLD.first_seen_at "
+        "OR NEW.last_seen_at < OLD.last_seen_at OR (OLD.complete AND NOT NEW.complete)",
+    ),
+)
 SQLITE_TRIGGER_SQL = dict(_SQLITE_TRIGGERS)
 
 POSTGRESQL_DDL = (
+    *(
+        f"CREATE FUNCTION {name}() RETURNS trigger\nLANGUAGE plpgsql AS $${body}$$"
+        for name, body in FUNCTION_BODIES.items()
+    ),
     *(sql for _, sql in PG_TRIGGER_SQL.values()),
     *(
         f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}"

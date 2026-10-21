@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     reconciliation_weekly_hour_utc: int = Field(default=3, ge=0, le=23)
     reconciliation_daily_days: int = Field(default=7, ge=1)
     reconciliation_weekly_days: int = Field(default=90, ge=1)
+    # The nightly identity reconciler (identity-backfill --incremental): decides source
+    # chains and links duplicate rows. Off the daily Google reconciliation and the backup.
+    identity_reconcile_enabled: bool = True
+    identity_reconcile_hour_utc: int = Field(default=2, ge=0, le=23)
+    identity_reconcile_minute: int = Field(default=30, ge=0, le=59)
 
     watchdog_enabled: bool = True
     watchdog_interval_seconds: int = Field(default=900, ge=60, le=86_400)

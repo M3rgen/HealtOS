@@ -308,3 +308,46 @@ async def test_webhook_element_completes_only_after_its_own_window(sessions):
         (NEW_START, NEW_END, None),
         (NEW_START, NEW_END, None),
     ]
+
+
+async def test_a_resumed_round_keeps_the_start_of_its_first_page(sessions, monkeypatch):
+    """Re-review 1 #1: pages fetched after a resume belong to the fetch that began before
+    the crash; "seen in this fetch" means since that start (persisted in fetch_rounds)."""
+    from app.models.state import FetchRound
+    from app.sync import incremental
+
+    now = [datetime(2026, 10, 19, 12, tzinfo=UTC)]
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003 - signature of datetime.now
+            return now[0]
+
+    monkeypatch.setattr(incremental, "datetime", Frozen)
+    starts = []
+    original = incremental.store_page
+
+    async def recording(session, spec, page, **options):
+        starts.append(options.get("fetch_started"))
+        return await original(session, spec, page, **options)
+
+    monkeypatch.setattr(incremental, "store_page", recording)
+
+    class Crashing:
+        async def list_data_points(self, spec, start, end, page_token=None):
+            if page_token is None:
+                return Page([], "p2")
+            raise RuntimeError("process restarted")
+
+    specs = {"steps": REGISTRY["steps"]}
+    with pytest.raises(RuntimeError):
+        await IncrementalSync(Settings(), sessions, Crashing(), specs).run("steps")
+    first = now[0]
+    now[0] = first + timedelta(minutes=30)
+    client = FakeClient([Page([], None), Page([], None)])
+    await IncrementalSync(Settings(), sessions, client, specs).run("steps")
+    assert client.tokens == ["p2", None]  # the interrupted round first, then a new one
+    assert [start.replace(tzinfo=UTC) for start in starts] == [first, first, now[0]]
+    async with sessions() as session:
+        row = await session.get(FetchRound, ("sync", "steps"))
+    assert row is not None and row.started_at.replace(tzinfo=UTC) == now[0]

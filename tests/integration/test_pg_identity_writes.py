@@ -110,26 +110,34 @@ async def execute(sessions, *statements: str) -> None:
             await session.execute(text(statement))
 
 
-async def test_rename_keeps_one_row_a_version_and_no_deletion_mark(pg_sessions, clock) -> None:
+async def test_rename_is_its_own_rows_until_the_reconciler_links_them(pg_sessions, clock):
+    """The write path never decides a rename: the new name gets rows of its own and the
+    complete fetch defers the old rows' marks; the nightly reconciler decides the chain and
+    links them, after which the dashboard counts each reading once."""
+    from app.models.identity import RawHealthDataSupersession
     from app.services.identity_backfill import identity_backfill
 
     await legacy(pg_sessions, HEART, heart(60), T0)
-    await identity_backfill(pg_sessions)  # the old name's sightings are known from now on
+    await identity_backfill(pg_sessions)  # the full run after the deploy
     await store(pg_sessions, HEART, heart(61, at=T0 + timedelta(minutes=1)))
     clock.now = T0 + timedelta(hours=7)
     fetched_since = clock.now
     renamed = [heart(60, name="Example Band"), heart(61, T0 + timedelta(minutes=1), "Example Band")]
     stats = await store(pg_sessions, HEART, *renamed)
-    assert (stats.inserted, stats.updated, stats.versions_kept) == (0, 2, 2)
+    assert (stats.inserted, stats.updated, stats.versions_kept) == (2, 0, 0)
     async with pg_sessions.begin() as session:
         marked = await mark_source_deletions(
             session, HEART, T0, T0 + timedelta(hours=1), fetched_since
         )
     assert marked == 0
-    assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthData)) == 2
-    assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthDataVersion)) == 2
-    # One per key: the renamed rows hold the new name now, so the key's alias leads to them.
-    assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthDataIdentity)) == 2
+    report = await identity_backfill(pg_sessions, incremental=True)
+    assert report["heart-rate"].linked == {"display-name-change": 2}
+    assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthData)) == 4
+    links = select(func.count()).select_from(RawHealthDataSupersession)
+    assert await scalar(pg_sessions, links) == 2
+    assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthDataVersion)) == 0
+    # The pre-v2 row has its alias; rows stored since need none.
+    assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthDataIdentity)) == 1
 
 
 async def test_growing_interval_and_genuine_deletion(pg_sessions, clock) -> None:

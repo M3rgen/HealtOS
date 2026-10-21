@@ -45,7 +45,6 @@ from app.core.timeutil import as_utc
 from app.models import identity as identity_guards
 from app.models import raw_versions as version_guards
 from app.models.raw_versions import (
-    FUNCTION_BODIES,
     HISTORY_VIEW,
     RENUMBER_SETTING,
     RawHealthDataEvent,
@@ -61,6 +60,7 @@ logger = logging.getLogger(__name__)
 PG_TRIGGER_SQL = {**version_guards.PG_TRIGGER_SQL, **identity_guards.PG_TRIGGER_SQL}
 PROTECTIVE_TRIGGERS = (*version_guards.PROTECTIVE_TRIGGERS, *identity_guards.PROTECTIVE_TRIGGERS)
 SQLITE_TRIGGER_SQL = {**version_guards.SQLITE_TRIGGER_SQL, **identity_guards.SQLITE_TRIGGER_SQL}
+FUNCTION_BODIES = {**version_guards.FUNCTION_BODIES, **identity_guards.FUNCTION_BODIES}
 
 IMPORT_SOURCE = "archive-import"
 
@@ -314,9 +314,17 @@ async def verify_guards(session: AsyncSession) -> list[str]:
         elif body != FUNCTION_BODIES[function]:
             errors.append(f"protective function {function}() was changed")
     known = {(table, trigger) for table, trigger, _ in PROTECTIVE_TRIGGERS}
-    for (table, trigger), (_, _, _, definition) in sorted(found.items()):
+    functions = {function for _, _, function in PROTECTIVE_TRIGGERS}
+    for (table, trigger), (_, function, _, definition) in sorted(found.items()):
         if table in guarded and (table, trigger) not in known:
             errors.append(f"unexpected trigger on guarded table {table}: {definition}")
+        elif table not in guarded and function in functions:
+            # A guard on a table that is not guarded: a guarded table renamed away (and an
+            # unguarded copy put in its place) keeps its triggers.
+            errors.append(
+                f"protective trigger {trigger} sits on {table}, which is not a guarded table "
+                "(was a guarded table renamed or replaced?)"
+            )
     return errors
 
 

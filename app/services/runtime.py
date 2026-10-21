@@ -13,6 +13,7 @@ from app.google_health.oauth import OAuthClient, TokenProvider
 from app.google_health.webhook import WebhookSignatureVerifier
 from app.services.credentials import CredentialStore
 from app.services.discovery import DiscoveryService
+from app.services.identity_reconciler import IdentityReconciler
 from app.services.pipeline_health import PipelineHealthService
 from app.services.responses import DatabaseResponseArchive
 from app.services.watchdog import PipelineWatchdog
@@ -38,6 +39,7 @@ class Runtime:
     discovery: DiscoveryService
     pipeline_health: PipelineHealthService
     watchdog: PipelineWatchdog
+    identity: IdentityReconciler | None = None
     tasks: set[asyncio.Task] = field(default_factory=set)
     scheduler: object | None = None
 
@@ -108,4 +110,5 @@ def build_runtime(settings: Settings, sessions: async_sessionmaker) -> Runtime:
         discovery=DiscoveryService(google, discovery_specs, settings.sync_concurrency),
         pipeline_health=pipeline_health,
         watchdog=watchdog,
+        identity=IdentityReconciler(sessions),
     )

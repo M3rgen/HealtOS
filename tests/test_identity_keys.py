@@ -27,12 +27,19 @@ from identity_records import (
     steps,
     swim,
 )
-from sqlalchemy import text
+from sqlalchemy import delete, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.models import identity as identity_models
 from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
-from app.parsers.identity import new_record_id, record_identity, supersession_reason
+from app.parsers.identity import (
+    new_record_id,
+    reading,
+    record_identity,
+    spare_record_id,
+    specific_key,
+    supersession_reason,
+)
 from app.services.raw_history import verify_guards
 
 
@@ -66,20 +73,38 @@ def test_growing_intervals_key_on_their_start() -> None:
     )
     assert short is not None and longer is not None
     assert short.key == longer.key and short.fingerprint != longer.fingerprint
+    # One source's growing interval is one row: its id leaves the end out.
+    assert short.specific_key == longer.specific_key
     # Other intervals keep their end in the key.
     one = record_identity(STEPS, steps(5))
     two = record_identity(STEPS, {**steps(5), "steps": {"interval": interval(T0, 2), "count": "5"}})
     assert one is not None and two is not None and one.key != two.key
 
 
-def test_keys_lead_with_the_start_and_new_ids_carry_only_the_hash() -> None:
+def test_keys_lead_with_the_start_and_new_ids_carry_key_and_fingerprint() -> None:
     identity = record_identity(HEART, heart(60))
-    assert identity is not None
+    renamed = record_identity(HEART, heart(60, name=NEW_NAME))
+    assert identity is not None and renamed is not None
     prefix, stamp, digest = identity.key.split(":")
     assert (prefix, stamp, len(digest)) == ("v2", "20261018T090000", 64)
+    assert identity.specific_key == specific_key(identity.key, identity.source)
+    _, _, own = identity.specific_key.split(":")
     assert identity.specific_key.startswith("v2s:20261018T090000:")
-    assert new_record_id(identity.key) == f"synthetic:v2:{digest}"
-    assert new_record_id(identity.specific_key).startswith("synthetic:v2s:")
+    # A new row's id names its key and its fingerprint: two sources never share one.
+    assert new_record_id(identity.specific_key) == f"synthetic:v2s:{own}"
+    assert new_record_id(identity.specific_key) != new_record_id(renamed.specific_key)
+    spares = {spare_record_id(identity, attempt) for attempt in range(1, 9)}
+    assert len(spares) == 8 and new_record_id(identity.specific_key) not in spares
+
+
+def test_reading_is_what_was_measured() -> None:
+    assert reading(HEART, heart(60)) == reading(HEART, heart(60, name=NEW_NAME, civil=True))
+    assert reading(HEART, heart(60)) != reading(HEART, heart(61))
+    assert reading(SWIM, swim(9)) == reading(SWIM, swim(9, civil=True))
+    assert reading(SEDENTARY, sedentary(15)) == reading(SEDENTARY, sedentary(30))
+    assert reading(STEPS, steps(5)) != reading(
+        STEPS, {**steps(5), "steps": {"interval": interval(T0, 2), "count": "5"}}
+    )
 
 
 def test_records_with_a_google_id_or_no_time_have_no_v2_identity() -> None:
@@ -134,6 +159,15 @@ def test_model_and_migration_ddl_are_the_same() -> None:
     assert normalize_sql(migration.POSTGRESQL_DDL) == normalize_sql(identity_models.POSTGRESQL_DDL)
     assert normalize_sql(migration.SQLITE_DDL) == normalize_sql(identity_models.SQLITE_DDL)
     assert migration.IDENTITY_TABLES == identity_models.IDENTITY_TABLES
+    assert migration.FUNCTION_BODIES == identity_models.FUNCTION_BODIES
+    # The analytics views verify compares with are the ones the migration creates.
+    from app.services import analytics_views
+
+    assert migration.NORMALIZED_TABLES == analytics_views.NORMALIZED_TABLES
+    for table in analytics_views.NORMALIZED_TABLES:
+        assert migration._view(table, current_only=True) == (
+            f"CREATE OR REPLACE VIEW analytics_{table} AS {analytics_views.view_select(table)}"
+        )
 
 
 async def test_identity_tables_are_append_only_on_sqlite(sessions) -> None:
@@ -188,3 +222,37 @@ async def test_verify_reports_a_missing_identity_guard(sessions) -> None:
             "protective trigger missing: "
             "raw_health_data_supersessions.raw_health_data_supersessions_no_delete"
         ]
+
+
+async def test_sightings_only_widen_on_sqlite(sessions) -> None:
+    from app.models.identity import RawSourceSighting
+
+    async with sessions.begin() as session:
+        session.add(
+            RawSourceSighting(
+                data_type="heart-rate",
+                fingerprint="f" * 64,
+                stable_class="s" * 64,
+                label="x",
+                first_seen_at=T0,
+                last_seen_at=T0 + timedelta(hours=1),
+                complete=True,
+            )
+        )
+    table = RawSourceSighting.__table__
+    async with sessions.begin() as session:
+        await session.execute(
+            update(table).values(
+                first_seen_at=T0 - timedelta(days=1), last_seen_at=T0 + timedelta(days=1)
+            )
+        )
+    for statement in (
+        update(table).values(last_seen_at=T0),
+        update(table).values(first_seen_at=T0),
+        update(table).values(complete=False),
+        update(table).values(fingerprint="g"),
+        delete(table),
+    ):
+        with pytest.raises((IntegrityError, OperationalError), match="only widens|keeps every"):
+            async with sessions.begin() as session:
+                await session.execute(statement)

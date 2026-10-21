@@ -1,10 +1,10 @@
 """Stable v2 identities: store_records and deletion marking (SQLite).
 
-Each scenario is one seen in the archive or found in review: a device rename (also next to a
-second device of the same platform), Apple Health's package losing its ``.<UUID>`` suffix,
-civil times added to an interval, a sedentary period whose end grows, a genuine deletion,
-and two devices that record at the same instant. Whether two source fingerprints are one
-renamed device is decided per source (app/services/source_chains.py), never per record.
+The write path never decides that two source fingerprints are one device: an unknown
+fingerprint gets rows of its own (counted twice at worst, never hidden), and deletion marks
+are deferred while a fingerprint not yet decided distinct holds the record. Only the
+reconciler (identity-backfill; nightly incremental) decides chains; the write path then
+applies them. Each scenario is one seen in the archive or found in review.
 """
 
 from __future__ import annotations
@@ -46,71 +46,97 @@ WATCH = "Example Watch"
 HOUR = timedelta(hours=1)
 
 
-async def test_rename_writes_onto_the_same_row_as_a_new_version(sessions, clock) -> None:
+async def reconcile(sessions):
+    """The nightly run: incremental, from each data type's checkpoint."""
+    return await identity_backfill(sessions, incremental=True)
+
+
+def visible(rows) -> list:
+    return sorted(
+        (name_of(row), row.raw_json["heartRate"]["beatsPerMinute"])
+        for row in rows
+        if row.source_deleted_at is None
+    )
+
+
+async def superseded_ids(sessions) -> set:
+    async with sessions() as session:
+        return set((await session.scalars(select(RawHealthDataSupersession.old_raw_id))).all())
+
+
+async def test_an_unknown_fingerprint_gets_a_row_of_its_own(sessions, clock) -> None:
+    """A rename the reconciler has not decided: two rows (counted twice), no chain decided by
+    the write path, and the complete fetch that no longer returns the old name defers the
+    mark instead of hiding anything."""
     first = await store(sessions, HEART, heart(60))
     clock.advance(hours=6)
     fetched_since = clock.now
     second = await store(sessions, HEART, heart(60, name=NEW_NAME))
-    assert (first.inserted, second.inserted, second.updated, second.versions_kept) == (1, 0, 1, 1)
-    [row] = await raw_rows(sessions, HEART)
-    assert row.google_data_point_id.startswith("synthetic:v2:")
-    assert row.raw_json["dataSource"]["device"]["displayName"] == NEW_NAME
-    assert await versions_of(sessions, row.id) == [heart(60)]
-    assert await count(sessions, HeartRate) == 1
+    assert (first.inserted, second.inserted, second.versions_kept) == (1, 1, 0)
+    rows = await raw_rows(sessions, HEART)
+    assert [row.google_data_point_id[:14] for row in rows] == ["synthetic:v2s:"] * 2
+    assert await chains(sessions) == []
     assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
-    assert (await raw_rows(sessions, HEART))[0].source_deleted_at is None
-    assert await chains(sessions) == [
-        (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED", "live")
-    ]
+    assert visible(await raw_rows(sessions, HEART)) == [(NEW_NAME, 60), (OLD_NAME, 60)]
 
 
-async def test_rows_archived_before_v2_are_renamed_only_after_the_backfill(sessions, clock):
-    """Before identity-backfill the old name's sightings are unknown: no chain, no merge."""
-    raw_id = await legacy(sessions, HEART, heart(60), T0)
+async def test_the_reconciler_ends_double_counting_and_the_chain_is_applied(sessions, clock):
+    """Archived before v2, then renamed: separate rows until the reconciler decides the chain
+    and links them; from then on the new name is written onto the old rows (versions)."""
+    old = await legacy(sessions, HEART, heart(60), T0)
+    other = await legacy(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1)), T0)
+    await identity_backfill(sessions)  # the full run after the deploy
     clock.advance(hours=6)
     fetched_since = clock.now
     stats = await store(sessions, HEART, heart(60, name=NEW_NAME))
-    assert (stats.inserted, await chains(sessions)) == (1, [])
-    # A complete fetch marks the old row (the new row shows the same reading) ...
-    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 1
-    # ... and the backfill links it to the new one.
-    await identity_backfill(sessions)
-    async with sessions() as session:
-        link = await session.get(RawHealthDataSupersession, raw_id)
-    assert link is not None and link.reason == "display-name-change"
+    assert stats.inserted == 1
+    window = (T0, T0 + timedelta(seconds=30))
+    assert await mark(sessions, HEART, *window, fetched_since) == 0  # deferred
+    assert len(visible(await raw_rows(sessions, HEART))) == 3  # counted twice for now
+    report = await reconcile(sessions)
+    assert report["heart-rate"].linked == {"display-name-change": 1}
+    assert [chain["decided"] for chain in report["heart-rate"].chains] == ["this run"]
+    assert await chains(sessions) == [
+        (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED", "reconciler")
+    ]
+    assert old in await superseded_ids(sessions)
+    # The decided chain is applied: the other record's row gets the new name as a version.
+    clock.advance(hours=1)
+    stats = await store(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1), name=NEW_NAME))
+    assert (stats.inserted, stats.updated, stats.versions_kept) == (0, 1, 1)
+    assert [name_of_json(v) for v in await versions_of(sessions, other)] == [OLD_NAME]
+    assert await count(sessions, HeartRate) == 3  # normalized rows updated, not doubled
 
 
-async def test_rename_after_the_backfill_versions_the_archived_row(sessions, clock) -> None:
+async def test_a_decided_chain_versions_the_archived_row_and_aliases_it(sessions, clock):
     raw_id = await legacy(sessions, HEART, heart(60), T0)
     await identity_backfill(sessions)
     clock.advance(hours=6)
-    fetched_since = clock.now
-    stats = await store(
-        sessions,
-        HEART,
-        heart(60, name=NEW_NAME),
-        heart(70, at=T0 + timedelta(minutes=5), name=NEW_NAME),
-    )
-    assert (stats.inserted, stats.updated) == (1, 1)
+    await store(sessions, HEART, heart(70, at=T0 + 6 * HOUR, name=NEW_NAME))  # new instant
+    await reconcile(sessions)
+    clock.advance(hours=1)
+    stats = await store(sessions, HEART, heart(60, name=NEW_NAME))
+    assert (stats.inserted, stats.updated) == (0, 1)
     rows = await raw_rows(sessions, HEART)
-    assert len(rows) == 2 and rows[0].id == raw_id
+    assert rows[0].id == raw_id
     assert rows[0].google_data_point_id == source_id(HEART, heart(60))  # its key never changes
-    assert rows[0].raw_json["dataSource"]["device"]["displayName"] == NEW_NAME
-    assert await count(sessions, HeartRate) == 2  # the normalized row was updated, not doubled
+    assert name_of(rows[0]) == NEW_NAME
     async with sessions() as session:
         aliased = (await session.scalars(select(RawHealthDataIdentity.raw_id))).all()
     assert raw_id in aliased
-    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
 
 
-async def test_package_suffix_change_keeps_one_row(sessions, clock) -> None:
+async def test_package_suffix_change_keeps_one_row_once_decided(sessions, clock) -> None:
     await legacy(sessions, STEPS, steps(40), T0)
     await identity_backfill(sessions)
     clock.advance(hours=8)
+    await store(sessions, STEPS, steps(41, start=T0 + 8 * HOUR, source=phone(PACKAGE)))
+    await reconcile(sessions)
     await store(sessions, STEPS, steps(40, source=phone(PACKAGE)))
-    [row] = await raw_rows(sessions, STEPS)
-    assert row.raw_json["dataSource"]["application"]["packageName"] == PACKAGE
-    assert await count(sessions, Steps) == 1
+    rows = await raw_rows(sessions, STEPS)
+    assert len(rows) == 2
+    assert rows[0].raw_json["dataSource"]["application"]["packageName"] == PACKAGE
+    assert await count(sessions, Steps) == 2
 
 
 async def test_interval_civil_fields_keep_one_row(sessions, clock) -> None:
@@ -153,20 +179,13 @@ async def test_two_devices_in_one_page_stay_apart(sessions, clock) -> None:
     assert len(rows) == 2 and all(
         row.google_data_point_id.startswith("synthetic:v2s:") for row in rows
     )
-    # One device's record alone still finds its own row.
     clock.advance(hours=1)
     assert (await store(sessions, HEART, watch)).unchanged == 1
 
 
-async def test_a_device_seen_moments_ago_is_not_merged(sessions, clock) -> None:
-    await store(sessions, HEART, heart(60))  # page 1 of a fetch
-    clock.advance(seconds=20)
-    await store(sessions, HEART, heart(64, name=WATCH))  # page 2: another device
-    rows = await raw_rows(sessions, HEART)
-    assert len(rows) == 2 and await count(sessions, RawHealthDataVersion) == 0
-
-
 async def test_deleted_record_of_one_device_is_marked_next_to_another(sessions, clock) -> None:
+    """Seen together (overlapping sightings): decided distinct without any reconciler run, so
+    the band's row never keeps the watch's deleted record."""
     band, watch = heart(60), heart(64, name=WATCH)
     await store(sessions, HEART, band, watch)
     clock.advance(hours=1)
@@ -177,70 +196,26 @@ async def test_deleted_record_of_one_device_is_marked_next_to_another(sessions, 
     assert deleted.raw_json == watch
 
 
-# --- review findings ----------------------------------------------------------------------
-
-
-async def test_renamed_device_next_to_a_second_device_is_versioned_not_duplicated(
-    sessions, clock
-) -> None:
-    """Review 2 blocker 1: a re-fetch after a rename, with a second device at one instant,
-    versions the renamed device's rows, creates nothing and marks nothing."""
-    later = T0 + timedelta(minutes=1)
-    await store(sessions, HEART, heart(60), heart(64, name=WATCH), heart(61, at=later))
-    clock.advance(hours=6)
-    fetched_since = clock.now
-    stats = await store(
-        sessions,
-        HEART,
-        heart(60, name=NEW_NAME),
-        heart(64, name=WATCH),
-        heart(61, at=later, name=NEW_NAME),
-    )
-    assert (stats.inserted, stats.updated, stats.unchanged, stats.versions_kept) == (0, 2, 1, 2)
-    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
-    rows = await raw_rows(sessions, HEART)
-    assert sorted(name_of(row) for row in rows) == [NEW_NAME, NEW_NAME, WATCH]
-    [watch] = [row for row in rows if name_of(row) == WATCH]
-    assert await versions_of(sessions, watch.id) == []  # never another device's payload
-    # A second rename, again next to the watch, extends the chain.
-    clock.advance(hours=6)
-    stats = await store(sessions, HEART, heart(60, name="Example Band 2"), heart(64, name=WATCH))
-    assert (stats.inserted, stats.updated, stats.unchanged) == (0, 1, 1)
-    assert [label.split(" / ")[1] for _, label, _ in await chains(sessions)] == [
-        "Example Band 2",
-        NEW_NAME,
-    ]
-
-
-async def test_archived_duplicates_and_a_second_device_after_the_backfill(sessions, clock):
-    """Review 2 scenario b: old/new name duplicates of one key plus another device; after the
-    backfill a second rename versions the row that holds the record."""
-    old = await legacy(sessions, HEART, heart(60), T0, last=T0 + 3 * HOUR)
-    new = await legacy(
-        sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * HOUR, last=T0 + 12 * HOUR
-    )
-    watch = await legacy(sessions, HEART, heart(64, name=WATCH), T0, last=T0 + 13 * HOUR)
-    report = await identity_backfill(sessions)
-    async with sessions() as session:
-        link = await session.get(RawHealthDataSupersession, old)
-    assert link is not None and link.new_raw_id == new
-    assert report["heart-rate"].linked == {"display-name-change": 1}
-    clock.now = T0 + 20 * HOUR
-    fetched_since = clock.now
-    stats = await store(sessions, HEART, heart(60, name="Example Band 2"), heart(64, name=WATCH))
-    assert (stats.inserted, stats.updated, stats.unchanged) == (0, 1, 1)
-    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
-    assert await versions_of(sessions, watch) == []
-    assert [name_of_json(v) for v in await versions_of(sessions, new)] == [NEW_NAME]
-
-
-def name_of_json(record: dict) -> str:
-    return record["dataSource"]["device"]["displayName"]
+async def test_another_devices_row_never_keeps_a_deleted_record(sessions, clock) -> None:
+    """Two devices returned together (before and after the full run); one record is deleted
+    upstream: a complete fetch marks it."""
+    for backfilled in (False, True):
+        start = T0 + timedelta(days=2) * backfilled
+        clock.now = start
+        await store(sessions, HEART, heart(60, at=start), heart(90, at=start, name=WATCH))
+        if backfilled:
+            await identity_backfill(sessions)
+        clock.now = start + 5 * HOUR
+        fetched_since = clock.now
+        await store(sessions, HEART, heart(60, at=start))  # the watch's record is gone
+        assert await mark(sessions, HEART, start, start + HOUR, fetched_since) == 1
+        marked = [row for row in await raw_rows(sessions, HEART) if row.source_deleted_at]
+        assert [name_of(row) for row in marked][-1] == WATCH
 
 
 async def test_a_new_name_is_never_written_onto_another_devices_row(sessions, clock) -> None:
-    """Review 2 blocker 2 (first half): without a chain there is no "newest row" fallback;
-    the new name gets a row of its own, the other device's row keeps its payload."""
+    """Review 2 blocker 2: no "newest row" fallback; the other device's row keeps its
+    payload, the unknown name gets a row of its own."""
     await legacy(sessions, HEART, heart(60), T0, last=T0 + 3 * HOUR)
     await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * HOUR, last=T0 + 12 * HOUR)
     watch = await legacy(sessions, HEART, heart(64, name=WATCH), T0, last=T0 + 13 * HOUR)
@@ -252,63 +227,129 @@ async def test_a_new_name_is_never_written_onto_another_devices_row(sessions, cl
     assert name_of(row) == WATCH
 
 
-async def test_another_devices_row_never_keeps_a_deleted_record(sessions, clock) -> None:
-    """Review 2 blocker 2 / review 1: two devices returned together; one record is deleted
-    upstream. A complete fetch marks it, before and after the backfill."""
-    for backfilled in (False, True):
-        start = T0 + timedelta(days=2) * backfilled
-        await legacy(sessions, HEART, heart(60, at=start), start, last=start + HOUR)
-        await legacy(sessions, HEART, heart(90, at=start, name=WATCH), start, last=start + HOUR)
-        if backfilled:
-            await identity_backfill(sessions)
-        clock.now = start + 5 * HOUR
-        fetched_since = clock.now
-        await store(sessions, HEART, heart(60, at=start))  # the watch's record is gone
-        assert await mark(sessions, HEART, start, start + HOUR, fetched_since) == 1
-        marked = [row for row in await raw_rows(sessions, HEART) if row.source_deleted_at]
-        assert [name_of(row) for row in marked][-1] == WATCH
-
-
-async def test_a_source_seen_earlier_in_the_same_fetch_is_not_renamed(sessions, clock) -> None:
-    """Review 1: the live decision compares with the current fetch, not the wall clock. The
-    band was returned on page 1; a watch record alone on page 2, at an instant where only
-    the band had a row, is a second device."""
-    await store(sessions, HEART, heart(60), heart(61, at=T0 + HOUR))
+async def test_a_decided_chain_never_writes_a_different_reading(sessions, clock) -> None:
+    """Even along a decided chain, a record that measured something else than the old row
+    gets a row of its own: a source wrongly taken for a renamed device hides nothing."""
+    await legacy(sessions, HEART, heart(60), T0)
+    await identity_backfill(sessions)
     clock.advance(hours=6)
+    await store(sessions, HEART, heart(70, at=T0 + 6 * HOUR, name=NEW_NAME))
+    await reconcile(sessions)
+    stats = await store(sessions, HEART, heart(95, name=NEW_NAME))  # same instant, other value
+    assert stats.inserted == 1
+    assert visible(await raw_rows(sessions, HEART)) == [
+        (NEW_NAME, 70),
+        (NEW_NAME, 95),
+        (OLD_NAME, 60),
+    ]
+    report = await reconcile(sessions)
+    assert report["heart-rate"].kept_differing == 1 and not report["heart-rate"].linked
+
+
+async def test_a_resumed_fetch_never_renames_a_device_seen_before_the_crash(sessions, clock):
+    """Re-review 1 #1: page 1 before a crash returned the band; the resumed page 2 returns a
+    second watch at the band's instant. It is a source of its own: no chain, no version."""
     started = clock.now
-    await store(sessions, HEART, heart(61, at=T0 + HOUR), fetch_started=started)  # page 1
-    clock.advance(minutes=20)
-    stats = await store(sessions, HEART, heart(64, name=WATCH), fetch_started=started)  # page 2
-    assert stats.inserted == 1 and await chains(sessions) == []
-    assert await count(sessions, RawHealthDataVersion) == 0
-
-
-async def test_a_contradicted_chain_is_no_longer_used(sessions, clock) -> None:
-    """Review 1 (late second device): a fetch that returns only the watch at an instant the
-    band had looks like a rename; when the band is returned again, the sightings contradict
-    the chain and both are sources of their own again. No reading is lost (versions) and
-    both are visible."""
-    await store(sessions, HEART, heart(60))
-    clock.advance(minutes=10)
-    await store(sessions, HEART, heart(90, name=WATCH))
-    assert len(await raw_rows(sessions, HEART)) == 1  # taken as the band renamed
-    clock.advance(minutes=10)
-    fetched_since = clock.now
-    await store(sessions, HEART, heart(60), heart(90, name=WATCH))
+    await store(sessions, HEART, heart(60), heart(61, at=T0 + timedelta(minutes=1)))
+    clock.advance(minutes=30)
+    await store(
+        sessions,
+        HEART,
+        heart(95, name="Second Watch"),
+        heart(96, name="Second Watch", at=T0 + timedelta(minutes=2)),
+        fetch_started=started,
+    )
     rows = await raw_rows(sessions, HEART)
-    assert sorted(name_of(row) for row in rows) == [OLD_NAME, WATCH]
-    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
+    assert len(rows) == 4 and await count(sessions, RawHealthDataVersion) == 0
+    assert await chains(sessions) == []
+
+
+async def test_a_contradicted_chain_is_no_longer_used_and_verify_notes_it(sessions, clock):
+    """The old name returns after the chain was decided: a contradiction event, the chain is
+    no longer applied (the old name's records go to their own rows), the links made under it
+    stay valid and verify reports a note, not an error."""
+    from app.models.identity import RawSourceChainEvent
     from app.services.identity import verify_identities
 
+    old = await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
+    await identity_backfill(sessions)
+    clock.now = T0 + 7 * HOUR
+    await store(sessions, HEART, heart(60, name=NEW_NAME))
+    await reconcile(sessions)
+    assert old in await superseded_ids(sessions)
+    clock.now = T0 + 30 * HOUR
+    stats = await store(sessions, HEART, heart(70, at=T0 + 30 * HOUR))  # the old name again
+    assert stats.inserted == 1
+    assert await count(sessions, RawSourceChainEvent) == 1
+    clock.advance(minutes=1)
+    later = heart(71, at=T0 + 2 * HOUR, name=NEW_NAME)
+    await legacy(sessions, HEART, heart(71, at=T0 + 2 * HOUR), T0, last=T0 + HOUR)
+    assert (await store(sessions, HEART, later)).inserted == 1  # the chain is not applied
     async with sessions() as session:
         _, errors, notes = await verify_identities(session)
-    assert errors == [] and len(notes) == 1 and "contradicted" in notes[0]
+    assert errors == []
+    assert len(notes) == 1 and "contradicted" in notes[0]
+
+
+async def test_marking_defers_while_a_rename_is_undecided(sessions, clock) -> None:
+    """Re-review 2 (within five minutes, inside a long fetch): the new name appears pages
+    after the old one in the same fetch. Nothing is marked; the reconciler cannot decide
+    (gap under five minutes) and lists it; both rows stay visible."""
+    await store(sessions, HEART, heart(60), heart(61, at=T0 + timedelta(minutes=1)))
+    await identity_backfill(sessions)
+    clock.advance(hours=3)
+    fetched_since = clock.now
+    await store(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1)))  # page 1: old name
+    clock.advance(minutes=2)
+    await store(sessions, HEART, heart(60, name=NEW_NAME))  # page 3: renamed meanwhile
+    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
+    report = await reconcile(sessions)
+    [case] = report["heart-rate"].ambiguous
+    assert "less than five minutes" in case["why"]
+    assert len(visible(await raw_rows(sessions, HEART))) == 3
+
+
+async def test_three_step_rename_chains_step_by_step(sessions, clock) -> None:
+    """A -> B -> C, where B only ever returned new instants (it never met A's rows): each
+    step satisfies the rule, so both links are decided; C's records land on A's rows."""
+    old = await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
+    await identity_backfill(sessions)
+    clock.now = T0 + 5 * HOUR
+    await store(sessions, HEART, heart(70, at=T0 + 5 * HOUR, name=NEW_NAME))
+    clock.now = T0 + 9 * HOUR
+    await store(sessions, HEART, heart(80, at=T0 + 9 * HOUR, name="Example Band 3"))
+    report = await reconcile(sessions)
+    assert {(chain["from"], chain["to"]) for chain in report["heart-rate"].chains} == {
+        (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED"),
+        (f"FITBIT / {NEW_NAME} / DERIVED", "FITBIT / Example Band 3 / DERIVED"),
+    }
+    clock.advance(hours=1)
+    stats = await store(sessions, HEART, heart(60, name="Example Band 3"))
+    assert (stats.inserted, stats.updated) == (0, 1)
+    rows = await raw_rows(sessions, HEART)
+    assert [name_of(row) for row in rows if row.id == old] == ["Example Band 3"]
+
+
+async def test_a_second_device_alongside_blocks_a_chain(sessions, clock) -> None:
+    """Rule 4: another source of the class seen alongside either form - the rename stays
+    undecided (listed), both rows stay visible, nothing is marked."""
+    await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
+    await legacy(sessions, HEART, heart(90, name=WATCH), T0, last=T0 + 20 * HOUR)
+    await identity_backfill(sessions)
+    clock.now = T0 + 8 * HOUR
+    fetched_since = clock.now
+    await store(sessions, HEART, heart(60, name=NEW_NAME), heart(90, name=WATCH))
+    report = await reconcile(sessions)
+    assert report["heart-rate"].chains == [] and not report["heart-rate"].linked
+    assert "alongside" in report["heart-rate"].ambiguous[0]["why"]
+    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
+    assert len(visible(await raw_rows(sessions, HEART))) == 3
 
 
 async def test_marking_reads_candidates_in_chunks_and_skips_superseded_rows(
     sessions, clock, monkeypatch
 ) -> None:
-    """Review 1: bounded memory; a superseded row is history and is never marked."""
+    """Bounded memory; a superseded row is history and is never marked."""
     from app.sync import deletions
 
     monkeypatch.setattr(deletions, "CHUNK", 2)
@@ -331,10 +372,8 @@ async def test_marking_reads_candidates_in_chunks_and_skips_superseded_rows(
 async def test_a_stale_stored_start_is_kept_by_marking_and_linked_by_the_backfill(
     sessions, clock
 ) -> None:
-    """Review 1 (low): a row whose source_start_time an older parser wrote differently is
-    not found by start when a page is stored (it gets a twin), but deletion marking still
-    sees the twin as the same record, and the backfill links them (settled last, with the
-    rows of the parsed start, even when they are in other batches)."""
+    """A row whose source_start_time an older parser wrote differently: deletion marking sees
+    its twin as the same record, and the backfill links them (settled last by id)."""
     stale = await legacy(sessions, SWIM, swim(12), T0, start=T0 + timedelta(seconds=30))
     clock.now = T0 + 5 * HOUR
     fetched_since = clock.now
@@ -346,3 +385,70 @@ async def test_a_stale_stored_start_is_kept_by_marking_and_linked_by_the_backfil
     async with sessions() as session:
         link = await session.get(RawHealthDataSupersession, stale)
     assert link is not None and link.reason == "interval-shape-change"
+
+
+def name_of_json(record: dict) -> str:
+    return record["dataSource"]["device"]["displayName"]
+
+
+# --- write path timing (re-review 2 blocker 3) ----------------------------------------------
+
+
+async def test_last_seen_is_stamped_after_the_lock_and_never_moves_back(
+    sessions, clock, monkeypatch
+) -> None:
+    """A writer that waited for the data type's lock stamps the time it got it, and a writer
+    that stamps an older time never moves ``last_seen_at`` backwards: a fetch that started
+    meanwhile does not see the record as unseen (no false deletion mark)."""
+    from app.services import identity
+
+    original = identity.lock_data_type
+
+    async def waiting(session, data_type, **options):
+        clock.advance(minutes=10)  # the time spent waiting behind a reconciler batch
+        await original(session, data_type, **options)
+
+    monkeypatch.setattr(identity, "lock_data_type", waiting)
+    before = clock.now
+    await store(sessions, HEART, heart(60))
+    [row] = await raw_rows(sessions, HEART)
+    assert row.last_seen_at.replace(tzinfo=None) == (before + timedelta(minutes=10)).replace(
+        tzinfo=None
+    )
+    monkeypatch.setattr(identity, "lock_data_type", original)
+    seen = clock.advance(hours=1)
+    await store(sessions, HEART, heart(60))  # the fetch that started at `seen`
+    clock.now = seen - timedelta(minutes=30)  # a delayed writer with an older time
+    await store(sessions, HEART, heart(60))
+    [row] = await raw_rows(sessions, HEART)
+    assert row.last_seen_at.replace(tzinfo=None) == seen.replace(tzinfo=None)
+    assert await mark(sessions, HEART, T0, T0 + HOUR, seen) == 0
+
+
+async def test_an_old_name_coming_back_never_marks_the_new_names_rows(sessions, clock) -> None:
+    """Validation of the redesign (review 2 s2): the device's old name is returned again for
+    an old window. Both forms' spans now overlap, but they were never returned together for
+    one key, so they are not decided distinct: the new name's rows are not marked."""
+    await store(sessions, HEART, heart(60))
+    clock.advance(hours=6)
+    await store(sessions, HEART, heart(60, name=NEW_NAME))
+    clock.advance(hours=6)
+    fetched_since = clock.now
+    await store(sessions, HEART, heart(60))  # the old name comes back
+    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
+    assert visible(await raw_rows(sessions, HEART)) == [(NEW_NAME, 60), (OLD_NAME, 60)]
+
+
+async def test_two_devices_archived_together_are_distinct_after_the_backfill(sessions, clock):
+    """Re-review 1 probe: two devices' rows of one instant, archived before v2 and last seen
+    by the same fetch, are two sources once the full run has read them: a deletion of one is
+    marked next to the other."""
+    await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
+    await legacy(sessions, HEART, heart(90, name=WATCH), T0, last=T0 + HOUR)
+    await identity_backfill(sessions)
+    clock.now = T0 + 5 * HOUR
+    fetched_since = clock.now
+    await store(sessions, HEART, heart(60))  # the watch's record is gone
+    assert await mark(sessions, HEART, T0, T0 + HOUR, fetched_since) == 1
+    [marked] = [row for row in await raw_rows(sessions, HEART) if row.source_deleted_at]
+    assert name_of(marked) == WATCH

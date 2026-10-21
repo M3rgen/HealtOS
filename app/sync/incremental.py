@@ -14,7 +14,7 @@ from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
-from app.models.state import JobStatus, SyncState
+from app.models.state import JobStatus, SyncState, fetch_round_start
 from app.services.storage import StoreStats, store_page
 from app.sync.checkpoints import incremental_start
 from app.sync.deletions import mark_source_deletions
@@ -189,9 +189,15 @@ class IncrementalSync:
             state.last_requested_from = start
             state.last_requested_to = end
             state.last_page_token = page_token
+            # A resumed round keeps the time its first page was fetched: "seen in this
+            # fetch" always means since the round's real start.
+            round_started = as_utc(
+                await fetch_round_start(
+                    session, "sync", data_type, fresh=page_token is None, now=datetime.now(UTC)
+                )
+            )
         # Only a fetch that starts at the first page sees the whole window, so only
         # then can records that stopped appearing be marked as deleted at the source.
-        round_started = datetime.now(UTC)
         fetched_since = round_started if page_token is None else None
         async for page in iter_pages(self.client, spec, start, end, page_token):
             try:

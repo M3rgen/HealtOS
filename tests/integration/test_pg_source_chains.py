@@ -56,24 +56,27 @@ async def execute(sessions, *statements: str) -> None:
             await session.execute(text(statement))
 
 
-async def test_rename_next_to_a_second_device_versions_and_marks_nothing(
+async def test_rename_next_to_a_second_device_hides_nothing_and_marks_nothing(
     pg_sessions, clock
 ) -> None:
-    """Review 2 blocker 1, with archived old/new duplicates and the backfill in between."""
+    """Review 2 blocker 1, with archived old/new duplicates and a second device seen alongside:
+    the rule leaves the rename undecided, a third name gets a row of its own, the watch keeps
+    its payload, and no deletion mark is guessed."""
     old = await legacy(pg_sessions, HEART, heart(60), T0, last=T0 + 3 * HOUR)
     new = await legacy(
         pg_sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * HOUR, last=T0 + 12 * HOUR
     )
     watch = await legacy(pg_sessions, HEART, heart(64, name=WATCH), T0, last=T0 + 13 * HOUR)
-    await identity_backfill(pg_sessions)
+    report = await identity_backfill(pg_sessions)
+    assert report["heart-rate"].chains == [] and report["heart-rate"].ambiguous
     clock.now = T0 + 20 * HOUR
     fetched_since = clock.now
     stats = await store(pg_sessions, HEART, heart(60, name="Example Band 2"), heart(64, name=WATCH))
-    assert (stats.inserted, stats.updated, stats.unchanged, stats.versions_kept) == (0, 1, 1, 1)
+    assert (stats.inserted, stats.updated, stats.unchanged, stats.versions_kept) == (1, 0, 1, 0)
     assert await mark(pg_sessions, HEART, T0, T0 + HOUR, fetched_since) == 0
     assert await versions_of(pg_sessions, watch) == []
     rows = {row.id: row for row in await raw_rows(pg_sessions, HEART)}
-    assert name_of(rows[new]) == "Example Band 2" and name_of(rows[old]) == "Example Band Pro"
+    assert name_of(rows[new]) == NEW_NAME and name_of(rows[old]) == "Example Band Pro"
     async with pg_sessions() as session:
         _, errors, notes = await verify_identities(session)
     assert errors == [] and notes == []

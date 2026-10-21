@@ -15,6 +15,7 @@ from identity_records import (
     SWIM,
     T0,
     count,
+    fitbit,
     heart,
     legacy,
     phone,
@@ -45,14 +46,17 @@ async def archive_with_duplicates(sessions) -> dict[str, uuid.UUID]:
             sessions, HEART, heart(80, at=T0 + timedelta(minutes=9)), T0, deleted=T0 + day
         ),
         # The band (old name) was last seen half a day before the new name first appeared;
-        # the watch, another device, was seen together with both.
+        # the watch, another device of another class (recording method), was seen with both.
         "band": await legacy(
             sessions, HEART, heart(70, at=T0 + timedelta(minutes=3)), T0, last=T0 + day / 2
         ),
         "watch": await legacy(
             sessions,
             HEART,
-            heart(72, at=T0 + timedelta(minutes=3), name="Example Watch"),
+            {
+                **heart(72, at=T0 + timedelta(minutes=3)),
+                "dataSource": fitbit("Example Watch", method="PASSIVELY_MEASURED"),
+            },
             T0 + timedelta(hours=2),
             last=T0 + day,
         ),
@@ -81,7 +85,7 @@ async def test_backfill_links_duplicates_once_and_dry_run_writes_nothing(session
     assert await count(sessions, RawHealthDataIdentity) == 0
     assert await links(sessions) == {}
     assert dry["heart-rate"].linked == {"display-name-change": 1}
-    assert dry["heart-rate"].distinct_sources == 1 and dry["heart-rate"].deletions_kept == 1
+    assert dry["heart-rate"].distinct_sources == 0 and dry["heart-rate"].deletions_kept == 1
 
     result = await identity_backfill(sessions)
     expected = {
@@ -111,9 +115,9 @@ async def test_backfill_links_duplicates_once_and_dry_run_writes_nothing(session
         lone = await session.get(RawHealthData, ids["lone-deleted"])
     assert sorted(raw_id for raw_id, _ in events) == sorted(expected)
     assert lone is not None and lone.source_deleted_at is not None  # a real deletion stays
-    # One alias per identity (heart-rate: renamed, lone; the two devices by their specific
-    # keys plus their shared plain key), steps 2, swim 1, sedentary 1.
-    assert await count(sessions, RawHealthDataIdentity) == 5 + 2 + 1 + 1
+    # One alias per key and fingerprint of a row archived under a v1 id (heart-rate 5,
+    # steps 3, the two swim rows of one source 1, the growing period 1).
+    assert await count(sessions, RawHealthDataIdentity) == 5 + 3 + 1 + 1
 
     again = await identity_backfill(sessions)
     assert sum(sum(stats.linked.values()) + stats.aliases_added for stats in again.values()) == 0
@@ -168,7 +172,8 @@ async def test_superseded_rows_are_not_counted_by_the_dashboard(sessions) -> Non
     await legacy(sessions, STEPS, steps(40), T0)
     await legacy(sessions, STEPS, steps(40, source=phone(PACKAGE)), T0 + timedelta(days=1))
     await legacy(sessions, HEART, heart(60), T0)
-    await legacy(sessions, HEART, heart(80, name=NEW_NAME), T0 + timedelta(days=1))
+    await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + timedelta(days=1))
+    await legacy(sessions, HEART, heart(80, at=T0 + timedelta(minutes=1)), T0)
 
     async def board() -> tuple:
         async with sessions() as session:
@@ -182,9 +187,9 @@ async def test_superseded_rows_are_not_counted_by_the_dashboard(sessions) -> Non
             everything["days"][0]["steps"],
         )
 
-    assert await board() == (80, 70.0, 80, 80)  # double counted, averaged twice
+    assert await board() == (80, 66.7, 80, 80)  # double counted, averaged twice
     await identity_backfill(sessions)
-    assert await board() == (40, 80.0, 40, 40)
+    assert await board() == (40, 70.0, 40, 40)
 
 
 async def test_verify_reports_an_alias_that_does_not_match_its_row(sessions) -> None:
@@ -194,7 +199,7 @@ async def test_verify_reports_an_alias_that_does_not_match_its_row(sessions) -> 
     await identity_backfill(sessions)
     async with sessions() as session:
         count, errors, notes = await verify_identities(session)
-    assert count == 9 and errors == [] and notes == []
+    assert count == 10 and errors == [] and notes == []
     async with sessions.begin() as session:
         session.add(
             RawHealthDataIdentity(
@@ -247,38 +252,33 @@ def test_cli_identity_backfill_reports_per_type_and_reason(tmp_path, monkeypatch
 # --- review findings ----------------------------------------------------------------------
 
 
-async def test_backfill_links_within_a_chain_next_to_an_overlapping_device(sessions) -> None:
-    """Review 1 (high) / review 2 blocker 3: old and new name of one device are linked even
-    where a second device recorded at the same instant; the second device is never linked."""
+async def test_a_device_seen_alongside_keeps_a_rename_undecided(sessions) -> None:
+    """Rule 4: a second device of the class seen alongside the old or the new name - even a
+    6 h gap does not decide the rename. Nothing is linked (both stay visible), the dry run
+    lists the case with its reason, and the second device is never linked either."""
     hour = timedelta(hours=1)
     later = T0 + timedelta(minutes=1)
-    old = await legacy(sessions, HEART, heart(60), T0, last=T0 + 3 * hour)
-    old_later = await legacy(sessions, HEART, heart(61, at=later), T0, last=T0 + 3 * hour)
-    new = await legacy(
-        sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * hour, last=T0 + 30 * hour
-    )
-    new_later = await legacy(
+    await legacy(sessions, HEART, heart(60), T0, last=T0 + 3 * hour)
+    await legacy(sessions, HEART, heart(61, at=later), T0, last=T0 + 3 * hour)
+    await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * hour, last=T0 + 30 * hour)
+    await legacy(
         sessions, HEART, heart(61, at=later, name=NEW_NAME), T0 + 9 * hour, last=T0 + 30 * hour
     )
     await legacy(sessions, HEART, heart(90, name="Example Watch"), T0, last=T0 + 30 * hour)
     dry = await identity_backfill(sessions, dry_run=True)
     report = dry["heart-rate"]
-    assert [(chain["from"], chain["to"]) for chain in report.chains] == [
-        ("FITBIT / Example Band Pro / DERIVED", "FITBIT / Example Band / DERIVED")
+    assert report.chains == []
+    [case] = report.ambiguous
+    assert case["source"] == "FITBIT / Example Band / DERIVED"
+    assert "alongside" in case["why"] and case["candidates"] == ["FITBIT / Example Watch / DERIVED"]
+    assert sorted(pair["why"] for pair in report.kept_apart) == [
+        "not decided as one device (see ambiguous)",
+        "seen together (overlapping sightings): two devices",
+        "seen together (overlapping sightings): two devices",
     ]
-    assert report.chains[0]["gap_seconds"] == 6 * 3600
-    assert sorted(tuple(pair["sources"]) for pair in report.kept_apart) == [
-        ("FITBIT / Example Band Pro / DERIVED", "FITBIT / Example Watch / DERIVED"),
-        ("FITBIT / Example Watch / DERIVED", "FITBIT / Example Band / DERIVED"),
-    ]
-    assert await links(sessions) == {}
     result = await identity_backfill(sessions)
-    assert await links(sessions) == {
-        old: (new, "display-name-change"),
-        old_later: (new_later, "display-name-change"),
-    }
-    assert result["heart-rate"].linked == {"display-name-change": 2} == dry["heart-rate"].linked
-    assert result["heart-rate"].distinct_sources == 1
+    assert await links(sessions) == {} and not result["heart-rate"].linked
+    assert result["heart-rate"].distinct_sources == 2
 
 
 async def test_backfill_keeps_two_devices_stored_seconds_apart(sessions) -> None:
@@ -289,7 +289,7 @@ async def test_backfill_keeps_two_devices_stored_seconds_apart(sessions) -> None
     report = await identity_backfill(sessions)
     assert await links(sessions) == {}
     assert report["heart-rate"].chains == []
-    assert report["heart-rate"].kept_apart[0]["why"].startswith("seen together")
+    assert "less than five minutes" in report["heart-rate"].ambiguous[0]["why"]
 
 
 async def test_backfill_never_links_across_fingerprints_with_two_candidates(sessions) -> None:
@@ -300,14 +300,12 @@ async def test_backfill_never_links_across_fingerprints_with_two_candidates(sess
     await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * hour)
     report = await identity_backfill(sessions)
     assert await links(sessions) == {}
-    assert report["heart-rate"].ambiguous == [
-        {
-            "source": "FITBIT / Example Band / DERIVED",
-            "candidates": [
-                "FITBIT / Example Band Pro / DERIVED",
-                "FITBIT / Example Watch / DERIVED",
-            ],
-        }
+    [case] = report["heart-rate"].ambiguous
+    assert case["source"] == "FITBIT / Example Band / DERIVED"
+    assert case["why"] == "more than one source of its class ended before it"
+    assert case["candidates"] == [
+        "FITBIT / Example Band Pro / DERIVED",
+        "FITBIT / Example Watch / DERIVED",
     ]
 
 
@@ -363,3 +361,56 @@ async def test_backfill_counts_only_links_it_inserted_and_genuine_deletions(
             select(func.count()).where(RawHealthDataEvent.event == "identity-merged")
         )
     assert merged == 1  # only for the link this run inserted
+
+
+async def test_after_still_settles_stale_start_rows_before_it(sessions, clock) -> None:
+    """Re-review 1 (small): resuming with ``--after`` past a stale-start row still links it
+    (pass 1 notes it by id; only ids and starts are kept in memory)."""
+    stale = await legacy(sessions, SWIM, swim(12), T0, start=T0 + timedelta(seconds=30))
+    await legacy(sessions, SWIM, swim(12, civil=True), T0 + timedelta(days=1))
+    report = await identity_backfill(sessions, after=T0 + timedelta(hours=2))
+    assert report["swim-lengths-data"].rows == 0  # the second pass read nothing
+    assert report["swim-lengths-data"].start_mismatches == 1
+    assert stale in await links(sessions)
+
+
+def test_status_shows_the_reconciler_and_incremental_runs_skip_without_a_full_run(
+    tmp_path, monkeypatch
+) -> None:
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import app.models  # noqa: F401
+    from app.cli import main as cli
+    from app.db.base import Base
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'status.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def prepare() -> None:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        await archive_with_duplicates(factory)
+
+    asyncio.run(prepare())
+    monkeypatch.setattr(cli, "SessionLocal", factory)
+    try:
+        nightly = CliRunner().invoke(cli.app, ["identity-backfill", "--incremental"])
+        assert nightly.exit_code == 0, nightly.output
+        report = json.loads(nightly.stdout)
+        assert report["data_types"]["steps"]["skipped"].startswith("no full identity-backfill")
+        assert report["total"]["superseded"] == 0
+        full = CliRunner().invoke(cli.app, ["identity-backfill", "--data-type", "steps"])
+        assert full.exit_code == 0, full.output
+        again = CliRunner().invoke(
+            cli.app, ["identity-backfill", "--incremental", "--data-type", "steps"]
+        )
+        assert json.loads(again.stdout)["data_types"]["steps"]["skipped"] is None
+        status = json.loads(CliRunner().invoke(cli.app, ["status"]).stdout)
+        [steps_state] = status["identity_reconcile"]
+        assert steps_state["data_type"] == "steps" and steps_state["full_run_at"]
+        assert steps_state["last_mode"] == "incremental" and steps_state["last_error"] is None
+        assert steps_state["last_result"]["skipped"] is None
+    finally:
+        asyncio.run(engine.dispose())

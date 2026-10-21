@@ -59,6 +59,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://health:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong value}@postgres:5432/health
       RECONCILIATION_ENABLED: ${RECONCILIATION_ENABLED:-true}
       WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
+      IDENTITY_RECONCILE_ENABLED: ${IDENTITY_RECONCILE_ENABLED:-true}
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     extra_hosts:

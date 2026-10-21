@@ -111,6 +111,35 @@ class BackfillJob(TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
+class FetchRound(Base):
+    """When a fetch of a window began at its first page (migration 20261021_0012).
+
+    ``kind`` is ``sync`` (``key``: the data type; the round of ``SyncState``'s requested
+    window) or ``backfill`` (``key``: the backfill job id). A fetch resumed from its page
+    token keeps the time, so "seen in this fetch" always means since the fetch's real
+    start. A table of its own (not a column) so that 0012 never needs an exclusive lock on
+    a table a running pg_dump reads.
+    """
+
+    __tablename__ = "fetch_rounds"
+
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+async def fetch_round_start(session, kind: str, key: str, *, fresh: bool, now: datetime):
+    """The start of the fetch ``kind``/``key``: ``now`` when it begins at its first page
+    (``fresh``), else the stored start of the fetch it resumes."""
+    row = await session.get(FetchRound, (kind, key))
+    if row is None:
+        row = FetchRound(kind=kind, key=key, started_at=now)
+        session.add(row)
+    elif fresh:
+        row.started_at = now
+    return row.started_at
+
+
 class OAuthToken(TimestampMixin, Base):
     __tablename__ = "oauth_tokens"
 

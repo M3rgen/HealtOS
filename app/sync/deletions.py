@@ -6,15 +6,19 @@ any archived record that the same filter must have matched, but which was not se
 that fetch, is marked with ``source_deleted_at``. Nothing is deleted or overwritten; if
 the record comes back, ``store_records`` clears the mark again.
 
-"Not seen" is decided per record identity, not per row: a row archived under an older id of
-a record (before a device rename, a package suffix change, a growing interval) is not marked
-while a row of the same v2 key *and the same device* - the same source fingerprint, or one
-of its recorded chain (app/services/source_chains.py) - was seen in the same fetch
-(app.services.identity.present_records). A row of another source never keeps a candidate:
-of two devices that recorded at one instant, one can be deleted alone. That holds before,
-during and after ``health-mirror identity-backfill``; before it, a renamed device's old rows
-have no chain yet, so a complete fetch marks them (the new rows show the same readings) and
-the backfill then supersedes them.
+"Not seen" is decided per record identity, not per row (app.services.identity.
+present_records). A row is not marked while, in the same fetch, a row with its v2 key was
+seen
+
+* of the *same device* - the same source fingerprint, or one of its decided chain
+  (app/services/source_chains.py): a duplicate of the record under another id; or
+* of a fingerprint not yet *decided distinct* from the row's (the two were never seen
+  together): possibly the same device renamed, which only the reconciler decides. The mark is
+  deferred, never guessed; once the reconciler has linked the two, the old row is superseded
+  instead.
+
+A row of a fingerprint decided distinct (seen alongside the row's own) never keeps a
+candidate: of two devices that recorded at one instant, one can be deleted alone.
 
 Superseded rows are skipped (they no longer count, and their record is decided through the
 row that holds it). Candidates are read and decided in chunks, so a long window never sits
@@ -111,7 +115,7 @@ async def mark_source_deletions(
         column >= lower,
         column < upper,
     )
-    marked = kept = 0
+    marked = kept = deferred = 0
     now = datetime.now(UTC)
     cursor: tuple | None = None
     while True:
@@ -131,14 +135,16 @@ async def mark_source_deletions(
         if not chunk:
             break
         cursor = (chunk[-1][3], chunk[-1][0])
-        present = await present_records(
+        presence = await present_records(
             session,
             spec,
             [(raw_id, raw_json, start) for raw_id, raw_json, start, _ in chunk],
             fetched_since,
         )
-        kept += len(present)
-        missing = sorted(raw_id for raw_id, *_ in chunk if raw_id not in present)
+        kept += len(presence.present)
+        deferred += len(presence.deferred)
+        spared = presence.present | presence.deferred
+        missing = sorted(raw_id for raw_id, *_ in chunk if raw_id not in spared)
         if missing:
             result = await session.execute(
                 update(RawHealthData)
@@ -152,6 +158,9 @@ async def mark_source_deletions(
             break
     if kept:
         event(logger, "SOURCE_DELETIONS_KEPT_BY_IDENTITY", data_type=spec.name, count=kept)
+    if deferred:
+        # Possibly renamed: the reconciler decides (identity-backfill, nightly).
+        event(logger, "SOURCE_DELETIONS_DEFERRED", data_type=spec.name, count=deferred)
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked

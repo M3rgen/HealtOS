@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.services.identity_reconciler import IdentityReconciler
 from app.services.pipeline_health import PipelineHealthService
 from app.services.watchdog import PipelineWatchdog
 from app.sync.reconciliation import ReconciliationService
@@ -32,6 +33,7 @@ def build_scheduler(
     reconciliation: ReconciliationService,
     watchdog: PipelineWatchdog | None = None,
     pipeline_health: PipelineHealthService | None = None,
+    identity: IdentityReconciler | None = None,
 ) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_listener(log_missed_job, EVENT_JOB_MISSED)
@@ -61,6 +63,18 @@ def build_scheduler(
             "interval",
             seconds=settings.watchdog_interval_seconds,
             id="pipeline-watchdog",
+            replace_existing=True,
+            **JOB_DEFAULTS,
+        )
+    if settings.identity_reconcile_enabled and identity is not None:
+        # The only place that decides renamed sources and links duplicate rows between
+        # deploys: incremental, from the last checkpoint (app/services/identity_backfill.py).
+        scheduler.add_job(
+            identity.run,
+            "cron",
+            hour=settings.identity_reconcile_hour_utc,
+            minute=settings.identity_reconcile_minute,
+            id="identity-reconcile",
             replace_existing=True,
             **JOB_DEFAULTS,
         )

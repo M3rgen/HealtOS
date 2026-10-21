@@ -4,27 +4,37 @@ Records that Google sends without a `name` were archived under a synthetic id th
 raw interval object and the whole `dataSource`. A device rename, a dropped `.<UUID>` package
 suffix, civil times added to `interval` and a growing in-progress interval each made the same
 record a new row (see app/parsers/identity.py for the v2 key that replaces it). Existing rows
-cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds three
-append-only tables and one bookkeeping table:
+cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds four
+append-only tables, a widen-only one and a bookkeeping one:
 
-* `raw_health_data_identity`: v2 identity key -> the raw row that holds the record. New
-  writes resolve a record through it (app/services/storage.py).
+* `raw_health_data_identity`: fingerprint-specific v2 key -> the raw row that holds the
+  record, for rows whose own id does not say so (rows stored before 0012). New writes find a
+  record through it (app/services/storage.py); rows stored since get `synthetic:v2s:` ids.
 * `raw_health_data_supersessions`: a duplicate row -> the row that holds its record now, with
   a reason. Superseded rows stay (payload, versions, `source_deleted_at`, events); readers and
   the `analytics_*` views skip them.
 * `raw_source_chains`: per data type, source fingerprint -> the fingerprint the same device has
-  after a rename or a dropped package suffix (decided from sighting timelines; see
+  after a rename or a dropped package suffix, decided by the reconciler only (identity-backfill;
   app/services/source_chains.py). Only fingerprints of one chain are ever paired or merged.
-* `raw_source_sightings` (not guarded, derived): first and last sighting of each fingerprint.
+* `raw_source_chain_events`: a later sighting contradicted a chain link (no longer used).
+* `raw_source_pairs`: two fingerprints returned together for one key (two distinct sources).
+* `raw_source_sightings` (widen-only): first and last sighting of each fingerprint.
+* `identity_reconcile_state` (bookkeeping): the reconciler's checkpoint per data type.
 
-The three append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
-triggers calling 0011's `healthos_refuse_change()`); `health-mirror verify` checks them, their
-constraints and that no rule sits on them. On PostgreSQL the `analytics_*` views are replaced
-(`CREATE OR REPLACE`, same columns) so they show what the dashboard counts: rows of a
-quarantined, source-deleted or superseded raw record are left out (before, only quarantined
-ones); SQLite (tests only) keeps the old views.
+It also adds `fetch_rounds` (bookkeeping): when a sync round or a backfill window fetch began
+at its first page, kept when the fetch resumes from its page token.
 
-Catalog-only and fast: two empty tables, their indexes and triggers, and view definitions.
+The five append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
+triggers calling 0011's `healthos_refuse_change()`); the sightings refuse `DELETE`,
+`TRUNCATE` and any `UPDATE` that narrows a span (`healthos_sightings_widen_only()`).
+`health-mirror verify` checks them, their constraints, that no rule or row-level security
+sits on them and that the `analytics_*` views are these. On PostgreSQL the `analytics_*`
+views are replaced (`CREATE OR REPLACE`, same columns) so they show what the dashboard
+counts: rows of a quarantined, source-deleted or superseded raw record are left out (before,
+only quarantined ones); SQLite (tests only) keeps the old views.
+
+Catalog-only and fast: empty tables, their indexes and triggers, and view definitions (no
+ALTER of an existing table, so a running pg_dump never blocks it).
 Filling them is `health-mirror identity-backfill`, run after the deploy (docs/RUNBOOK.md).
 Like 0011 it sets `lock_timeout` (30 s, `-x lock-timeout=...`): the foreign keys to
 `raw_health_data` need a SHARE ROW EXCLUSIVE lock on it (writers conflict, readers and
@@ -53,8 +63,30 @@ depends_on = None
 IDENTITY_TABLE = "raw_health_data_identity"
 SUPERSESSION_TABLE = "raw_health_data_supersessions"
 CHAIN_TABLE = "raw_source_chains"
+CHAIN_EVENT_TABLE = "raw_source_chain_events"
+PAIR_TABLE = "raw_source_pairs"
 SIGHTING_TABLE = "raw_source_sightings"
-IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE)
+RECONCILE_TABLE = "identity_reconcile_state"
+FETCH_ROUND_TABLE = "fetch_rounds"
+IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE, CHAIN_EVENT_TABLE, PAIR_TABLE)
+
+SIGHTINGS_FUNCTION = "healthos_sightings_widen_only"
+FUNCTION_BODIES = {
+    SIGHTINGS_FUNCTION: f"""
+BEGIN
+    IF NEW.data_type IS DISTINCT FROM OLD.data_type
+       OR NEW.fingerprint IS DISTINCT FROM OLD.fingerprint
+       OR NEW.stable_class IS DISTINCT FROM OLD.stable_class
+       OR NEW.first_seen_at > OLD.first_seen_at
+       OR NEW.last_seen_at < OLD.last_seen_at
+       OR (OLD.complete AND NOT NEW.complete) THEN
+        RAISE EXCEPTION USING MESSAGE =
+            '{SIGHTING_TABLE} only widens: ' || TG_OP || ' refused';
+    END IF;
+    RETURN NEW;
+END
+""",
+}
 
 _PG_TRIGGERS = {}
 for _table in IDENTITY_TABLES:
@@ -68,6 +100,21 @@ for _table in IDENTITY_TABLES:
         f"BEFORE TRUNCATE ON {_table} FOR EACH STATEMENT",
         "healthos_refuse_change",
     )
+_PG_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
+    SIGHTING_TABLE,
+    f"BEFORE UPDATE ON {SIGHTING_TABLE} FOR EACH ROW",
+    SIGHTINGS_FUNCTION,
+)
+_PG_TRIGGERS[f"{SIGHTING_TABLE}_no_delete"] = (
+    SIGHTING_TABLE,
+    f"BEFORE DELETE ON {SIGHTING_TABLE} FOR EACH ROW",
+    "healthos_refuse_change",
+)
+_PG_TRIGGERS[f"{SIGHTING_TABLE}_no_truncate"] = (
+    SIGHTING_TABLE,
+    f"BEFORE TRUNCATE ON {SIGHTING_TABLE} FOR EACH STATEMENT",
+    "healthos_refuse_change",
+)
 PROTECTIVE_TRIGGERS = tuple(
     (table, trigger, function) for trigger, (table, _, function) in _PG_TRIGGERS.items()
 )
@@ -75,19 +122,47 @@ PG_TRIGGER_SQL = {
     trigger: (table, f"CREATE TRIGGER {trigger}\n{definition}\nEXECUTE FUNCTION {function}()")
     for trigger, (table, definition, function) in _PG_TRIGGERS.items()
 }
+
+
+def _sqlite_refusal(name: str, table: str, operation: str, when: str = "") -> str:
+    condition = f"\nWHEN {when}" if when else ""
+    message = (
+        f"{table} only widens: {operation} refused"
+        if when
+        else f"{table} keeps every record: {operation} refused"
+    )
+    return f"""CREATE TRIGGER {name}
+BEFORE {operation} ON {table}{condition}
+BEGIN
+    SELECT RAISE(ABORT, '{message}');
+END"""
+
+
 _SQLITE_TRIGGERS = {}
 for _table in IDENTITY_TABLES:
     for _operation in ("UPDATE", "DELETE"):
         _name = f"{_table}_no_{_operation.lower()}"
-        _SQLITE_TRIGGERS[_name] = (
-            _table,
-            f"""CREATE TRIGGER {_name}
-BEFORE {_operation} ON {_table}
-BEGIN
-    SELECT RAISE(ABORT, '{_table} keeps every record: {_operation} refused');
-END""",
-        )
+        _SQLITE_TRIGGERS[_name] = (_table, _sqlite_refusal(_name, _table, _operation))
+_SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_no_delete"] = (
+    SIGHTING_TABLE,
+    _sqlite_refusal(f"{SIGHTING_TABLE}_no_delete", SIGHTING_TABLE, "DELETE"),
+)
+_SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
+    SIGHTING_TABLE,
+    _sqlite_refusal(
+        f"{SIGHTING_TABLE}_widen_only",
+        SIGHTING_TABLE,
+        "UPDATE",
+        "NEW.data_type IS NOT OLD.data_type OR NEW.fingerprint IS NOT OLD.fingerprint "
+        "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.first_seen_at > OLD.first_seen_at "
+        "OR NEW.last_seen_at < OLD.last_seen_at OR (OLD.complete AND NOT NEW.complete)",
+    ),
+)
 POSTGRESQL_DDL = (
+    *(
+        f"CREATE FUNCTION {name}() RETURNS trigger\nLANGUAGE plpgsql AS $${body}$$"
+        for name, body in FUNCTION_BODIES.items()
+    ),
     *(sql for _, sql in PG_TRIGGER_SQL.values()),
     *(
         f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger}"
@@ -272,6 +347,71 @@ def _upgrade(dialect: str) -> None:
         ),
         sa.PrimaryKeyConstraint("data_type", "fingerprint", name="pk_raw_source_sightings"),
     )
+    op.create_table(
+        CHAIN_EVENT_TABLE,
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("from_fingerprint", sa.String(64), nullable=False),
+        sa.Column("to_fingerprint", sa.String(64), nullable=False),
+        sa.Column("event", sa.String(32), nullable=False),
+        sa.Column("evidence", sa.Text(), nullable=False),
+        sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint(
+            "data_type", "from_fingerprint", "event", name="pk_raw_source_chain_events"
+        ),
+    )
+    op.create_table(
+        PAIR_TABLE,
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("first_fingerprint", sa.String(64), nullable=False),
+        sa.Column("second_fingerprint", sa.String(64), nullable=False),
+        sa.Column("seen_together_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "first_fingerprint < second_fingerprint", name=op.f("ck_raw_source_pairs_ordered")
+        ),
+        sa.PrimaryKeyConstraint(
+            "data_type", "first_fingerprint", "second_fingerprint", name="pk_raw_source_pairs"
+        ),
+    )
+    op.create_table(
+        RECONCILE_TABLE,
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("checkpoint_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("full_run_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_mode", sa.String(16), nullable=True),
+        sa.Column("last_result", sa.Text(), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("runs", sa.Integer(), server_default="0", nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("data_type", name="pk_identity_reconcile_state"),
+    )
+    # Not columns of sync_state / backfill_jobs: ALTER TABLE would need an exclusive lock that
+    # a running pg_dump blocks.
+    op.create_table(
+        FETCH_ROUND_TABLE,
+        sa.Column("kind", sa.String(16), nullable=False),
+        sa.Column("key", sa.String(128), nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint("kind", "key", name="pk_fetch_rounds"),
+    )
     for statement in POSTGRESQL_DDL if dialect == "postgresql" else SQLITE_DDL:
         op.execute(statement)
     if dialect == "postgresql":
@@ -313,7 +453,13 @@ def downgrade() -> None:
         for table in NORMALIZED_TABLES:
             op.execute(_view(table, current_only=False))
     # Dropping a table drops its triggers; healthos_refuse_change() belongs to 0011.
+    op.drop_table(FETCH_ROUND_TABLE)
+    op.drop_table(RECONCILE_TABLE)
+    op.drop_table(PAIR_TABLE)
+    op.drop_table(CHAIN_EVENT_TABLE)
     op.drop_table(SIGHTING_TABLE)
     op.drop_table(CHAIN_TABLE)
     op.drop_table(SUPERSESSION_TABLE)
     op.drop_table(IDENTITY_TABLE)
+    if context_.dialect.name == "postgresql":
+        op.execute(f"DROP FUNCTION {SIGHTINGS_FUNCTION}()")

@@ -21,9 +21,13 @@ The v2 key hashes only what identifies the record physically:
 *fingerprint* (the hash of the whole ``dataSource``): two records with the same key and
 different fingerprints are either the same record seen before and after a change of its
 source, or two sources that really are distinct (two devices recording at the same instant).
-That is decided per source, never per record: app/services/source_chains.py links two
-fingerprints into one device's chain only when their sighting timelines say one replaced the
-other. A source kept apart gets ``specific_key``, which includes the fingerprint.
+That is decided per source, never per record, and never by the write path: only the
+reconciler (``health-mirror identity-backfill``, app/services/source_chains.py) links two
+fingerprints into one device's chain, from their whole sighting history.
+
+``specific_key`` is the key plus the fingerprint. A record stored for the first time gets the
+id ``new_record_id(specific_key)`` (``synthetic:v2s:<hash>``): every fingerprint has its own
+row, so the payload of one source is never written onto another source's row by accident.
 """
 
 from __future__ import annotations
@@ -114,7 +118,7 @@ def source_fingerprint(data_source: object) -> str:
 class RecordIdentity:
     # data type + physical time + discriminators + stable source fields.
     key: str
-    # ``key`` plus the fingerprint: for sources that must be kept apart.
+    # ``key`` plus the fingerprint: the record of exactly this source (its row's id).
     specific_key: str
     # Hash of the whole dataSource (renames, package suffixes and unknown fields).
     source: str
@@ -150,7 +154,7 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
             parts[name] = payload[name]
     data_source = record.get("dataSource")
     parts["source"] = stable_source(data_source)
-    key = payload_hash(parts)
+    digest = payload_hash(parts)
     shape = instant(end) if growing else None
     # The time leads the key only for locality: aliases of one period sit together in the
     # index, so the backfill (in time order) and each page's lookups touch few index pages.
@@ -158,10 +162,10 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
     assert moment is not None
     stamp = as_utc(moment).strftime("%Y%m%dT%H%M%S")
     source = source_fingerprint(data_source)
-    specific = payload_hash({"key": key, "source": source, "shape": shape})
+    key = f"{KEY_PREFIX}:{stamp}:{digest}"
     return RecordIdentity(
-        key=f"{KEY_PREFIX}:{stamp}:{key}",
-        specific_key=f"{SPECIFIC_PREFIX}:{stamp}:{specific}",
+        key=key,
+        specific_key=specific_key(key, source),
         source=source,
         shape=shape,
         start=start,
@@ -169,11 +173,48 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
     )
 
 
+def specific_key(key: str, source: str) -> str:
+    """The key of the record ``key`` as sent by the source ``source`` (a fingerprint).
+
+    Without the shape: a growing interval of one source stays one row while its end grows."""
+    _, stamp, digest = key.split(":")
+    return f"{SPECIFIC_PREFIX}:{stamp}:{payload_hash({'key': digest, 'source': source})}"
+
+
 def new_record_id(identity_key: str) -> str:
-    """The ``google_data_point_id`` of a record first stored under ``identity_key``:
-    ``synthetic:v2:<hash>`` (``synthetic:v2s:<hash>`` for a source kept apart)."""
+    """The ``google_data_point_id`` of a record first stored under ``identity_key`` (its
+    ``specific_key``): ``synthetic:v2s:<hash>``."""
     prefix, _, digest = identity_key.split(":")
     return f"synthetic:{prefix}:{digest}"
+
+
+def spare_record_id(identity: RecordIdentity, attempt: int) -> str:
+    """Another id of this source's record, for when ``new_record_id`` is taken by a row that
+    holds another source's payload now (a chain wrote it there)."""
+    digest = payload_hash({"key": identity.specific_key, "n": attempt})
+    return f"synthetic:{SPECIFIC_PREFIX}:{digest}"
+
+
+def reading(spec: DataTypeSpec, record: object) -> str | None:
+    """Hash of what a record measured: its payload without the source and with its time as
+    parsed (civil times and offsets do not count; a growing interval counts by its start).
+
+    Two fingerprints of one device give the same reading for the same record. The reconciler
+    only merges rows of *different* fingerprints whose readings are equal, and a decided chain
+    only writes onto a row whose reading equals the incoming one: a source wrongly taken for a
+    renamed device can never hide a value of its own."""
+    if not isinstance(record, dict):
+        return None
+    payload = {
+        name: value
+        for name, value in payload_for(spec, record).items()
+        if name not in ("interval", "sampleTime", "date")
+    }
+    start, end, _ = temporal(spec, record)
+    payload["@start"] = instant(start)
+    if spec.name not in GROWING_INTERVAL_TYPES:
+        payload["@end"] = instant(end)
+    return payload_hash(payload)
 
 
 def _times(spec: DataTypeSpec, record: dict) -> tuple:

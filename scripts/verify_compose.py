@@ -204,6 +204,7 @@ def main() -> int:
             "POSTGRES_PASSWORD": "local-smoke-test-only",
             "RECONCILIATION_ENABLED": "false",
             "WATCHDOG_ENABLED": "false",
+            "IDENTITY_RECONCILE_ENABLED": "false",
         }
     )
     cleanup_needed = False

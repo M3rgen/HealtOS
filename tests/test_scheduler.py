@@ -87,11 +87,16 @@ def test_every_job_tolerates_late_starts_and_coalesces_missed_runs():
         async def refresh_freshness(self):
             return None
 
+    class Identity:
+        async def run(self):
+            return None
+
     scheduler = build_scheduler(
         Settings(reconciliation_enabled=True, watchdog_enabled=True),
         Reconciliation(),
         Watchdog(),
         Health(),
+        Identity(),
     )
     jobs = scheduler.get_jobs()
 
@@ -100,6 +105,7 @@ def test_every_job_tolerates_late_starts_and_coalesces_missed_runs():
         "weekly-reconciliation",
         "pipeline-watchdog",
         "pipeline-freshness-refresh",
+        "identity-reconcile",
     }
     for job in jobs:
         assert job.misfire_grace_time == 3600
@@ -126,3 +132,28 @@ def test_missed_job_is_logged_at_info(caplog, monkeypatch):
     [record] = [item for item in caplog.records if item.message == "SCHEDULER_JOB_MISSED"]
     assert record.levelno == logging.INFO
     assert record.job_id == "daily-reconciliation"
+
+
+def test_identity_reconciler_runs_nightly_at_a_configurable_quiet_time():
+    class Reconciliation:
+        async def run(self, days):
+            return days
+
+    class Identity:
+        async def run(self):
+            return None
+
+    default = build_scheduler(Settings(), Reconciliation(), identity=Identity())
+    job = default.get_job("identity-reconcile")
+    # 02:30 UTC: after the daily Google reconciliation starts, away from the 03:30 backup.
+    assert "hour='2'" in str(job.trigger) and "minute='30'" in str(job.trigger)
+    moved = build_scheduler(
+        Settings(identity_reconcile_hour_utc=4, identity_reconcile_minute=15),
+        Reconciliation(),
+        identity=Identity(),
+    )
+    assert "hour='4', minute='15'" in str(moved.get_job("identity-reconcile").trigger)
+    off = build_scheduler(
+        Settings(identity_reconcile_enabled=False), Reconciliation(), identity=Identity()
+    )
+    assert off.get_job("identity-reconcile") is None

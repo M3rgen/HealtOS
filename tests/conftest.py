@@ -27,10 +27,11 @@ async def sessions():
 
 @pytest.fixture
 def clock(monkeypatch):
-    """store_records' wall clock (identity tests: sightings decide what was seen together)."""
+    """store_records' wall clock and the database clock of the sightings (identity tests:
+    sightings decide what was seen together)."""
     from identity_records import Clock
 
-    from app.services import storage
+    from app.services import source_chains, storage
 
     current = Clock()
 
@@ -39,5 +40,9 @@ def clock(monkeypatch):
         def now(cls, tz=None):  # noqa: ARG003 - signature of datetime.now
             return current.now
 
+    async def database_now(session):  # noqa: ARG001 - signature of the real one
+        return current.now
+
     monkeypatch.setattr(storage, "datetime", Frozen)
+    monkeypatch.setattr(source_chains, "database_now", database_now)
     return current

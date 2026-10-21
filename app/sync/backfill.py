@@ -15,7 +15,7 @@ from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
 from app.google_health.pagination import iter_pages
-from app.models.state import BackfillJob, JobStatus
+from app.models.state import BackfillJob, JobStatus, fetch_round_start
 from app.services.storage import store_page
 from app.sync.errors import error_summary
 
@@ -205,12 +205,21 @@ class BackfillService:
             job.status = JobStatus.running
             job.started_at = job.started_at or datetime.now(UTC)
             job.last_error = None
+            # A fetch resumed from its page token keeps the time its first page was fetched.
+            run_started = as_utc(
+                await fetch_round_start(
+                    session,
+                    "backfill",
+                    str(job_id),
+                    fresh=job.page_token is None,
+                    now=datetime.now(UTC),
+                )
+            )
             spec = self.specs[job.data_type]
             start, end, token = job.window_start, job.window_end, job.page_token
         event(logger, "BACKFILL_WINDOW_STARTED", data_type=spec.name, window_start=str(start))
         try:
             with provenance(source="backfill", context_id=f"backfill:{job_id}"):
-                run_started = datetime.now(UTC)
                 async for page in iter_pages(self.client, spec, start, end, token):
                     try:
                         async with self.sessions.begin() as session:

@@ -16,9 +16,12 @@ from app.models.health import (
     Weight,
 )
 from app.models.identity import (
+    IdentityReconcileState,
     RawHealthDataIdentity,
     RawHealthDataSupersession,
     RawSourceChain,
+    RawSourceChainEvent,
+    RawSourcePair,
     RawSourceSighting,
 )
 from app.models.manual import ManualMeasurement, ManualWorkout
@@ -26,6 +29,7 @@ from app.models.raw_versions import RawApiResponse, RawHealthDataEvent, RawHealt
 from app.models.settings import AppearanceSettings
 from app.models.state import (
     BackfillJob,
+    FetchRound,
     OAuthToken,
     RawHealthData,
     ReliabilityState,
@@ -44,8 +48,10 @@ __all__ = [
     "Distance",
     "EnergyExpenditure",
     "ExerciseSession",
+    "FetchRound",
     "HeartRate",
     "HeartRateVariability",
+    "IdentityReconcileState",
     "OAuthToken",
     "OxygenSaturation",
     "RespiratoryRate",
@@ -57,6 +63,8 @@ __all__ = [
     "RawHealthDataSupersession",
     "RawHealthDataVersion",
     "RawSourceChain",
+    "RawSourceChainEvent",
+    "RawSourcePair",
     "RawSourceSighting",
     "ReliabilityState",
     "ScalarMetric",
