@@ -152,7 +152,10 @@ async def test_old_name_back_with_another_value_is_counted(sessions, clock) -> N
 
 async def test_a_growing_period_of_the_old_name_counts_at_its_full_length(sessions, clock):
     """Review 1 #2 (identity.py:310-313): a sedentary period in progress at the rename; its
-    old form comes back grown. The grown period is what counts."""
+    old form comes back grown. The grown period is what counts: visible at once (a row of its
+    own: its own row is hidden behind the shorter end), and alone once the complete fetch
+    that returned it marks the end it no longer returned (lane AB: a row with another end is
+    another value, never linked to it, so that end coming back is never hidden either)."""
 
     def period(minutes: int, name: str) -> dict:
         return {
@@ -164,7 +167,14 @@ async def test_a_growing_period_of_the_old_name_counts_at_its_full_length(sessio
     await legacy(sessions, SEDENTARY, period(45, NEW_NAME), T0 + 9 * HOUR)
     await identity_backfill(sessions)
     clock.now = T0 + 30 * HOUR
+    since = clock.now
     await store(sessions, SEDENTARY, period(60, OLD_NAME))
+    ends = [
+        row.raw_json["sedentaryPeriod"]["interval"]["endTime"]
+        for row in await counted_rows(sessions, SEDENTARY)
+    ]
+    assert "2026-10-18T10:00:00Z" in ends
+    await mark(sessions, SEDENTARY, T0 - HOUR, T0 + HOUR, since)
     [row] = await counted_rows(sessions, SEDENTARY)
     assert row.raw_json["sedentaryPeriod"]["interval"]["endTime"] == "2026-10-18T10:00:00Z"
     assert (await problems(sessions))[0] == []

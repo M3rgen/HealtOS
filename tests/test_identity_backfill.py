@@ -84,12 +84,13 @@ async def test_backfill_links_duplicates_once_and_dry_run_writes_nothing(session
     dry = await identity_backfill(sessions, dry_run=True)
     assert await count(sessions, RawHealthDataIdentity) == 0
     assert await links(sessions) == {}
-    assert dry["heart-rate"].linked == {"display-name-change": 1}
+    # The renamed record's old row is marked deleted: never linked across fingerprints (it
+    # counts nowhere, and a link would hide it if its record came back with another value).
+    assert dry["heart-rate"].linked == {}
     assert dry["heart-rate"].distinct_sources == 0 and dry["heart-rate"].deletions_kept == 1
 
     result = await identity_backfill(sessions)
     expected = {
-        ids["renamed-old"]: (ids["renamed-new"], "display-name-change"),
         ids["suffixed"]: (ids["plain"], "package-suffix-change"),
         ids["swim-flat"]: (ids["swim-civil"], "interval-shape-change"),
         ids["sedentary-15"]: (ids["sedentary-45"], "growing-interval"),
@@ -99,7 +100,7 @@ async def test_backfill_links_duplicates_once_and_dry_run_writes_nothing(session
     assert {
         name: stats.as_dict() == dry[name].as_dict() for name, stats in result.items()
     } == dict.fromkeys(result, True)
-    assert result["heart-rate"].superseded_marked == 1
+    assert result["heart-rate"].superseded_marked == 0
     async with sessions() as session:
         events = (
             (
@@ -139,7 +140,7 @@ async def test_backfill_batches_never_split_an_identity_and_resume_after(session
     )
     found = await links(sessions)
     assert found[ids["sedentary-15"]] == (ids["sedentary-45"], "growing-interval")
-    assert found[ids["renamed-old"]] == (ids["renamed-new"], "display-name-change")
+    assert ids["renamed-old"] not in found  # marked deleted: not linked across fingerprints
     assert ("heart-rate", T0 + timedelta(minutes=9)) in progress
     # Resuming at a later start does not revisit (or count) earlier rows.
     resumed = await identity_backfill(
@@ -316,18 +317,16 @@ async def test_backfill_counts_only_links_it_inserted_and_genuine_deletions(
     from app.services import identity_backfill as backfill
 
     day = timedelta(days=1)
-    renamed_old = await legacy(sessions, HEART, heart(60), T0, deleted=T0 + day)
+    renamed_old = await legacy(sessions, HEART, heart(60), T0)
     await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + day)
-    both_old = await legacy(
-        sessions, HEART, heart(62, at=T0 + timedelta(minutes=2)), T0, deleted=T0 + day
-    )
+    both_old = await legacy(sessions, HEART, heart(62, at=T0 + timedelta(minutes=2)), T0)
     both_new = await legacy(
-        sessions,
-        HEART,
-        heart(62, at=T0 + timedelta(minutes=2), name=NEW_NAME),
-        T0 + day,
-        deleted=T0 + 2 * day,
+        sessions, HEART, heart(62, at=T0 + timedelta(minutes=2), name=NEW_NAME), T0 + day
     )
+    # Deleted under both names, and a lone deletion.
+    at = T0 + timedelta(minutes=4)
+    await legacy(sessions, HEART, heart(64, at=at), T0, deleted=T0 + day)
+    await legacy(sessions, HEART, heart(64, at=at, name=NEW_NAME), T0 + day, deleted=T0 + 2 * day)
     await legacy(sessions, HEART, heart(80, at=T0 + timedelta(minutes=9)), T0, deleted=T0 + day)
     original = backfill._write_plan
 

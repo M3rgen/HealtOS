@@ -957,6 +957,7 @@ async def _plan_batch(
             held = by_id.get(dependent)
             if (
                 held is not None
+                and not held.deleted
                 and (
                     held.identity.source == holder.identity.source
                     or measured(held) == measured(holder)
@@ -1004,6 +1005,8 @@ async def _plan_batch(
                     candidates,
                     key=lambda row: (
                         not row.deleted,
+                        # A growing interval: the end returned last holds the record.
+                        row.last_seen_at if row.identity.shape else _EPOCH,
                         row.identity.shape or "",
                         row.last_seen_at,
                         row.raw_id in pointed,
@@ -1015,13 +1018,19 @@ async def _plan_batch(
                     if row is not root:
                         join(row, root)
                 roots.append(root)
-            counted = [root for root in roots if root.raw_id not in hidden]
+            # A root marked deleted counts nowhere, and a link would keep it hidden when its
+            # record comes back with another value (a row of its own again, every time):
+            # only live roots are linked across fingerprints.
+            counted = [root for root in roots if root.raw_id not in hidden and not root.deleted]
             if len(counted) > 1:
                 holder = max(
                     counted,
                     key=lambda row: (
                         not row.deleted,
-                        # A growing interval: its latest shape holds the record.
+                        # A growing interval: the end returned last holds the record (an
+                        # end Google no longer returns is stale, longer or not), then the
+                        # longer one.
+                        row.last_seen_at if row.identity.shape else _EPOCH,
                         row.identity.shape or "",
                         sum((other.raw_id, row.raw_id) in existing for other in counted),
                         row.raw_id in pointed,

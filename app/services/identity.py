@@ -691,15 +691,16 @@ def _link_written(
     record: all but one are superseded at once, so it is counted once. The one that holds
     the others is a row this page writes (the row Google returned now: a later value under
     its name is written onto it, never hidden behind a stale one), of the device's newest
-    form, then the longer end. A link that would close a cycle of links is left out (both
-    count; the reconciler lists it)."""
+    form. A growing interval is the same only with the same end: one with another end is
+    a value no longer returned, marked by the complete fetch (app/sync/deletions.py), and a
+    link would keep this fingerprint's row hidden when that end comes back. A link that
+    would close a cycle of links is left out (both count; the reconciler lists it)."""
     chains = page.chains
     spans = chains.spans
-    newly: dict[tuple[str, str, str | None], list[tuple[_Group, StoredRow | None]]] = defaultdict(
-        list
-    )
+    newly: dict[tuple, list[tuple[_Group, StoredRow | None]]] = defaultdict(list)
     for group, row in written:
-        newly[(group.key, chains.device(group.source), group.reading)].append((group, row))
+        shown = (group.reading, group.identity.shape)
+        newly[(group.key, chains.device(group.source), shown)].append((group, row))
     for (key, device, value), entries in sorted(newly.items(), key=lambda item: item[0][:2]):
         # google id -> (fingerprint, end, stored row or None, the page's group or None)
         members: dict[str, tuple[str, str | None, StoredRow | None, _Group | None]] = {}
@@ -711,7 +712,7 @@ def _link_written(
                 or other.identity is None
                 or chains.device(other.identity.source) != device
                 or not page.counted(other)
-                or page.shown(other)[0] != value
+                or page.shown(other) != value
             ):
                 continue
             writer = page.claimed.get(other.raw_id)
@@ -721,10 +722,10 @@ def _link_written(
             continue
 
         def rank(item) -> tuple:
-            google_id, (source, shape, _, group) = item
+            google_id, (source, _, _, group) = item
             span = spans.get(source)
             first = span.first.isoformat() if span is not None else ""
-            return (group is not None, first, shape or "", google_id)
+            return (group is not None, first, google_id)
 
         holder_id, (holder_source, _, holder_row, holder_group) = max(members.items(), key=rank)
         if holder_group is not None:
