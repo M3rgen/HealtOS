@@ -999,8 +999,9 @@ class SourceState:
     """What a page needs to know about its sources (one statement)."""
 
     chains: Chains
-    # Fingerprints of the page that already have a sighting.
+    # Fingerprints of the page that already have a sighting, and when they were first seen.
     known: set[str] = field(default_factory=set)
+    first_seen: dict[str, datetime] = field(default_factory=dict)
     # A fingerprint first seen now covers the archive (a full run built the data type's
     # spans, or it has no rows yet).
     history_known: bool = False
@@ -1096,7 +1097,7 @@ async def load_state(
                 literal("", String),
                 literal("", String),
                 zero,
-                never,
+                sighting.first_seen_at,
             ).where(sighting.data_type == data_type, sighting.fingerprint.in_(seen))
         )
         complete = select(sighting.fingerprint).where(
@@ -1132,6 +1133,7 @@ async def load_state(
             devices.append((number, first, second))
         elif kind == "s":
             state.known.add(first)
+            state.first_seen[first] = as_utc(at)
         elif kind == "h":
             state.history_known = True
         elif kind == "g":

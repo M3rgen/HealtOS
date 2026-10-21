@@ -696,7 +696,7 @@ def _link_written(
     link would keep this fingerprint's row hidden when that end comes back. A link that
     would close a cycle of links is left out (both count; the reconciler lists it)."""
     chains = page.chains
-    spans = chains.spans
+    first_seen = resolution.state.first_seen if resolution.state is not None else {}
     newly: dict[tuple, list[tuple[_Group, StoredRow | None]]] = defaultdict(list)
     for group, row in written:
         shown = (group.reading, group.identity.shape)
@@ -723,9 +723,9 @@ def _link_written(
 
         def rank(item) -> tuple:
             google_id, (source, _, _, group) = item
-            span = spans.get(source)
-            first = span.first.isoformat() if span is not None else ""
-            return (group is not None, first, google_id)
+            # A fingerprint first seen in this page is the newest form of all.
+            first = first_seen.get(source)
+            return (group is not None, first.isoformat() if first else "~", google_id)
 
         holder_id, (holder_source, _, holder_row, holder_group) = max(members.items(), key=rank)
         if holder_group is not None:
