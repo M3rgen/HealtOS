@@ -4,8 +4,8 @@ Records that Google sends without a `name` were archived under a synthetic id th
 raw interval object and the whole `dataSource`. A device rename, a dropped `.<UUID>` package
 suffix, civil times added to `interval` and a growing in-progress interval each made the same
 record a new row (see app/parsers/identity.py for the v2 key that replaces it). Existing rows
-cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds seven
-append-only tables, a widen-only one and a bookkeeping one:
+cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds eight
+append-only tables, a widen-only one and bookkeeping ones:
 
 * `raw_health_data_identity`: fingerprint-specific v2 key -> the raw row that holds the
   record, for rows whose own id does not say so (rows stored before 0012). New writes find a
@@ -24,16 +24,22 @@ append-only tables, a widen-only one and a bookkeeping one:
 * `raw_source_pairs`: a key returned in one response under two fingerprints with two
   different readings (evidence of two distinct sources).
 * `raw_source_decisions`: the owner's decisions about two fingerprints.
-* `raw_source_sightings` (widen-only): first and last sighting of each fingerprint.
-* `identity_reconcile_state` (bookkeeping): the reconciler's checkpoint per data type.
+* `raw_source_agreements`: per pair of fingerprints with evidence of two devices and per key
+  both hold, whether they hold the same reading (appended when that changes).
+* `raw_source_sightings` (widen-only): first and last sighting of each fingerprint, and the
+  newest record time it returned.
+* `identity_reconcile_state` (bookkeeping): the reconciler's checkpoint per data type, the
+  agreement counts and any re-settlement still owed.
+* `identity_deferred_deletions` (bookkeeping): rows whose deletion a complete fetch deferred,
+  until a later one decides them.
 
 It also adds `fetch_rounds` (bookkeeping): when a sync round or a backfill window fetch began
 at its first page, kept when the fetch resumes from its page token.
 
-The seven append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
+The eight append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
 triggers calling 0011's `healthos_refuse_change()`); the sightings refuse `DELETE`,
-`TRUNCATE` and any `UPDATE` that narrows a span or changes anything but the span and
-`complete` (`healthos_sightings_widen_only()`).
+`TRUNCATE` and any `UPDATE` that narrows a span or changes anything but the span, the newest
+record time (later only) and `complete` (`healthos_sightings_widen_only()`).
 `health-mirror verify` checks them, their constraints, that no rule or row-level security
 sits on them and that the `analytics_*` views are these. On PostgreSQL the `analytics_*`
 views are replaced (`CREATE OR REPLACE`, same columns) so they show what the dashboard
@@ -43,14 +49,23 @@ keeps the old views.
 
 Fast: empty tables, their indexes and triggers, view definitions, and one partial index on
 `raw_health_data` (its source-deleted rows, so the views never scan the whole table), built
-`CONCURRENTLY` first, in a step of its own outside the transaction (writers never wait for it;
-when it cannot finish within the lock timeout, the upgrade goes on without it and verify
-names it); no ALTER of an existing table, so a running pg_dump never blocks it.
-Filling them is `health-mirror identity-backfill`, run after the deploy (docs/RUNBOOK.md).
-Like 0011 it sets `lock_timeout` (30 s, `-x lock-timeout=...`): the foreign keys to
-`raw_health_data` need a SHARE ROW EXCLUSIVE lock on it (writers conflict, readers and
-pg_dump do not), and a lock held too long makes the upgrade fail fast, changing nothing,
-instead of queueing every writer behind it.
+`CONCURRENTLY` first, in a step of its own outside the transaction (writers never wait for it).
+It is only started while no other session of the database holds a transaction or snapshot
+open, and it is never given a timeout: a build that fails leaves an invalid index behind, so
+none is started that could, and a dump started meanwhile is waited for. Otherwise (or when an
+invalid copy exists) the upgrade goes on without it, printing the statement; verify notes it
+(and any invalid index on `raw_health_data`). No ALTER of an existing table, so a running
+pg_dump never blocks it. Filling the tables is `health-mirror identity-backfill`, run after the
+deploy (docs/RUNBOOK.md).
+
+The transaction creates the new tables first (no lock on anything existing), then, in one
+attempt that is retried every few hundred milliseconds until `lock_timeout` (30 s, `-x
+lock-timeout=...`): replaces the `analytics_*` views (each waits at most 100 ms for a reader of
+the view) and takes the SHARE ROW EXCLUSIVE lock on `raw_health_data` that the foreign keys
+need with `NOWAIT`. A failed attempt releases what it took (a savepoint) and waits before the
+next one, so neither writers nor readers queue behind the upgrade; once it holds both, the
+foreign keys are added and the transaction commits at once (writers wait milliseconds). When
+no attempt succeeds the upgrade fails, changing nothing.
 
 downgrade() refuses while an append-only table or the sightings have rows (dropping them
 would lose which duplicates were linked, which sources were chained, what the owner decided
@@ -61,6 +76,7 @@ compares them.
 """
 
 import re
+import time
 
 import sqlalchemy as sa
 from alembic import context, op
@@ -78,8 +94,10 @@ CHAIN_EVENT_TABLE = "raw_source_chain_events"
 PAIR_TABLE = "raw_source_pairs"
 DECISION_TABLE = "raw_source_decisions"
 DEVICE_TABLE = "raw_source_devices"
+AGREEMENT_TABLE = "raw_source_agreements"
 SIGHTING_TABLE = "raw_source_sightings"
 RECONCILE_TABLE = "identity_reconcile_state"
+DEFERRAL_TABLE = "identity_deferred_deletions"
 FETCH_ROUND_TABLE = "fetch_rounds"
 IDENTITY_TABLES = (
     IDENTITY_TABLE,
@@ -89,6 +107,7 @@ IDENTITY_TABLES = (
     PAIR_TABLE,
     DECISION_TABLE,
     DEVICE_TABLE,
+    AGREEMENT_TABLE,
 )
 # Source-deleted raw rows, for the analytics views (a partial index; the only object this
 # revision adds to an existing table).
@@ -107,6 +126,8 @@ BEGIN
        OR NEW.data_source IS DISTINCT FROM OLD.data_source
        OR NEW.first_seen_at > OLD.first_seen_at
        OR NEW.last_seen_at < OLD.last_seen_at
+       OR NEW.newest_record_at < OLD.newest_record_at
+       OR (OLD.newest_record_at IS NOT NULL AND NEW.newest_record_at IS NULL)
        OR (OLD.complete AND NOT NEW.complete) THEN
         RAISE EXCEPTION USING MESSAGE =
             '{SIGHTING_TABLE} only widens: ' || TG_OP || ' refused';
@@ -184,7 +205,9 @@ _SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
         "NEW.data_type IS NOT OLD.data_type OR NEW.fingerprint IS NOT OLD.fingerprint "
         "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.label IS NOT OLD.label "
         "OR NEW.data_source IS NOT OLD.data_source OR NEW.first_seen_at > OLD.first_seen_at "
-        "OR NEW.last_seen_at < OLD.last_seen_at OR (OLD.complete AND NOT NEW.complete)",
+        "OR NEW.last_seen_at < OLD.last_seen_at OR NEW.newest_record_at < OLD.newest_record_at "
+        "OR (OLD.newest_record_at IS NOT NULL AND NEW.newest_record_at IS NULL) "
+        "OR (OLD.complete AND NOT NEW.complete)",
     ),
 )
 POSTGRESQL_DDL = (
@@ -265,7 +288,25 @@ _IN_FORCE = (
 
 
 LOCK_TIMEOUT = "30s"
+# How long replacing one analytics view waits for a reader of it, per attempt.
+VIEW_LOCK_TIMEOUT = "100ms"
 _LOCK_NOT_AVAILABLE = "55P03"
+# The foreign keys to raw_health_data: (name, table, column). On PostgreSQL they are added
+# last, once the lock they need is held.
+FOREIGN_KEYS = (
+    ("fk_raw_health_data_identity_raw_id_raw_health_data", IDENTITY_TABLE, "raw_id"),
+    (
+        "fk_raw_health_data_supersessions_old_raw_id_raw_health_data",
+        SUPERSESSION_TABLE,
+        "old_raw_id",
+    ),
+    (
+        "fk_raw_health_data_supersessions_new_raw_id_raw_health_data",
+        SUPERSESSION_TABLE,
+        "new_raw_id",
+    ),
+    ("fk_identity_deferred_deletions_raw_id_raw_health_data", DEFERRAL_TABLE, "raw_id"),
+)
 
 
 def _lock_timeout() -> str:
@@ -273,6 +314,12 @@ def _lock_timeout() -> str:
     if not re.fullmatch(r"[1-9][0-9]*(ms|s|min)?", value):
         raise ValueError(f"lock-timeout must look like 30s, 500ms or 2min, not {value!r}")
     return value
+
+
+def _seconds(value: str) -> float:
+    found = re.fullmatch(r"([0-9]+)(ms|s|min)?", value)
+    assert found is not None
+    return int(found.group(1)) * {"ms": 0.001, "s": 1, "min": 60}[found.group(2) or "ms"]
 
 
 def upgrade() -> None:
@@ -287,23 +334,72 @@ def upgrade() -> None:
         return
     timeout = _lock_timeout()
     # First, outside any transaction: nothing of this revision exists if it fails.
-    _deleted_index(timeout)
-    op.execute(f"SET LOCAL lock_timeout = '{timeout}'")
-    try:
-        _upgrade("postgresql")
-    except sa.exc.DBAPIError as exc:
-        code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
-        if code != _LOCK_NOT_AVAILABLE:
-            raise
-        raise RuntimeError(
-            f"20261021_0012 could not lock its tables within {timeout}: another session holds "
-            "them (a long sync, backfill or import transaction writing raw_health_data). "
-            "Nothing was changed and the database is still on 20261020_0011 (a partial index "
-            f"{DELETED_INDEX} built before may remain; it changes no data, and the next "
-            "upgrade checks it); stop the app or retry when that session has finished (see "
-            "docs/RUNBOOK.md, 20261021_0012)."
-        ) from exc
-    op.execute("SET LOCAL lock_timeout TO DEFAULT")
+    _deleted_index()
+    # New tables only: nothing that exists is locked yet.
+    _upgrade("postgresql")
+    if context.is_offline_mode():
+        op.execute(f"SET LOCAL lock_timeout = '{timeout}'")
+        _views_and_foreign_keys()
+        op.execute("SET LOCAL lock_timeout TO DEFAULT")
+        return
+    _locked(timeout)
+    for name, table, column in FOREIGN_KEYS:
+        op.create_foreign_key(name, table, "raw_health_data", [column], ["id"])
+
+
+def _views_and_foreign_keys() -> None:
+    for table in NORMALIZED_TABLES:
+        op.execute(_view(table, current_only=True))
+    for name, table, column in FOREIGN_KEYS:
+        op.create_foreign_key(name, table, "raw_health_data", [column], ["id"])
+
+
+def _locked(timeout: str) -> None:
+    """Replace the analytics views and take the lock the foreign keys need, in one attempt
+    (a savepoint) retried until ``timeout``: each view waits at most ``VIEW_LOCK_TIMEOUT``
+    for its readers, and ``raw_health_data`` is locked with ``NOWAIT``. A failed attempt
+    releases everything it took, so no writer (and no reader for long) waits behind the
+    upgrade; the caller adds the foreign keys right after, under the lock."""
+    bind = op.get_bind()
+    deadline = time.monotonic() + _seconds(timeout)
+    pause, attempts = 0.05, 0
+    while True:
+        attempts += 1
+        try:
+            with bind.begin_nested():
+                bind.execute(sa.text(f"SET LOCAL lock_timeout = '{VIEW_LOCK_TIMEOUT}'"))
+                for table in NORMALIZED_TABLES:
+                    bind.execute(sa.text(_view(table, current_only=True)))
+                bind.execute(
+                    sa.text("LOCK TABLE raw_health_data IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+                )
+            return
+        except sa.exc.DBAPIError as exc:
+            code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+            if code != _LOCK_NOT_AVAILABLE:
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"20261021_0012 could not lock its tables within {timeout} ({attempts} "
+                    "attempts): another session kept writing raw_health_data (a long sync, "
+                    "backfill or import transaction) or reading an analytics_* view. Nothing "
+                    "was changed and the database is still on 20261020_0011 (the partial "
+                    f"index {DELETED_INDEX}, if it was built, changes no data); stop the app "
+                    "or retry when that session has finished (see docs/RUNBOOK.md, "
+                    "20261021_0012)."
+                ) from exc
+            time.sleep(pause)
+            pause = min(pause * 2, 0.5)
+        finally:
+            bind.execute(sa.text("SET LOCAL lock_timeout TO DEFAULT"))
+
+
+def _foreign_key(dialect: str, name: str, column: str) -> list:
+    """The foreign key ``name`` of ``column`` to raw_health_data inline (SQLite, which cannot
+    add one later); on PostgreSQL ``FOREIGN_KEYS`` are added once the lock is held."""
+    if dialect == "postgresql":
+        return []
+    return [sa.ForeignKeyConstraint([column], ["raw_health_data.id"], name=name)]
 
 
 def _upgrade(dialect: str) -> None:
@@ -319,11 +415,7 @@ def _upgrade(dialect: str) -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.ForeignKeyConstraint(
-            ["raw_id"],
-            ["raw_health_data.id"],
-            name="fk_raw_health_data_identity_raw_id_raw_health_data",
-        ),
+        *_foreign_key(dialect, "fk_raw_health_data_identity_raw_id_raw_health_data", "raw_id"),
         sa.PrimaryKeyConstraint("data_type", "identity_key", name="pk_raw_health_data_identity"),
     )
     op.create_table(
@@ -347,15 +439,11 @@ def _upgrade(dialect: str) -> None:
         sa.CheckConstraint(
             "old_raw_id <> new_raw_id", name=op.f("ck_raw_health_data_supersessions_distinct_rows")
         ),
-        sa.ForeignKeyConstraint(
-            ["old_raw_id"],
-            ["raw_health_data.id"],
-            name="fk_raw_health_data_supersessions_old_raw_id_raw_health_data",
+        *_foreign_key(
+            dialect, "fk_raw_health_data_supersessions_old_raw_id_raw_health_data", "old_raw_id"
         ),
-        sa.ForeignKeyConstraint(
-            ["new_raw_id"],
-            ["raw_health_data.id"],
-            name="fk_raw_health_data_supersessions_new_raw_id_raw_health_data",
+        *_foreign_key(
+            dialect, "fk_raw_health_data_supersessions_new_raw_id_raw_health_data", "new_raw_id"
         ),
         sa.PrimaryKeyConstraint(
             "old_raw_id", "new_raw_id", name="pk_raw_health_data_supersessions"
@@ -416,6 +504,7 @@ def _upgrade(dialect: str) -> None:
         sa.Column("data_source", raw_json, nullable=True),
         sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("newest_record_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("complete", sa.Boolean(), nullable=False),
         sa.Column(
             "updated_at",
@@ -537,7 +626,7 @@ def _upgrade(dialect: str) -> None:
         sa.Column("last_result", sa.Text(), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("pair_agreement", sa.Text(), nullable=True),
-        sa.Column("deferred_deletions", sa.Text(), nullable=True),
+        sa.Column("pending_settle", sa.Text(), nullable=True),
         sa.Column("runs", sa.Integer(), server_default="0", nullable=False),
         sa.Column(
             "updated_at",
@@ -546,6 +635,56 @@ def _upgrade(dialect: str) -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("data_type", name="pk_identity_reconcile_state"),
+    )
+    op.create_table(
+        AGREEMENT_TABLE,
+        sa.Column(
+            "id",
+            sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+            primary_key=True,
+            autoincrement=True,
+        ),
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("first_fingerprint", sa.String(64), nullable=False),
+        sa.Column("second_fingerprint", sa.String(64), nullable=False),
+        sa.Column("identity_key", sa.String(100), nullable=False),
+        sa.Column("same_reading", sa.Boolean(), nullable=False),
+        sa.Column("counted_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "first_fingerprint < second_fingerprint",
+            name=op.f("ck_raw_source_agreements_ordered"),
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_raw_source_agreements"),
+    )
+    op.create_index(
+        "ix_raw_source_agreements_key",
+        AGREEMENT_TABLE,
+        ["data_type", "identity_key", "first_fingerprint", "second_fingerprint", "id"],
+    )
+    op.create_table(
+        DEFERRAL_TABLE,
+        sa.Column("raw_id", sa.Uuid(), nullable=False),
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("fingerprint", sa.String(64), nullable=False),
+        sa.Column("returned_by", sa.String(64), nullable=False),
+        sa.Column("first_deferred_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_deferred_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
+        *_foreign_key(dialect, "fk_identity_deferred_deletions_raw_id_raw_health_data", "raw_id"),
+        sa.PrimaryKeyConstraint("raw_id", name="pk_identity_deferred_deletions"),
+    )
+    op.create_index(
+        "ix_identity_deferred_deletions_open",
+        DEFERRAL_TABLE,
+        ["data_type"],
+        postgresql_where=sa.text("resolved_at IS NULL"),
+        sqlite_where=sa.text("resolved_at IS NULL"),
     )
     # Not columns of sync_state / backfill_jobs: ALTER TABLE would need an exclusive lock that
     # a running pg_dump blocks.
@@ -558,20 +697,21 @@ def _upgrade(dialect: str) -> None:
     )
     for statement in POSTGRESQL_DDL if dialect == "postgresql" else SQLITE_DDL:
         op.execute(statement)
-    if dialect == "postgresql":
-        for table in NORMALIZED_TABLES:
-            op.execute(_view(table, current_only=True))
 
 
-def _deleted_index(timeout: str) -> None:
+def _deleted_index() -> None:
     """The partial index of source-deleted rows, built ``CONCURRENTLY`` (writers are never
-    blocked, however large the table) in its own non-transactional step. When another
-    session is writing, or has held a snapshot open for a while (a running ``pg_dump``),
-    the build would wait for it: it is not started, and left for later (``health-mirror
-    verify`` names it and the statement that builds it), since it only makes the
-    ``analytics_*`` views faster. A build that still has to wait gives up after
-    ``timeout``; an index left invalid by an interrupted build is built again by the next
-    upgrade (``REINDEX ... CONCURRENTLY``)."""
+    blocked, however large the table) in its own non-transactional step.
+
+    A concurrent build that fails (a timeout, a cancel) leaves an invalid index behind, so
+    none is started that could: only while no other session of this database holds a
+    transaction or a snapshot open (however briefly) or a lock on ``raw_health_data`` beyond
+    reading it, and with no lock timeout (a dump started during the build is waited for: the
+    writers are not). Otherwise, and when an index of that name exists already (valid, or
+    invalid from an interrupted build), it is left as it is: the upgrade goes on without it
+    (it only makes the ``analytics_*`` views faster) and prints the statement that builds it;
+    ``health-mirror verify`` notes it until then, and names any invalid index on
+    ``raw_health_data`` with the statement for it."""
     build = (
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {DELETED_INDEX} ON raw_health_data "
         "(data_type, google_data_point_id) WHERE source_deleted_at IS NOT NULL"
@@ -581,15 +721,28 @@ def _deleted_index(timeout: str) -> None:
             op.execute(build)
             return
         bind = op.get_bind()
-        # A build that would have to wait (for a writing transaction, or a snapshot open for
-        # a while such as a running dump's) is not started at all: interrupted, it would
-        # leave an invalid index. A short read is waited for.
+        valid = bind.scalar(
+            sa.text(
+                "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = current_schema() AND c.relname = :name"
+            ),
+            {"name": DELETED_INDEX},
+        )
+        if valid is True:
+            return
+        if valid is False:
+            print(
+                f"20261021_0012: an invalid {DELETED_INDEX} exists (an interrupted build); it "
+                "is left as it is and the upgrade goes on without it. When no dump or long "
+                f"transaction runs: REINDEX INDEX CONCURRENTLY {DELETED_INDEX} (docs/RUNBOOK.md)."
+            )
+            return
         busy = bind.scalar(
             sa.text(
                 "SELECT count(*) FROM pg_stat_activity a WHERE a.pid <> pg_backend_pid() "
                 "AND a.datname = current_database() "
-                "AND (a.backend_xid IS NOT NULL OR (a.backend_xmin IS NOT NULL "
-                "AND a.xact_start < clock_timestamp() - interval '5 seconds') "
+                "AND (a.backend_xid IS NOT NULL OR a.backend_xmin IS NOT NULL "
                 "OR EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid "
                 "AND l.relation = 'raw_health_data'::regclass AND l.mode <> 'AccessShareLock'))"
             )
@@ -597,33 +750,18 @@ def _deleted_index(timeout: str) -> None:
         if busy:
             print(
                 f"20261021_0012: {DELETED_INDEX} is left for later ({busy} other session(s) "
-                "write, or hold a snapshot open for a while such as a dump's; building it "
-                "now would wait for them). The upgrade goes on without it; build it later with "
-                f"{build} (docs/RUNBOOK.md)."
+                "hold a transaction or snapshot open, such as a dump's; a concurrent build "
+                "would wait for them, and one that fails leaves an invalid index). The upgrade "
+                f"goes on without it; build it later with {build} (docs/RUNBOOK.md)."
             )
             return
-        bind.execute(sa.text(f"SET lock_timeout = '{timeout}'"))
+        print(
+            f"20261021_0012: building {DELETED_INDEX} concurrently (writers are not blocked; a "
+            "dump started meanwhile is waited for)."
+        )
+        bind.execute(sa.text("SET lock_timeout = 0"))
         try:
             bind.execute(sa.text(build))
-            valid = bind.scalar(
-                sa.text(
-                    "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE n.nspname = current_schema() AND c.relname = :name"
-                ),
-                {"name": DELETED_INDEX},
-            )
-            if valid is False:
-                bind.execute(sa.text(f"REINDEX INDEX CONCURRENTLY {DELETED_INDEX}"))
-        except sa.exc.DBAPIError as exc:
-            code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
-            if code != _LOCK_NOT_AVAILABLE:
-                raise
-            print(
-                f"20261021_0012: {DELETED_INDEX} could not be built within {timeout} (a writer "
-                "or a dump was running); the upgrade goes on without it. Build it later with "
-                f"REINDEX INDEX CONCURRENTLY {DELETED_INDEX} (docs/RUNBOOK.md)."
-            )
         finally:
             bind.execute(sa.text("RESET lock_timeout"))
 
@@ -661,6 +799,8 @@ def downgrade() -> None:
             op.execute(_view(table, current_only=False))
     # Dropping a table drops its triggers; healthos_refuse_change() belongs to 0011.
     op.drop_table(FETCH_ROUND_TABLE)
+    op.drop_table(DEFERRAL_TABLE)
+    op.drop_table(AGREEMENT_TABLE)
     op.drop_table(RECONCILE_TABLE)
     op.drop_table(DEVICE_TABLE)
     op.drop_table(DECISION_TABLE)

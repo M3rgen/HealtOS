@@ -76,6 +76,9 @@ from app.services.source_chains import (
 logger = logging.getLogger(__name__)
 
 MIN_PREFIX = 6
+# How long a decision waits for a reconciler run (or another decision) holding the single-run
+# lock before it is refused.
+DECISION_WAIT = 60.0
 
 
 class DecisionRefused(ValueError):
@@ -176,6 +179,19 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
                     f"{second[:12]} already continues {earlier[:12]} (a live chain): reject "
                     "that chain first"
                 )
+            elif chains.reaches(second, first):
+                # The live chain from ``second`` already leads back to ``first``.
+                path, current = [second], second
+                while current != first and len(path) <= source_chains.MAX_CHAIN:
+                    current = following[current]
+                    path.append(current)
+                step = (path[-2], path[-1])
+                reason = (
+                    f"{second[:12]} already leads to {first[:12]} through live chains ("
+                    + " -> ".join(name[:12] for name in path)
+                    + f"), so this would close a cycle: reject the chain {step[0][:12]} -> "
+                    f"{step[1][:12]} (or the wrong one of that path) first"
+                )
             else:
                 reason = "; ".join(problems)
             raise DecisionRefused(f"the chains would no longer be chains: {reason}")
@@ -240,6 +256,7 @@ class Outcome:
                     "kept_apart",
                     "review_distinct",
                     "refuted",
+                    "left_to_reconciler",
                 )
             },
         }
@@ -275,6 +292,7 @@ async def decide_sources(
     statement_timeout: str = STATEMENT_TIMEOUT,
     progress=None,
     notice: Notice | None = None,
+    wait: float = DECISION_WAIT,
 ) -> Outcome:
     """Record and apply one owner decision (see the module docstring). Raises
     ``DecisionRefused`` (nothing written) or ``BackfillRunning``."""
@@ -328,7 +346,7 @@ async def decide_sources(
             decision_id=outcome.decision_id,
         )
 
-    async with backfill_lock(sessions, dry_run=dry_run):
+    async with backfill_lock(sessions, dry_run=dry_run, purpose="identity-decide", wait=wait):
         outcome.stats = await relink_data_type(
             sessions,
             data_type,

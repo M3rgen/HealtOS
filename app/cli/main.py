@@ -43,9 +43,11 @@ def status() -> None:
             )
             from app.models.identity import IdentityReconcileState
             from app.services.identity import identity_tables_missing
+            from app.sync.deletions import deferred_deletions
 
             identity = []
             open_chains: list[dict] = []
+            deferred: list[dict] = []
             if not await identity_tables_missing(session):
                 identity = (
                     await session.scalars(
@@ -53,6 +55,7 @@ def status() -> None:
                     )
                 ).all()
                 open_chains = await _chains_to_review(session)
+                deferred = await deferred_deletions(session)
             return {
                 "raw_records": raw_count,
                 "sync": [
@@ -84,11 +87,7 @@ def status() -> None:
                 "identity_review_suggested": open_chains,
                 # Deletions complete fetches left undecided: a source that may be the
                 # record's device renamed returned its reading (identity-decide).
-                "identity_deferred_deletions": [
-                    {"data_type": row.data_type, **json.loads(row.deferred_deletions)}
-                    for row in identity
-                    if row.deferred_deletions
-                ],
+                "identity_deferred_deletions": deferred,
             }
 
     typer.echo(json.dumps(run(command()), indent=2))

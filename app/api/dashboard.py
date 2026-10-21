@@ -15,7 +15,7 @@ from app.api.deps import require_job_request
 from app.core.timeutil import as_utc
 from app.db.session import get_session
 from app.models.health import ExerciseSession, SleepSession, Steps
-from app.models.identity import held_elsewhere
+from app.models.identity import held_elsewhere, plan_each_query
 from app.models.manual import ManualMeasurement, ManualWorkout
 from app.models.state import RawHealthData
 from app.services.dashboard import dashboard_data
@@ -83,6 +83,7 @@ async def workouts(
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     zone = check_zone(timezone)
+    await plan_each_query(session)
     current = datetime.now(zone).date()
     first = (month or current).replace(day=1)
     if first > current:
@@ -155,6 +156,7 @@ async def metric_history(
 ) -> dict:
     """Thirty civil days per page, newest first, through the full valid archive."""
     zone = check_zone(timezone)
+    await plan_each_query(session)
     today = datetime.now(zone).date()
     source_type, value_key = {
         "steps": ("steps", "steps"),

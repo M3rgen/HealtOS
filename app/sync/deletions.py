@@ -33,13 +33,11 @@ waits for a writer, and a writer never waits for it in a circle.
 
 from __future__ import annotations
 
-import json
 import logging
-from collections import Counter
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, select, tuple_, update
+from sqlalchemy import CursorResult, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute, aliased
 
@@ -66,47 +64,117 @@ CHUNK = 2000
 async def _note_deferred(
     session: AsyncSession,
     data_type: str,
-    chains,
-    pairs: Counter,
-    window: tuple,
+    deferred: dict,
+    column,
+    window: tuple[datetime, datetime],
     now: datetime,
 ) -> None:
-    """Keep what this complete fetch deferred (``identity_reconcile_state``, shown by
-    ``health-mirror status`` and every reconciler run) until a later complete fetch of a
-    window that covers it defers nothing, or defers something else."""
-    from app.models.identity import IdentityReconcileState
-    from app.services.identity import deferred_summary, identity_tables_missing
+    """Keep what this complete fetch deferred, row by row (``identity_deferred_deletions``,
+    shown by ``health-mirror status`` and every reconciler run), and resolve every open
+    deferral of a row in its window that it did not defer again (marked, kept, or returned):
+    a later fetch of another window never hides what an earlier one deferred."""
+    from app.models.identity import IdentityDeferredDeletion as Deferral
+    from app.services.identity import identity_tables_missing
+    from app.services.storage import dialect_insert
 
     if await identity_tables_missing(session):
         return
-    state = await session.get(IdentityReconcileState, data_type)
-    previous = json.loads(state.deferred_deletions) if state and state.deferred_deletions else None
-    lower, upper = (
-        value.isoformat() if hasattr(value, "isoformat") else str(value) for value in window
-    )
-    if not pairs:
-        if previous is None or not (
-            lower <= previous["window"][0] and previous["window"][1] <= upper
-        ):
-            return
-        value = None
-    else:
-        value = json.dumps(
-            {
-                "at": now.isoformat(),
-                "window": [lower, upper],
-                "deferred": sum(pairs.values()),
-                "sources": [
-                    {**entry, "at": now.isoformat()} for entry in deferred_summary(chains, pairs)
-                ],
+    if deferred:
+        table = Deferral.__table__
+        statement = dialect_insert(session, table)
+        statement = statement.on_conflict_do_update(
+            index_elements=["raw_id"],
+            set_={
+                "fingerprint": statement.excluded.fingerprint,
+                "returned_by": statement.excluded.returned_by,
+                "last_deferred_at": statement.excluded.last_deferred_at,
+                "resolved_at": None,
             },
-            sort_keys=True,
         )
-    if state is None:
-        state = IdentityReconcileState(data_type=data_type, runs=0)
-        session.add(state)
-    state.deferred_deletions = value
-    await session.flush()
+        values = [
+            {
+                "raw_id": raw_id,
+                "data_type": data_type,
+                "fingerprint": fingerprint,
+                "returned_by": other,
+                "first_deferred_at": now,
+                "last_deferred_at": now,
+                "resolved_at": None,
+            }
+            for raw_id, (fingerprint, other) in sorted(
+                deferred.items(), key=lambda item: str(item[0])
+            )
+        ]
+        for offset in range(0, len(values), 1000):
+            await session.execute(statement, values[offset : offset + 1000])
+    lower, upper = window
+    in_window = select(RawHealthData.id).where(
+        RawHealthData.data_type == data_type, column >= lower, column < upper
+    )
+    conditions = [
+        Deferral.data_type == data_type,
+        Deferral.resolved_at.is_(None),
+        Deferral.raw_id.in_(in_window),
+    ]
+    if deferred:
+        conditions.append(~among(session, Deferral.raw_id, sorted(deferred, key=str)))
+    await session.execute(
+        update(Deferral)
+        .where(*conditions)
+        .values(resolved_at=now)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def deferred_deletions(session: AsyncSession, data_type: str | None = None) -> list[dict]:
+    """The deletions complete fetches deferred and no later one decided: per data type and
+    pair of sources, how many rows, since when and when last deferred."""
+    from app.models.identity import IdentityDeferredDeletion as Deferral
+    from app.services.identity import identity_tables_missing
+    from app.services.source_chains import load_chains
+
+    if await identity_tables_missing(session):
+        return []
+    query = (
+        select(
+            Deferral.data_type,
+            Deferral.fingerprint,
+            Deferral.returned_by,
+            func.count(),
+            func.min(Deferral.first_deferred_at),
+            func.max(Deferral.last_deferred_at),
+        )
+        .where(Deferral.resolved_at.is_(None))
+        .group_by(Deferral.data_type, Deferral.fingerprint, Deferral.returned_by)
+    )
+    if data_type is not None:
+        query = query.where(Deferral.data_type == data_type)
+    rows = (await session.execute(query)).tuples().all()
+    chains = {}
+    found = []
+    rows = sorted(rows, key=lambda row: (row[0], -row[3]))
+    for name, fingerprint, other, count, since, last in rows:
+        if name not in chains:
+            chains[name] = await load_chains(session, name, [fingerprint, other])
+
+        def label(source: str, name=name) -> str:
+            span = chains[name].spans.get(source)
+            return span.label if span is not None else source[:12]
+
+        found.append(
+            {
+                "data_type": name,
+                "rows_of": label(fingerprint),
+                "returned_by": label(other),
+                "fingerprints": [fingerprint[:12], other[:12]],
+                "deferred": count,
+                "since": since.isoformat() if since else None,
+                "at": last.isoformat() if last else None,
+                "decide": "identity-decide distinct (two devices: mark them) or not-distinct "
+                "and link (one device renamed)",
+            }
+        )
+    return found
 
 
 def deletion_scope(
@@ -186,7 +254,8 @@ async def mark_source_deletions(
         .exists()
     )
     marked = kept = deferred = 0
-    pairs: Counter = Counter()
+    # Raw id -> (its fingerprint, the source that returned its reading).
+    deferrals: dict = {}
     now = datetime.now(UTC)
     cursor: tuple | None = None
     chains = await load_chains(session, spec.name)
@@ -217,7 +286,7 @@ async def mark_source_deletions(
         )
         kept += len(presence.present)
         deferred += len(presence.deferred)
-        pairs.update(presence.deferred_pairs)
+        deferrals.update(presence.deferred_by)
         spared = presence.present | presence.deferred
         ids = [raw_id for raw_id, _, _, _ in chunk if raw_id not in spared]
         if ids and postgresql:
@@ -248,7 +317,7 @@ async def mark_source_deletions(
         # Possibly renamed: the reconciler or the owner decides (identity-backfill, nightly;
         # identity-decide).
         event(logger, "SOURCE_DELETIONS_DEFERRED", data_type=spec.name, count=deferred)
-    await _note_deferred(session, spec.name, chains, pairs, (lower, upper), now)
+    await _note_deferred(session, spec.name, deferrals, column, (lower, upper), now)
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked

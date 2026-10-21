@@ -83,8 +83,8 @@ async def test_an_unknown_fingerprint_gets_a_row_of_its_own(sessions, clock) -> 
 
 async def test_the_reconciler_ends_double_counting_and_the_chain_is_applied(sessions, clock):
     """Archived before v2, then renamed: separate rows until the reconciler decides the chain
-    and links them; from then on the new name gets rows of its own, linked at once to the old
-    ones (a row never holds another source's payload)."""
+    and links them; from then on the new name gets rows of its own, which hold the old ones at
+    once (the row Google returned now counts; a row never holds another source's payload)."""
     old = await legacy(sessions, HEART, heart(60), T0)
     other = await legacy(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1)), T0)
     await identity_backfill(sessions)  # the full run after the deploy
@@ -102,14 +102,14 @@ async def test_the_reconciler_ends_double_counting_and_the_chain_is_applied(sess
         (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED", "reconciler")
     ]
     assert old in await superseded_ids(sessions)
-    # The decided chain is applied: the other record's new form gets a row of its own,
-    # linked at once to the archived row, which keeps only its own source's payloads.
+    # The decided chain is applied: the other record's new form gets a row of its own, which
+    # holds the archived row at once; that keeps only its own source's payloads.
     clock.advance(hours=1)
     stats = await store(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1), name=NEW_NAME))
     assert (stats.inserted, stats.updated, stats.versions_kept) == (1, 0, 0)
     assert await versions_of(sessions, other) == []
-    assert visible(await counted_rows(sessions)) == [(NEW_NAME, 60), (OLD_NAME, 61)]
-    assert len(await superseded_ids(sessions)) == 2  # counted once each, at once
+    assert visible(await counted_rows(sessions)) == [(NEW_NAME, 60), (NEW_NAME, 61)]
+    assert {old, other} == await superseded_ids(sessions)  # counted once each, at once
 
 
 async def test_a_decided_chain_links_the_new_form_and_keeps_the_archived_row_as_it_was(
@@ -330,7 +330,7 @@ async def test_marking_defers_while_a_rename_is_undecided(sessions, clock) -> No
 async def test_three_step_rename_chains_step_by_step(sessions, clock) -> None:
     """A -> B -> C, where B only ever returned new instants (it never met A's rows): each
     step satisfies the rule, so both links are decided; C's records get rows of their own,
-    linked at once to A's (which keep A's payloads only)."""
+    which hold A's at once (A's keep A's payloads only)."""
     old = await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
     await identity_backfill(sessions)
     clock.now = T0 + 5 * HOUR
@@ -347,7 +347,7 @@ async def test_three_step_rename_chains_step_by_step(sessions, clock) -> None:
     assert (stats.inserted, stats.updated) == (1, 0)
     rows = await raw_rows(sessions, HEART)
     assert [name_of(row) for row in rows if row.id == old] == [OLD_NAME]
-    assert [row.id for row in await counted_rows(sessions)][0] == old
+    assert old in await superseded_ids(sessions)
     assert len(await counted_rows(sessions)) == 3
 
 

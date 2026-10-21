@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
 
 from app.db.session import SessionLocal
-from app.models.identity import held_elsewhere
+from app.models.identity import held_elsewhere, plan_each_query
 from app.models.state import RawHealthData
 from app.services.dashboard import dashboard_data
 
@@ -66,6 +66,7 @@ HEALTH_TOOL = {
 async def read_health(arguments: dict) -> dict:
     query = ArchiveQuery.model_validate(arguments)
     async with SessionLocal() as session:
+        await plan_each_query(session)
         if query.action == "inventory":
             rows = await session.execute(
                 select(

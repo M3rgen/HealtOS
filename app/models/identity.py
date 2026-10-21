@@ -48,14 +48,24 @@ response alone, or the same old records returned again, never is (app/services/s
 ``raw_source_decisions`` records the owner's decisions about two fingerprints (link, reject or
 confirm a chain; mark a pair distinct or not distinct). The latest decision per question wins.
 
-These seven tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
-``ENABLE ALWAYS``). ``raw_source_sightings`` - when each source fingerprint was first and last
-seen, by the database clock - may only widen: no ``DELETE`` or ``TRUNCATE``, and an ``UPDATE``
-may only move ``first_seen_at`` earlier, ``last_seen_at`` later and ``complete`` to true (its
-key, class, label and ``dataSource`` never change). ``health-mirror verify`` checks all of
-these triggers like the ones of 0011.
+``raw_source_agreements`` records, per pair of fingerprints with evidence of two devices and per
+key both hold, whether some row of each holds the same reading (appended when that changes;
+the latest row per key is current). Counting the latest rows of a pair gives how many of its
+shared keys agree: counted per key, so a key counted again is never counted twice.
 
-``identity_reconcile_state`` is bookkeeping: per data type, how far the reconciler got.
+These eight tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
+``ENABLE ALWAYS``). ``raw_source_sightings`` - when each source fingerprint was first and last
+seen, by the database clock, and the newest record time it returned - may only widen: no
+``DELETE`` or ``TRUNCATE``, and an ``UPDATE`` may only move ``first_seen_at`` earlier,
+``last_seen_at`` and ``newest_record_at`` later and ``complete`` to true (its key, class, label
+and ``dataSource`` never change). ``health-mirror verify`` checks all of these triggers like
+the ones of 0011.
+
+``identity_reconcile_state`` is bookkeeping: per data type, how far the reconciler got, the
+agreement counts per pair (``raw_source_agreements`` summed; verify compares them) and any
+re-settlement a run or decision still owes. ``identity_deferred_deletions`` is bookkeeping too:
+one row per raw row whose deletion a complete fetch deferred, until a later complete fetch of
+its window decides it (``resolved_at``).
 
 The trigger SQL is duplicated, frozen, in the migration; tests/test_identity_keys.py compares
 the two.
@@ -84,6 +94,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
     tuple_,
 )
 from sqlalchemy.orm import Mapped, aliased, mapped_column
@@ -102,8 +113,10 @@ CHAIN_EVENT_TABLE = "raw_source_chain_events"
 PAIR_TABLE = "raw_source_pairs"
 DECISION_TABLE = "raw_source_decisions"
 DEVICE_TABLE = "raw_source_devices"
+AGREEMENT_TABLE = "raw_source_agreements"
 SIGHTING_TABLE = "raw_source_sightings"
 RECONCILE_TABLE = "identity_reconcile_state"
+DEFERRAL_TABLE = "identity_deferred_deletions"
 # The append-only tables of this revision.
 IDENTITY_TABLES = (
     IDENTITY_TABLE,
@@ -113,6 +126,7 @@ IDENTITY_TABLES = (
     PAIR_TABLE,
     DECISION_TABLE,
     DEVICE_TABLE,
+    AGREEMENT_TABLE,
 )
 # Every table whose rows verify protects (the sightings may only widen).
 GUARDED_TABLES = (*IDENTITY_TABLES, SIGHTING_TABLE)
@@ -354,16 +368,76 @@ class IdentityReconcileState(Base):
     # JSON summary of the last run (links, chains, ambiguous sources, rows read).
     last_result: Mapped[str | None] = mapped_column(Text)
     last_error: Mapped[str | None] = mapped_column(Text)
-    # JSON: per fingerprint pair of evidence, how many keys both held with the same reading and
-    # how many with two (app/services/source_chains.py, ``agreeing``), as last counted.
+    # JSON: per fingerprint pair of evidence, how many of the keys both hold agree (some row
+    # of each holds the same reading) and how many hold two readings, and whether every key
+    # both hold was counted (app/services/source_chains.py, ``agreeing``): the latest rows of
+    # raw_source_agreements summed, updated in the transaction that appends them.
     pair_agreement: Mapped[str | None] = mapped_column(Text)
-    # JSON: the deletions the last complete fetches left undecided (deferred) and why
-    # (app/sync/deletions.py), until the owner or the reconciler decides their sources.
-    deferred_deletions: Mapped[str | None] = mapped_column(Text)
+    # JSON: rows a run or a decision still has to settle again because devices changed (the
+    # pairs no longer one device, the earliest first sighting of pairs newly one), kept until
+    # that re-settlement finished, so an interrupted run resumes it.
+    pending_settle: Mapped[str | None] = mapped_column(Text)
     runs: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class RawSourceAgreement(Base):
+    """Whether the rows of two fingerprints (with evidence of two devices) of one key hold the
+    same reading, appended when that changes (the latest row per pair and key is current)."""
+
+    __tablename__ = AGREEMENT_TABLE
+    __table_args__ = (
+        PrimaryKeyConstraint("id"),
+        CheckConstraint("first_fingerprint < second_fingerprint", name="ordered"),
+        Index(
+            "ix_raw_source_agreements_key",
+            "data_type",
+            "identity_key",
+            "first_fingerprint",
+            "second_fingerprint",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True
+    )
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    first_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    second_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    identity_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    same_reading: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    counted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class IdentityDeferredDeletion(Base):
+    """A raw row whose deletion a complete fetch deferred (its reading came back under a source
+    that may be its device renamed), until a later complete fetch of its window decides it
+    (bookkeeping, not guarded; never deleted: ``resolved_at`` is set)."""
+
+    __tablename__ = DEFERRAL_TABLE
+    __table_args__ = (
+        Index(
+            "ix_identity_deferred_deletions_open",
+            "data_type",
+            postgresql_where=text("resolved_at IS NULL"),
+            sqlite_where=text("resolved_at IS NULL"),
+        ),
+    )
+
+    raw_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("raw_health_data.id"), primary_key=True)
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The row's fingerprint, and the one that returned its reading.
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    returned_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    first_deferred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_deferred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class RawSourceSighting(Base):
@@ -381,6 +455,9 @@ class RawSourceSighting(Base):
     data_source: Mapped[dict | None] = mapped_column(RawJSON)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The physical time of the newest record returned under it (a re-fetch of old records
+    # sights a source again without making it newer: a retired device stays retired).
+    newest_record_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The span covers the whole archive (identity-backfill built it, or the data type had no
     # rows when the fingerprint was first seen). Chains are only decided between complete
     # spans.
@@ -469,6 +546,14 @@ def held_elsewhere(raw_id):
     )
 
 
+async def plan_each_query(session) -> None:
+    """Plan every reader statement of this transaction with its own parameters (PostgreSQL):
+    a generic plan, which a long-lived connection switches to after five executions, cannot
+    use the bounds of ``in_force`` and of the time range, and reads many times more rows."""
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(text("SET LOCAL plan_cache_mode = force_custom_plan"))
+
+
 def key_held_elsewhere(data_type, google_data_point_id):
     """``held_elsewhere`` of the raw row with this data type and ``google_data_point_id``,
     found through the supersessions' ``(old_google_data_point_id, data_type)`` index: for a
@@ -522,6 +607,8 @@ BEGIN
        OR NEW.data_source IS DISTINCT FROM OLD.data_source
        OR NEW.first_seen_at > OLD.first_seen_at
        OR NEW.last_seen_at < OLD.last_seen_at
+       OR NEW.newest_record_at < OLD.newest_record_at
+       OR (OLD.newest_record_at IS NOT NULL AND NEW.newest_record_at IS NULL)
        OR (OLD.complete AND NOT NEW.complete) THEN
         RAISE EXCEPTION USING MESSAGE =
             '{SIGHTING_TABLE} only widens: ' || TG_OP || ' refused';
@@ -601,7 +688,9 @@ _SQLITE_TRIGGERS[f"{SIGHTING_TABLE}_widen_only"] = (
         "NEW.data_type IS NOT OLD.data_type OR NEW.fingerprint IS NOT OLD.fingerprint "
         "OR NEW.stable_class IS NOT OLD.stable_class OR NEW.label IS NOT OLD.label "
         "OR NEW.data_source IS NOT OLD.data_source OR NEW.first_seen_at > OLD.first_seen_at "
-        "OR NEW.last_seen_at < OLD.last_seen_at OR (OLD.complete AND NOT NEW.complete)",
+        "OR NEW.last_seen_at < OLD.last_seen_at OR NEW.newest_record_at < OLD.newest_record_at "
+        "OR (OLD.newest_record_at IS NOT NULL AND NEW.newest_record_at IS NULL) "
+        "OR (OLD.complete AND NOT NEW.complete)",
     ),
 )
 SQLITE_TRIGGER_SQL = dict(_SQLITE_TRIGGERS)

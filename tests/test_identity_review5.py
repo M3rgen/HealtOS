@@ -312,7 +312,7 @@ def test_status_lists_deferred_deletions(tmp_path, monkeypatch) -> None:
         status = json.loads(CliRunner().invoke(cli.app, ["status"]).stdout)
         [entry] = status["identity_deferred_deletions"]
         assert entry["data_type"] == "heart-rate" and entry["deferred"] == 1
-        assert entry["sources"][0]["fingerprints"] == [fp(A1)[:12], fp("Example Watch")[:12]]
+        assert entry["fingerprints"] == [fp(A1)[:12], fp("Example Watch")[:12]]
     finally:
         asyncio.run(engine.dispose())
 

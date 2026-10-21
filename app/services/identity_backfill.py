@@ -85,6 +85,7 @@ from app.models.identity import (
     IdentityReconcileState,
     RawHealthDataIdentity,
     RawHealthDataSupersession,
+    RawSourceAgreement,
 )
 from app.models.raw_versions import RawHealthDataEvent, RawHealthDataVersion
 from app.models.state import RawHealthData
@@ -113,6 +114,7 @@ from app.services.source_chains import (
     dump_agreement,
     gap_seconds,
     insert_chain,
+    key_time,
     load_chains,
     lock_data_type,
     ordered_pair,
@@ -191,11 +193,15 @@ class BackfillStats:
     returned: list[dict] = field(default_factory=list)
     # Pairs established distinct by evidence alone that look like a rename.
     review_distinct: list[dict] = field(default_factory=list)
+    # Chains an owner decision made possible, left to the next reconciler run.
+    left_to_reconciler: list[dict] = field(default_factory=list)
     # Deletions the last complete fetches left undecided, and the sources they wait for.
     deferred_deletions: list[dict] = field(default_factory=list)
     # Ordered pair of fingerprints with evidence -> [keys whose rows of both held the same
-    # reading, keys whose rows held two] among the keys this run settled.
+    # reading, keys whose rows held two] among the keys this run settled ...
     agreement: dict[tuple[str, str], list[int]] = field(default_factory=dict)
+    # ... and per (pair, key) whether they did (recorded in raw_source_agreements).
+    agreement_keys: dict[tuple[tuple[str, str], str], bool] = field(default_factory=dict)
     # Why an incremental run did nothing, or did a full pass instead.
     skipped: str | None = None
     # The data type failed (the run went on with the others).
@@ -210,6 +216,7 @@ class BackfillStats:
         "returned",
         "review_distinct",
         "deferred_deletions",
+        "left_to_reconciler",
     )
 
     def add(self, other: BackfillStats) -> None:
@@ -221,6 +228,9 @@ class BackfillStats:
                     counts = self.agreement.setdefault(pair, [0, 0])
                     counts[0] += agree
                     counts[1] += disagree
+            elif name == "agreement_keys":
+                # Per batch only (recorded with it): a full run's would be every key.
+                continue
             elif name in self._LISTS:
                 getattr(self, name).extend(getattr(other, name))
             elif name in ("mode", "skipped", "error"):
@@ -232,6 +242,7 @@ class BackfillStats:
         values = {name: getattr(self, name) for name in self.__dataclass_fields__}
         values["linked"] = dict(sorted(self.linked.items()))
         values["superseded"] = sum(self.linked.values())
+        values.pop("agreement_keys", None)
         values["agreement"] = [
             {"fingerprints": _fingerprints(*pair), "same_reading": agree, "two_readings": other}
             for pair, (agree, other) in sorted(self.agreement.items())
@@ -297,6 +308,7 @@ class _Row:
     deleted: bool
     identity: RecordIdentity
     payload_hash: str = ""
+    quarantined: bool = False
 
     @property
     def order(self) -> tuple:
@@ -317,6 +329,7 @@ _COLUMNS = (
     RawHealthData.source_deleted_at,
     RawHealthData.payload_received_at,
     RawHealthData.payload_hash,
+    RawHealthData.is_quarantined,
 )
 
 
@@ -419,7 +432,10 @@ async def _exclusively[T](
     raise LockUnavailable(
         f"{data_type}: could not get the identity lock (or a row it needs) in "
         f"{LOCK_ATTEMPTS} attempts (a long sync, deletion check or import of this data type "
-        "held it); nothing of this batch was written - run again later, it resumes"
+        "held it); nothing of this batch was written. Run again later: an incremental run (or "
+        "the next night's) settles everything since its checkpoint again and any re-settlement "
+        "a run or decision still owes (identity_reconcile_state.pending_settle); a full run "
+        "starts its passes over (--after skips the second pass up to a start time)"
     )
 
 
@@ -438,6 +454,7 @@ class _Timeline:
     evidence: dict[tuple[str, str], list[Evidence]] = field(default_factory=dict)
 
     def sight(self, identity: RecordIdentity, data_source, first, last) -> None:
+        newest = key_time(identity.key)
         span = self.spans.get(identity.source)
         if span is None:
             self.spans[identity.source] = Span(
@@ -447,9 +464,10 @@ class _Timeline:
                 source_label(data_source),
                 True,
                 data_source,
+                newest,
             )
         else:
-            span.widen(first, last)
+            span.widen(first, last, newest)
 
 
 def _together(
@@ -484,7 +502,7 @@ async def _timeline(
             row_keys: dict[uuid.UUID, tuple[str, datetime]] = {}
             sources: dict[str, set[str]] = defaultdict(set)
             stored: dict[str, list] = defaultdict(list)
-            for raw_id, _, raw_json, start, first, last, _, received, _ in batch:
+            for raw_id, _, raw_json, start, first, last, _, received, _, _ in batch:
                 identity = record_identity(spec, raw_json)
                 if google_name(raw_json) is not None or identity is None:
                     continue
@@ -655,7 +673,7 @@ async def _settle_chains(
             for fingerprint, span in timeline.spans.items():
                 stored = chains.spans.get(fingerprint)
                 if stored is not None:
-                    span.widen(stored.first, stored.last)
+                    span.widen(stored.first, stored.last, stored.newest)
                 chains.spans[fingerprint] = span
             for fingerprint in chains.spans:
                 chains.spans[fingerprint].complete = True
@@ -682,7 +700,23 @@ async def _settle_chains(
             chains._changed()
         else:
             refuted = await record_refutations(session, spec.name, chains, now)
-        decision = decide_chains(chains)
+        if apply is None:
+            decision = decide_chains(chains)
+        else:
+            # An owner decision records only itself: chains it makes possible are decided by
+            # the next reconciler run (and reviewed like any other), never inside it.
+            decision = decide_chains(chains.copy())
+            stats.left_to_reconciler.extend(
+                {
+                    "from": chains.spans[old].label,
+                    "to": chains.spans[new].label,
+                    "fingerprints": _fingerprints(old, new),
+                    "why": "the chain rule would link them now: left to the next reconciler run "
+                    "(identity-backfill --incremental, nightly), which lists it for review",
+                }
+                for old, new in decision.links
+            )
+            decision.links = []
         recorded: set[tuple[str, str]] = set()
         for old, new in decision.links:
             if dry_run:
@@ -736,6 +770,10 @@ async def _settle_chains(
             after = chains.members(name)
             change.lapsed.update(ordered_pair(name, other) for other in before - after)
             change.joined.update(ordered_pair(name, other) for other in after - before)
+        if not dry_run:
+            # Kept with the change itself, so a re-settlement that fails is resumed by the
+            # next run (cleared once it finished).
+            change = await _owe_settlement(session, spec.name, change)
         return chains, change
 
     return await _exclusively(sessions, spec.name, work, statement_timeout, notice, dry_run=dry_run)
@@ -748,6 +786,59 @@ class DeviceChange:
 
     lapsed: set[tuple[str, str]] = field(default_factory=set)
     joined: set[tuple[str, str]] = field(default_factory=set)
+
+    def __bool__(self) -> bool:
+        return bool(self.lapsed or self.joined)
+
+    def dump(self) -> str | None:
+        if not self:
+            return None
+        return json.dumps(
+            {"lapsed": sorted(map(list, self.lapsed)), "joined": sorted(map(list, self.joined))},
+            sort_keys=True,
+        )
+
+    @classmethod
+    def load(cls, value: str | None) -> DeviceChange:
+        try:
+            found = json.loads(value or "{}")
+            return cls(
+                {ordered_pair(*pair) for pair in found.get("lapsed", [])},
+                {ordered_pair(*pair) for pair in found.get("joined", [])},
+            )
+        except (ValueError, TypeError, AttributeError):
+            return cls()
+
+
+async def _reconcile_row(session: AsyncSession, data_type: str) -> IdentityReconcileState:
+    """The data type's bookkeeping row, locked (created when missing)."""
+    state = await session.get(IdentityReconcileState, data_type, with_for_update=True)
+    if state is None:
+        state = IdentityReconcileState(data_type=data_type, runs=0)
+        session.add(state)
+        await session.flush()
+    return state
+
+
+async def _owe_settlement(
+    session: AsyncSession, data_type: str, change: DeviceChange
+) -> DeviceChange:
+    """Add ``change`` to the re-settlement the data type still owes (a run that failed after
+    devices changed) and return all of it: settled by this run, cleared once it finished."""
+    state = await _reconcile_row(session, data_type)
+    owed = DeviceChange.load(state.pending_settle)
+    owed.lapsed |= change.lapsed
+    owed.joined |= change.joined
+    state.pending_settle = owed.dump()
+    return owed
+
+
+async def _settled(sessions: async_sessionmaker, data_type: str) -> None:
+    """The re-settlement owed is done."""
+    async with sessions.begin() as session:
+        state = await session.get(IdentityReconcileState, data_type, with_for_update=True)
+        if state is not None and state.pending_settle is not None:
+            state.pending_settle = None
 
 
 # --- pass 2: links ------------------------------------------------------------------------
@@ -834,7 +925,9 @@ async def _plan_batch(
         if chains.in_force(link.old_source, link.new_source):
             dependents[link.new].append(link.old)
             holder = by_id.get(link.new)
-            if holder is None or not holder.deleted:
+            # Hidden like readers see it (held_elsewhere): its holder is neither marked
+            # deleted nor quarantined.
+            if holder is None or not (holder.deleted or holder.quarantined):
                 hidden.add(link.old)
     pointed = set(dependents)
 
@@ -897,7 +990,7 @@ async def _plan_batch(
         if count_groups:
             if len(devices) > 1:
                 stats.distinct_sources += 1
-            _tally_agreement(spec, members, chains, stats)
+        _tally_agreement(spec, members, chains, stats)
         for device in devices.values():
             if count_groups:
                 stats.already_superseded += sum(row.raw_id in hidden for row in device)
@@ -974,12 +1067,17 @@ async def _plan_batch(
     return plan
 
 
-def _review_agreeing(chains: Chains, stats: BackfillStats) -> None:
-    """Pairs established distinct by evidence whose keys this run found mostly agreeing (a
-    rename with reprocessing): listed under ``review_distinct`` at once (the reconciler's
-    next run no longer takes them for two devices)."""
+def _review_agreeing(
+    chains: Chains,
+    stats: BackfillStats,
+    summary: dict[tuple[str, str], tuple[int, int, bool]],
+) -> None:
+    """Pairs established distinct by evidence whose shared keys mostly agree (a rename with
+    reprocessing; ``summary``: the counts over every key counted so far): listed under
+    ``review_distinct`` at once (the reconciler's next run no longer takes them for two
+    devices)."""
     listed = {tuple(entry["fingerprints"]) for entry in stats.review_distinct}
-    for pair, (agree, disagree) in sorted(stats.agreement.items()):
+    for pair, (agree, disagree, _) in sorted(summary.items()):
         left, right = pair
         if (
             agree < PAIR_KEYS
@@ -1004,21 +1102,203 @@ def _review_agreeing(chains: Chains, stats: BackfillStats) -> None:
 
 
 def _tally_agreement(
-    spec: DataTypeSpec, members: list[_Row], chains: Chains, stats: BackfillStats
+    spec: DataTypeSpec,
+    members: list[_Row],
+    chains: Chains,
+    stats: BackfillStats,
+    pairs: set[tuple[str, str]] | None = None,
 ) -> None:
-    """For every pair of fingerprints with evidence of two devices that both hold this key:
-    whether some row of each holds the same reading (agree) or not (disagree)."""
+    """For every pair of fingerprints with evidence of two devices (or of ``pairs``) that both
+    hold this key: whether some row of each holds the same reading (agree) or not. Noted per
+    key (``agreement_keys``), so a key counted again replaces its earlier count."""
     readings: dict[str, set[str | None]] = defaultdict(set)
     for row in members:
         readings[row.identity.source].add(reading(spec, row.raw_json))
     names = sorted(readings)
+    key = members[0].identity.key
     for position, left in enumerate(names):
         for right in names[position + 1 :]:
             pair = ordered_pair(left, right)
-            if pair not in chains.evidence:
+            if pair not in (chains.evidence if pairs is None else pairs):
                 continue
-            counts = stats.agreement.setdefault(pair, [0, 0])
-            counts[0 if readings[left] & readings[right] else 1] += 1
+            same = bool(readings[left] & readings[right])
+            if (pair, key) not in stats.agreement_keys:
+                counts = stats.agreement.setdefault(pair, [0, 0])
+                counts[0 if same else 1] += 1
+            stats.agreement_keys[(pair, key)] = same
+
+
+async def _record_agreement(
+    session: AsyncSession, data_type: str, found: dict[tuple[tuple[str, str], str], bool]
+) -> None:
+    """Append the per-key agreement that changed (``raw_source_agreements``) and move the
+    pair's counts (``identity_reconcile_state.pair_agreement``) by exactly that, in this
+    transaction: a key counted again counts once."""
+    if not found:
+        return
+    table = RawSourceAgreement
+    latest: dict[tuple[tuple[str, str], str], bool] = {}
+    for chunk in _chunked(sorted({key for _, key in found}), 5000):
+        rows = await session.execute(
+            select(
+                table.first_fingerprint,
+                table.second_fingerprint,
+                table.identity_key,
+                table.same_reading,
+            )
+            .where(table.data_type == data_type, among(session, table.identity_key, chunk))
+            .order_by(table.id)
+        )
+        for first, second, key, same in rows.tuples():
+            latest[((first, second), key)] = same
+    changed = {name: same for name, same in found.items() if latest.get(name) is not same}
+    if not changed:
+        return
+    now = await source_chains.database_now(session)
+    values = [
+        {
+            "data_type": data_type,
+            "first_fingerprint": first,
+            "second_fingerprint": second,
+            "identity_key": key,
+            "same_reading": same,
+            "counted_at": now,
+        }
+        for ((first, second), key), same in sorted(changed.items())
+    ]
+    for chunk in _chunked(values):
+        await session.execute(insert(table), list(chunk))
+    state = await _reconcile_row(session, data_type)
+    summary = parse_agreement(state.pair_agreement)
+    for (pair, key), same in changed.items():
+        agree, disagree, counted = summary.get(pair, (0, 0, False))
+        before = latest.get((pair, key))
+        agree += int(same) - int(before is True)
+        disagree += int(not same) - int(before is False)
+        summary[pair] = (agree, disagree, counted)
+    state.pair_agreement = dump_agreement(summary)
+
+
+async def _agreement_of(
+    sessions: async_sessionmaker, data_type: str
+) -> dict[tuple[str, str], tuple[int, int, bool]]:
+    async with sessions() as session:
+        state = await session.get(IdentityReconcileState, data_type)
+        return parse_agreement(state.pair_agreement if state is not None else None)
+
+
+async def _count_shared(
+    sessions: async_sessionmaker,
+    spec: DataTypeSpec,
+    *,
+    batch_size: int,
+    statement_timeout: str,
+) -> set[tuple[str, str]]:
+    """Count the agreement of every key shared by the pairs established distinct by evidence
+    whose keys were not all counted yet (evidence that appeared after the last full run): the
+    start times with rows of more than one source since the later of the two was first seen.
+    Before chains are refuted, so a refutation is judged on every key, never on a sample.
+    Reads rows and writes only the agreement bookkeeping (no data type lock). Returns the
+    pairs, now counted."""
+    async with sessions() as session:
+        chains = await load_chains(session, spec.name)
+    pairs = {
+        pair
+        for pair, items in chains.evidence.items()
+        if source_chains.established(items)
+        and not chains.agreement_counted(*pair)
+        and pair[0] in chains.spans
+        and pair[1] in chains.spans
+    }
+    if not pairs:
+        return set()
+    touched = (
+        min(max(chains.spans[left].first, chains.spans[right].first) for left, right in pairs)
+        - OVERLAP
+    )
+    starts = await _collect_starts(sessions, spec.name, since=None, touched=touched, lapsed=set())
+    step = max(1, batch_size // 10)
+    for offset in range(0, len(starts), step):
+        chunk = [_from_micros(value) for value in starts[offset : offset + step]]
+        async with sessions.begin() as session:
+            await _prepare(session, statement_timeout)
+            rows, mismatched = _rows_of(spec, await _rows_at(session, spec, chunk), None)
+            groups: dict[str, list[_Row]] = defaultdict(list)
+            for row in (*rows, *mismatched):
+                groups[row.identity.key].append(row)
+            stats = BackfillStats()
+            for members in groups.values():
+                _tally_agreement(spec, members, chains, stats, pairs)
+            await _record_agreement(session, spec.name, stats.agreement_keys)
+    await _mark_counted(sessions, spec.name, pairs)
+    return pairs
+
+
+async def _summed(session: AsyncSession, data_type: str) -> dict[tuple[str, str], tuple[int, int]]:
+    """The latest per-key agreement of each pair of the data type, summed."""
+    table = RawSourceAgreement
+    latest: dict[tuple[str, str, str], bool] = {}
+    result = await session.stream(
+        select(
+            table.first_fingerprint,
+            table.second_fingerprint,
+            table.identity_key,
+            table.same_reading,
+        )
+        .where(table.data_type == data_type)
+        .order_by(table.id)
+        .execution_options(yield_per=10_000)
+    )
+    async for first, second, key, same in result:
+        latest[(first, second, key)] = same
+    counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for (first, second, _), same in latest.items():
+        counts[(first, second)][0 if same else 1] += 1
+    return {pair: (agree, disagree) for pair, (agree, disagree) in counts.items()}
+
+
+async def _rows_at(session: AsyncSession, spec: DataTypeSpec, starts: Sequence[datetime]) -> list:
+    found = []
+    for chunk in _chunked(sorted(set(starts)), 2000):
+        found.extend(
+            (
+                await session.execute(
+                    select(*_COLUMNS).where(
+                        RawHealthData.data_type == spec.name,
+                        among(session, RawHealthData.source_start_time, chunk),
+                    )
+                )
+            )
+            .tuples()
+            .all()
+        )
+    return found
+
+
+async def _mark_counted(
+    sessions: async_sessionmaker,
+    data_type: str,
+    pairs: set[tuple[str, str]],
+    *,
+    recount: bool = False,
+) -> dict[tuple[str, str], tuple[int, int, bool]]:
+    """Every key of these pairs was counted (a full run, or the count of their shared keys);
+    returns the counts of the data type. ``recount`` (a full run): the counts are summed
+    again from raw_source_agreements first."""
+    async with sessions.begin() as session:
+        state = await _reconcile_row(session, data_type)
+        summary = parse_agreement(state.pair_agreement)
+        if recount:
+            summary = {
+                pair: (agree, disagree, summary.get(pair, (0, 0, False))[2])
+                for pair, (agree, disagree) in (await _summed(session, data_type)).items()
+            }
+        for pair in pairs:
+            agree, disagree, _ = summary.get(pair, (0, 0, False))
+            summary[pair] = (agree, disagree, True)
+        if summary:
+            state.pair_agreement = dump_agreement(summary)
+        return summary
 
 
 async def _write_plan(
@@ -1030,6 +1310,7 @@ async def _write_plan(
             stats.superseded_marked += row.deleted
         stats.aliases_added += len(plan.aliases)
         return
+    await _record_agreement(session, spec.name, stats.agreement_keys)
     if plan.aliases:
         values = [
             {
@@ -1128,7 +1409,7 @@ def _rows_of(
     """(rows to settle, rows whose stored start differs from the parsed one)."""
     rows: list[_Row] = []
     mismatched: list[_Row] = []
-    for raw_id, google_id, raw_json, start, first, last, deleted, _, digest in batch:
+    for raw_id, google_id, raw_json, start, first, last, deleted, _, digest, quarantined in batch:
         if stats is not None:
             stats.rows += 1
         if google_name(raw_json) is not None:
@@ -1149,6 +1430,7 @@ def _rows_of(
             deleted is not None,
             identity,
             digest,
+            bool(quarantined),
         )
         if instant(identity.start) != instant(start):
             mismatched.append(row)
@@ -1188,20 +1470,7 @@ async def _settle_starts(
 ) -> None:
     """Every row stored at one of ``starts``, plus the rows ``extra`` (by id: rows whose
     stored start is stale), settled together (keys of the extra rows only, then)."""
-    found = []
-    for chunk in _chunked(sorted(set(starts)), 2000):
-        found.extend(
-            (
-                await session.execute(
-                    select(*_COLUMNS).where(
-                        RawHealthData.data_type == spec.name,
-                        among(session, RawHealthData.source_start_time, chunk),
-                    )
-                )
-            )
-            .tuples()
-            .all()
-        )
+    found = await _rows_at(session, spec, starts)
     rows, mismatched = _rows_of(spec, found, stats if count else None)
     rows.extend(mismatched)
     if extra:
@@ -1221,14 +1490,10 @@ async def _settle_starts(
 
 
 async def _deferred_of(session: AsyncSession, data_type: str) -> list[dict]:
-    """The deletions the last complete fetches deferred (app/sync/deletions.py)."""
-    state = await session.get(IdentityReconcileState, data_type)
-    if state is None or not state.deferred_deletions:
-        return []
-    try:
-        return list(json.loads(state.deferred_deletions).get("sources", []))
-    except (ValueError, AttributeError):
-        return []
+    """The deletions complete fetches deferred that no later one decided (app/sync/deletions.py)."""
+    from app.sync.deletions import deferred_deletions
+
+    return await deferred_deletions(session, data_type)
 
 
 async def _reconcile_state(sessions: async_sessionmaker, data_type: str):
@@ -1260,13 +1525,6 @@ async def _save_state(
             state.last_mode = stats.mode
             state.last_result = json.dumps(stats.summary(), sort_keys=True)
             state.last_error = None
-            # The latest count per pair that this run saw often enough replaces the last.
-            agreement = parse_agreement(state.pair_agreement)
-            for pair, (agree, disagree) in stats.agreement.items():
-                if agree + disagree >= PAIR_KEYS:
-                    agreement[pair] = (agree, disagree)
-            if agreement:
-                state.pair_agreement = dump_agreement(agreement)
             if stats.skipped is None and checkpoint:
                 state.checkpoint_at = started
                 if stats.mode == "full":
@@ -1389,7 +1647,17 @@ async def backfill_data_type(
             )
         )
     total.unidentified += undated or 0
-    _review_agreeing(planned, total)
+    if dry_run:
+        summary = await _agreement_of(sessions, data_type)
+    else:
+        # Pass 2 counted every key of the pairs with evidence when it began (unless --after
+        # skipped some), and settled every row (so no re-settlement is owed).
+        summary = await _mark_counted(
+            sessions, data_type, set(planned.evidence) if after is None else set(), recount=True
+        )
+        if after is None:
+            await _settled(sessions, data_type)
+    _review_agreeing(planned, total, summary)
     if not dry_run:
         await _save_state(sessions, data_type, started=started, stats=total)
     return total
@@ -1438,7 +1706,9 @@ async def relink_data_type(
         progress=progress,
         notice=notice,
     )
-    _review_agreeing(planned, total)
+    if not dry_run:
+        await _settled(sessions, data_type)
+    _review_agreeing(planned, total, await _agreement_of(sessions, data_type))
     if not dry_run:
         await _save_state(sessions, data_type, started=started, stats=total, checkpoint=False)
     return total
@@ -1475,6 +1745,10 @@ async def reconcile_data_type(
     total = BackfillStats(mode="incremental")
     async with sessions() as session:
         started = await source_chains.database_now(session)
+    if not dry_run:
+        await _count_shared(
+            sessions, spec, batch_size=batch_size, statement_timeout=statement_timeout
+        )
     planned, change = await _settle_chains(
         sessions,
         spec,
@@ -1497,7 +1771,9 @@ async def reconcile_data_type(
         progress=progress,
         notice=notice,
     )
-    _review_agreeing(planned, total)
+    if not dry_run:
+        await _settled(sessions, data_type)
+    _review_agreeing(planned, total, await _agreement_of(sessions, data_type))
     if not dry_run:
         await _save_state(sessions, data_type, started=started, stats=total)
     return total
@@ -1519,7 +1795,8 @@ async def _settle_changed(
 ) -> None:
     """Settle again, batch by batch, the start times of
 
-    * rows created or given a new payload since ``since`` (an incremental run);
+    * rows created or given a new payload since ``since`` (an incremental run), and rows whose
+      deletion mark was cleared since then;
     * every row of a link between two fingerprints that are no longer one device (``lapsed``:
       a rejected or refuted chain, a ``distinct`` decision), whatever its age - its two sides
       are linked again within each device, so neither counts twice;
@@ -1588,6 +1865,19 @@ async def _collect_starts(
                 # or given a new payload since can need a link.
                 RawHealthData.updated_at >= since,
                 RawHealthData.payload_received_at >= since,
+                RawHealthData.source_start_time.is_not(None),
+            )
+        )
+        # A row whose deletion mark was cleared with its payload unchanged counts again: a
+        # link it needs is not left for a full run (raw_health_data_events, by trigger).
+        returned = RawHealthDataEvent
+        queries.append(
+            select(RawHealthData.source_start_time)
+            .join(returned, returned.raw_id == RawHealthData.id)
+            .where(
+                returned.data_type == data_type,
+                returned.event == "source-returned",
+                returned.occurred_at >= since,
                 RawHealthData.source_start_time.is_not(None),
             )
         )

@@ -169,10 +169,16 @@ class Span:
     label: str
     complete: bool
     data_source: object = None
+    # The physical time of the newest record returned under the fingerprint (a re-fetch of old
+    # records widens ``last`` but not this).
+    newest: datetime | None = None
 
-    def widen(self, first: datetime, last: datetime) -> None:
+    def widen(self, first: datetime, last: datetime, newest: datetime | None = None) -> None:
         self.first = min(self.first, as_utc(first))
         self.last = max(self.last, as_utc(last))
+        if newest is not None:
+            newest = as_utc(newest)
+            self.newest = newest if self.newest is None else max(self.newest, newest)
 
     def as_dict(self) -> dict:
         return {"first": self.first.isoformat(), "last": self.last.isoformat()}
@@ -271,8 +277,9 @@ class Chains:
     # Fingerprint -> its latest row in raw_source_devices (what readers use now).
     logged_devices: dict[str, str] = field(default_factory=dict)
     # Ordered fingerprint pair -> (keys whose rows of both hold the same reading, keys whose
-    # rows hold two readings), as the reconciler last counted them (identity_reconcile_state).
-    agreement: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
+    # rows hold two readings, whether every key both hold was counted): the latest rows of
+    # raw_source_agreements summed (identity_reconcile_state.pair_agreement).
+    agreement: dict[tuple[str, str], tuple[int, int, bool]] = field(default_factory=dict)
     # (from, to) -> the live links a link of the reconciler relied on (``live``).
     premises: dict[tuple[str, str], frozenset[tuple[str, str]]] = field(default_factory=dict)
 
@@ -342,13 +349,15 @@ class Chains:
 
     def refutable(self, old: str, new: str) -> bool:
         """A recorded link whose forms became established distinct by evidence, with no refuted
-        event yet and no owner decision about the pair."""
+        event yet and no owner decision about the pair - judged on every key both hold (never
+        on part of them: a night's sample can be all disagreement while the archive agrees)."""
         pair = ordered_pair(old, new)
         return (
             (old, new) in self.links
             and (old, new) not in self.refuted_events
             and pair not in self.pair_decisions
             and self.evidence_distinct(old, new)
+            and self.agreement_counted(old, new)
         )
 
     def _live_maps(self) -> tuple[dict[str, str], dict[str, str]]:
@@ -431,8 +440,12 @@ class Chains:
         """Most keys the two fingerprints share hold the same reading in both (at least
         ``PAIR_KEYS`` of them): one device returned again under another name (a rename with
         reprocessing), whatever a few keys with two values say."""
-        agree, disagree = self.agreement.get(ordered_pair(left, right), (0, 0))
+        agree, disagree, _ = self.agreement.get(ordered_pair(left, right), (0, 0, False))
         return agree >= PAIR_KEYS and agree >= disagree
+
+    def agreement_counted(self, left: str, right: str) -> bool:
+        """Every key the two fingerprints share was counted (``agreeing`` is not a sample)."""
+        return self.agreement.get(ordered_pair(left, right), (0, 0, False))[2]
 
     def evidence_distinct(self, left: str, right: str) -> bool:
         """Established by evidence (``established``), unless the keys they share mostly agree."""
@@ -527,9 +540,9 @@ class Chains:
     def certainly_distinct(self, left: str, right: str) -> bool:
         """For a deletion mark, which is permanent: these two fingerprints are established
         distinct by evidence between themselves (not through another form of their devices,
-        whose chain may be wrong) while their keys do not mostly agree and their sightings do
-        not merely touch, with no owner decision about them (``owner_decided_distinct`` is
-        asked separately)."""
+        whose chain may be wrong) while the keys they share - every one of them counted - do
+        not mostly agree and their sightings do not merely touch, with no owner decision about
+        them (``owner_decided_distinct`` is asked separately)."""
         if left == right:
             return False
         if ordered_pair(left, right) in self.pair_decisions:
@@ -537,6 +550,7 @@ class Chains:
         before, after = self.spans.get(left), self.spans.get(right)
         return (
             self.evidence_distinct(left, right)
+            and self.agreement_counted(left, right)
             and before is not None
             and after is not None
             and not back_to_back(before, after)
@@ -697,12 +711,26 @@ def decide_chains(chains: Chains) -> Decision:
             and len({item.key for item in chains.evidence.get(pair, ())}) >= PAIR_KEYS
         )
 
+    def retired_before(name: str, other: str) -> bool:
+        # Another device than ``other`` (established distinct) whose newest record is older
+        # than ``other``'s: it stopped recording first, so it is neither ``other``'s rival as a
+        # predecessor nor seen alongside a successor of ``other`` (its later sightings are
+        # re-fetches of its old records).
+        mine, theirs = spans[name].newest, spans[other].newest
+        return (
+            mine is not None
+            and theirs is not None
+            and mine + CHAIN_GAP < theirs
+            and chains.distinct(name, other)
+        )
+
     def blocks(other: str, old: str, new: str) -> bool:
-        # A source established distinct from one of them and apart from the other says
-        # nothing about old -> new.
+        # A source established distinct from one of them and apart from the other, or one
+        # that retired before ``old`` did, says nothing about old -> new.
         return not (
             (chains.distinct(other, old) and apart(other, new))
             or (chains.distinct(other, new) and apart(other, old))
+            or retired_before(other, old)
         )
 
     def kin(name: str, old: str, new: str) -> bool:
@@ -786,6 +814,14 @@ def decide_chains(chains: Chains) -> Decision:
                 and name not in chains.following
                 and not chains.distinct(name, new)
                 and spans[name].first < spans[new].first
+            ]
+            # A candidate that retired before another one that ended before this one appeared
+            # (two devices, the other kept recording after it) is not this one's earlier form.
+            ended_before = [name for name in earlier if spans[name].last < spans[new].first]
+            earlier = [
+                name
+                for name in earlier
+                if not any(retired_before(name, other) for other in ended_before if other != name)
             ]
             if not earlier:
                 continue
@@ -919,21 +955,29 @@ def parse_premise(value: str | None) -> frozenset[tuple[str, str]]:
         return frozenset()
 
 
-def parse_agreement(value: str | None) -> dict[tuple[str, str], tuple[int, int]]:
-    """``identity_reconcile_state.pair_agreement``: ``{"<first>|<second>": [agree, disagree]}``."""
+def parse_agreement(value: str | None) -> dict[tuple[str, str], tuple[int, int, bool]]:
+    """``identity_reconcile_state.pair_agreement``:
+    ``{"<first>|<second>": [agree, disagree, counted]}`` (``counted``: every shared key)."""
     try:
         found = json.loads(value or "{}")
         return {
-            ordered_pair(*name.split("|", 1)): (int(counts[0]), int(counts[1]))
+            ordered_pair(*name.split("|", 1)): (
+                int(counts[0]),
+                int(counts[1]),
+                bool(counts[2]) if len(counts) > 2 else False,
+            )
             for name, counts in found.items()
         }
     except (ValueError, TypeError, IndexError, AttributeError):
         return {}
 
 
-def dump_agreement(found: Mapping[tuple[str, str], tuple[int, int]]) -> str:
+def dump_agreement(found: Mapping[tuple[str, str], tuple[int, int, bool]]) -> str:
     return json.dumps(
-        {f"{first}|{second}": list(counts) for (first, second), counts in sorted(found.items())},
+        {
+            f"{first}|{second}": [counts[0], counts[1], bool(counts[2])]
+            for (first, second), counts in sorted(found.items())
+        },
         sort_keys=True,
     )
 
@@ -946,6 +990,7 @@ def _span(row: RawSourceSighting) -> Span:
         row.label,
         row.complete,
         row.data_source,
+        as_utc(row.newest_record_at) if row.newest_record_at is not None else None,
     )
 
 
@@ -1127,9 +1172,14 @@ def _upsert(session: AsyncSession, *, complete_wins: bool):
     statement = dialect_insert(session, table)
     postgresql = session.get_bind().dialect.name == "postgresql"
     lowest, highest = (func.least, func.greatest) if postgresql else (func.min, func.max)
+    newest, incoming = table.c.newest_record_at, statement.excluded.newest_record_at
     updates = {
         "first_seen_at": lowest(table.c.first_seen_at, statement.excluded.first_seen_at),
         "last_seen_at": highest(table.c.last_seen_at, statement.excluded.last_seen_at),
+        # Only ever later (SQLite's max() of a NULL is NULL: coalesced either way).
+        "newest_record_at": highest(
+            func.coalesce(newest, incoming), func.coalesce(incoming, newest)
+        ),
         "updated_at": statement.excluded.updated_at,
     }
     if complete_wins:
@@ -1142,14 +1192,15 @@ def _upsert(session: AsyncSession, *, complete_wins: bool):
 async def record_sightings(
     session: AsyncSession,
     data_type: str,
-    seen: Mapping[str, tuple[str, str, object]],
+    seen: Mapping[str, tuple[str, str, object, datetime | None]],
     at: datetime,
     *,
     history_known: bool,
 ) -> None:
-    """Note that the fingerprints ``seen`` (fingerprint -> stable class, label, dataSource)
-    were returned by Google at ``at`` (when the response was fetched). A fingerprint seen
-    for the first time is complete when ``history_known``."""
+    """Note that the fingerprints ``seen`` (fingerprint -> stable class, label, dataSource,
+    the physical time of its newest record in the page) were returned by Google at ``at``
+    (when the response was fetched). A fingerprint seen for the first time is complete when
+    ``history_known``."""
     if not seen:
         return
     values = [
@@ -1161,10 +1212,11 @@ async def record_sightings(
             "data_source": data_source,
             "first_seen_at": at,
             "last_seen_at": at,
+            "newest_record_at": newest,
             "complete": history_known,
             "updated_at": at,
         }
-        for fingerprint, (stable, label, data_source) in sorted(seen.items())
+        for fingerprint, (stable, label, data_source, newest) in sorted(seen.items())
     ]
     # Sorted, so two writers of one data type lock the rows in the same order.
     await session.execute(_upsert(session, complete_wins=False), values)
@@ -1186,6 +1238,7 @@ async def write_spans(
                 "data_source": span.data_source,
                 "first_seen_at": span.first,
                 "last_seen_at": span.last,
+                "newest_record_at": span.newest,
                 "complete": True,
                 "updated_at": now,
             }
@@ -1446,11 +1499,46 @@ async def _queue_for_lock(session: AsyncSession, arguments: dict) -> None:
         raise LockBusy("the data type's exclusive lock is held by other writers") from exc
 
 
+# What the holder of the single-run lock is doing (its connection's application_name).
+LOCK_PURPOSES = {
+    "identity-backfill": "an identity-backfill run (the nightly reconciler, or one by hand)",
+    "identity-decide": "another identity-decide (applying an owner decision)",
+}
+
+
+async def _lock_holder(connection) -> str:
+    """Who holds the single-run lock, for the refusal message."""
+    row = (
+        await connection.execute(
+            text(
+                "SELECT a.application_name, a.backend_start FROM pg_locks l "
+                "JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'advisory' "
+                "AND l.granted AND l.classid = :namespace AND l.objid = :key"
+            ),
+            {"namespace": BACKFILL_LOCK[0], "key": BACKFILL_LOCK[1]},
+        )
+    ).first()
+    if row is None:
+        return "another identity-backfill or identity-decide"
+    name, started = row
+    purpose = str(name or "").removeprefix("healthos-")
+    what = LOCK_PURPOSES.get(purpose, f"a session ({name or 'unnamed'})")
+    return f"{what}, connected since {as_utc(started).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
+
 @asynccontextmanager
-async def backfill_lock(sessions: async_sessionmaker, *, dry_run: bool = False):
-    """Hold the single-run lock of identity-backfill (a session lock on its own connection,
-    outside any transaction); refuse at once when another run holds it. A dry run writes
-    nothing and takes no lock."""
+async def backfill_lock(
+    sessions: async_sessionmaker,
+    *,
+    dry_run: bool = False,
+    purpose: str = "identity-backfill",
+    wait: float = 0.0,
+):
+    """Hold the single-run lock of identity-backfill and identity-decide (a session lock on
+    its own connection, outside any transaction, named ``healthos-<purpose>``). It is tried
+    for every half second for ``wait`` seconds (a decision waits briefly for a reconciler
+    batch run to end), then refused, naming who holds it. A dry run writes nothing and takes
+    no lock."""
     bind = sessions.kw.get("bind")
     if dry_run or bind is None or bind.dialect.name != "postgresql":
         yield
@@ -1458,15 +1546,33 @@ async def backfill_lock(sessions: async_sessionmaker, *, dry_run: bool = False):
     connection = await bind.connect()
     try:
         connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
-        acquired = await connection.scalar(
-            text("SELECT pg_try_advisory_lock(:namespace, :key)"),
-            {"namespace": BACKFILL_LOCK[0], "key": BACKFILL_LOCK[1]},
+        await connection.execute(
+            text("SELECT set_config('application_name', :name, false)"),
+            {"name": f"healthos-{purpose}"},
         )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        while True:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:namespace, :key)"),
+                {"namespace": BACKFILL_LOCK[0], "key": BACKFILL_LOCK[1]},
+            )
+            if acquired or loop.time() >= deadline:
+                break
+            await asyncio.sleep(min(0.5, max(0.0, deadline - loop.time())))
         if not acquired:
+            holder = await _lock_holder(connection)
+            waited = f" (waited {wait:g} s)" if wait else ""
             raise BackfillRunning(
-                "another identity-backfill is running (PostgreSQL advisory lock "
-                f"{BACKFILL_LOCK[0]}/{BACKFILL_LOCK[1]} is held); wait for it to finish or "
-                "stop it, then run again (it resumes where the archive left off)"
+                f"another identity-backfill is running: {holder} holds the single-run lock "
+                f"(PostgreSQL advisory lock {BACKFILL_LOCK[0]}/{BACKFILL_LOCK[1]}){waited}; "
+                f"nothing was written. Run the {purpose} again when it has finished"
+                + (
+                    " (the nightly reconciler takes minutes; `health-mirror status` shows "
+                    "its last run)"
+                    if purpose == "identity-decide"
+                    else ""
+                )
             )
         try:
             yield

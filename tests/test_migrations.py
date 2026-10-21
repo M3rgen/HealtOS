@@ -41,4 +41,4 @@ def test_postgresql_offline_ddl_uses_native_types(monkeypatch, capsys) -> None:
     assert "CREATE TYPE jobstatus AS ENUM" in ddl
     assert "id UUID NOT NULL" in ddl
     assert "TIMESTAMP WITH TIME ZONE" in ddl
-    assert ddl.count("CREATE TABLE ") == 40  # 39 application tables + Alembic version.
+    assert ddl.count("CREATE TABLE ") == 42  # 41 application tables + Alembic version.

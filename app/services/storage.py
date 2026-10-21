@@ -156,15 +156,26 @@ async def store_records(
 
 
 async def _lock_rows(session: AsyncSession, spec: DataTypeSpec, google_ids: list[str], resolution):
-    """Lock the existing rows the page writes onto (key order, like the upserts; PostgreSQL)
-    and check that each still holds the payload it was resolved against. Returns
-    google id -> (raw id, payload hash)."""
+    """Lock the existing rows the page relies on (the rows it writes onto, every row that
+    could hide one of them, the rows it links; key order, like the upserts; PostgreSQL) and
+    check that each is still as it was resolved against - its payload, deletion mark,
+    quarantine and links - so another page that revised, revived or linked one of them
+    meanwhile makes this one resolve again. Returns google id -> (raw id, payload hash)."""
+    from app.models.identity import RawHealthDataSupersession
+
     table = RawHealthData
     found: dict[str, tuple] = {}
+    current: dict = {}
     postgresql = session.get_bind().dialect.name == "postgresql"
     for offset in range(0, len(google_ids), 5000):
         query = (
-            select(table.google_data_point_id, table.id, table.payload_hash)
+            select(
+                table.google_data_point_id,
+                table.id,
+                table.payload_hash,
+                table.source_deleted_at,
+                table.is_quarantined,
+            )
             .where(
                 table.data_type == spec.name,
                 among(session, table.google_data_point_id, google_ids[offset : offset + 5000]),
@@ -173,10 +184,27 @@ async def _lock_rows(session: AsyncSession, spec: DataTypeSpec, google_ids: list
         )
         if postgresql:
             query = query.with_for_update()
-        for google_id, raw_id, digest in (await session.execute(query)).tuples():
+        for google_id, raw_id, digest, deleted, quarantined in (
+            await session.execute(query)
+        ).tuples():
             found[google_id] = (raw_id, digest)
-    current = {raw_id: digest for raw_id, digest in found.values()}
-    if any(current.get(raw_id) != digest for raw_id, digest in resolution.expected.items()):
+            current[raw_id] = (digest, deleted is not None, bool(quarantined))
+    if any(current.get(raw_id) != state for raw_id, state in resolution.expected.items()):
+        raise _Collision
+    watched = sorted(resolution.expected_links, key=str)
+    links: dict = {raw_id: set() for raw_id in watched}
+    link = RawHealthDataSupersession
+    for offset in range(0, len(watched), 5000):
+        rows = await session.execute(
+            select(link.old_raw_id, link.new_raw_id).where(
+                among(session, link.old_raw_id, watched[offset : offset + 5000])
+            )
+        )
+        for old, new in rows.tuples():
+            links[old].add(new)
+    if any(
+        links[raw_id] != set(expected) for raw_id, expected in resolution.expected_links.items()
+    ):
         raise _Collision
     return found
 

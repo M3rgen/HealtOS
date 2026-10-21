@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timeutil import as_utc
 from app.google_health.data_types import supported_data_types
 from app.models.health import HeartRate, SleepSession, Steps, Weight
-from app.models.identity import held_elsewhere, holds_live, key_held_elsewhere, superseded
+from app.models.identity import (
+    held_elsewhere,
+    holds_live,
+    key_held_elsewhere,
+    plan_each_query,
+    superseded,
+)
 from app.models.manual import ManualMeasurement
 from app.models.state import RawHealthData
 from app.parsers.common import first_number, parse_date, payload_for
@@ -50,6 +56,7 @@ async def dashboard_data(
     valid_sources_only: bool = False,
     include_source_deleted: bool = False,
 ) -> dict:
+    await plan_each_query(session)
     zone = ZoneInfo(timezone)
     first = end_date - timedelta(days=days - 1)
     start = datetime.combine(first, time.min, zone).astimezone(UTC)

@@ -188,7 +188,11 @@ async def test_verify_accepts_links_after_a_later_rename(sessions, clock) -> Non
     stats = await store(sessions, HEART, heart(60, name=BAND3))
     assert (stats.inserted, stats.updated) == (1, 0)
     assert len(await counted_rows(sessions)) == 2
-    assert await problems(sessions) == ([], [])
+    # C's new row holds B's, which holds A's (readers count C's alone).
+    assert await problems(sessions) == (
+        [],
+        ["1 holder row(s) are superseded themselves (readers follow both links)"],
+    )
 
 
 # --- B4: near renames, open cases, the owner ------------------------------------------------
@@ -465,8 +469,10 @@ async def test_a_watch_worn_alongside_does_not_block_the_bands_rename(sessions) 
 async def test_deciding_a_watch_distinct_lets_the_rename_chain_and_links_at_once(sessions):
     """B8 with a later full run: the watch was seen with the band's new name in no page
     together, so nothing proves it another device and the rename stays open. The owner says
-    the watch is another device: the rename is chained and its rows linked at once (not by
-    the nightly run, which only reads rows written since its checkpoint)."""
+    the watch is another device: the decision records only that (lane AB, AB5: a chain it
+    makes possible is listed for the next reconciler run, which decides it with the normal
+    review), and the next nightly run chains the rename and links its rows (every row since
+    the later source was first seen, not only those written since its checkpoint)."""
     await worn_together(sessions, OLD_NAME, range(3), T0 + 3 * MINUTE)
     await worn_together(sessions, OLD_NAME, range(5, 8), T0 + 8 * MINUTE, T0 + 10 * HOUR)
     for minute in (*range(3), *range(5, 8)):
@@ -476,7 +482,14 @@ async def test_deciding_a_watch_distinct_lets_the_rename_chain_and_links_at_once
     assert report.chains == [] and len(await counted_rows(sessions)) == 6 * 3
     watch = source_fingerprint(fitbit(WATCH))
     outcome = await decide_sources(sessions, "heart-rate", "distinct", watch[:12], NEW[:12])
-    assert [chain["decided"] for chain in outcome.stats.chains] == ["this run"]
+    assert outcome.stats.chains == []
+    assert [entry["fingerprints"] for entry in outcome.stats.left_to_reconciler] == [
+        [OLD[:12], NEW[:12]]
+    ]
+    assert len(await counted_rows(sessions)) == 6 * 3
+    nightly = (await identity_backfill(sessions, incremental=True))["heart-rate"]
+    assert [chain["decided"] for chain in nightly.chains] == ["this run"]
+    assert [chain["review"] for chain in nightly.review] == ["suggested"]
     assert len(await counted_rows(sessions)) == 6 * 2
     assert await problems(sessions) == ([], [])
 
