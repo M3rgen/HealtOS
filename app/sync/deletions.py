@@ -33,7 +33,9 @@ waits for a writer, and a writer never waits for it in a circle.
 
 from __future__ import annotations
 
+import json
 import logging
+from collections import Counter
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, cast
 
@@ -59,6 +61,52 @@ logger = logging.getLogger(__name__)
 
 # Candidates read and decided at a time.
 CHUNK = 2000
+
+
+async def _note_deferred(
+    session: AsyncSession,
+    data_type: str,
+    chains,
+    pairs: Counter,
+    window: tuple,
+    now: datetime,
+) -> None:
+    """Keep what this complete fetch deferred (``identity_reconcile_state``, shown by
+    ``health-mirror status`` and every reconciler run) until a later complete fetch of a
+    window that covers it defers nothing, or defers something else."""
+    from app.models.identity import IdentityReconcileState
+    from app.services.identity import deferred_summary, identity_tables_missing
+
+    if await identity_tables_missing(session):
+        return
+    state = await session.get(IdentityReconcileState, data_type)
+    previous = json.loads(state.deferred_deletions) if state and state.deferred_deletions else None
+    lower, upper = (
+        value.isoformat() if hasattr(value, "isoformat") else str(value) for value in window
+    )
+    if not pairs:
+        if previous is None or not (
+            lower <= previous["window"][0] and previous["window"][1] <= upper
+        ):
+            return
+        value = None
+    else:
+        value = json.dumps(
+            {
+                "at": now.isoformat(),
+                "window": [lower, upper],
+                "deferred": sum(pairs.values()),
+                "sources": [
+                    {**entry, "at": now.isoformat()} for entry in deferred_summary(chains, pairs)
+                ],
+            },
+            sort_keys=True,
+        )
+    if state is None:
+        state = IdentityReconcileState(data_type=data_type, runs=0)
+        session.add(state)
+    state.deferred_deletions = value
+    await session.flush()
 
 
 def deletion_scope(
@@ -138,6 +186,7 @@ async def mark_source_deletions(
         .exists()
     )
     marked = kept = deferred = 0
+    pairs: Counter = Counter()
     now = datetime.now(UTC)
     cursor: tuple | None = None
     chains = await load_chains(session, spec.name)
@@ -168,6 +217,7 @@ async def mark_source_deletions(
         )
         kept += len(presence.present)
         deferred += len(presence.deferred)
+        pairs.update(presence.deferred_pairs)
         spared = presence.present | presence.deferred
         ids = [raw_id for raw_id, _, _, _ in chunk if raw_id not in spared]
         if ids and postgresql:
@@ -198,6 +248,7 @@ async def mark_source_deletions(
         # Possibly renamed: the reconciler or the owner decides (identity-backfill, nightly;
         # identity-decide).
         event(logger, "SOURCE_DELETIONS_DEFERRED", data_type=spec.name, count=deferred)
+    await _note_deferred(session, spec.name, chains, pairs, (lower, upper), now)
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked

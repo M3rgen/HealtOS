@@ -9,27 +9,34 @@ applies it:
 
 * ``link FROM TO``: the two fingerprints are one device (``FROM`` its earlier form). A chain
   ``FROM -> TO`` is recorded (``decided_by = owner``, naming the decision), or a chain recorded
-  before and rejected is made live again; the whole data type is then settled again, so the
-  rows of both forms are linked (equal readings only).
+  before and rejected is made live again; the rows of both forms are then linked (equal
+  readings only).
 * ``reject FROM TO``: the chain ``FROM -> TO`` is wrong. It is no longer used: the links made
-  under it no longer hide anything (readers count both sides again at once), each form gets
-  rows of its own from now on, and both fingerprints are free for another chain.
+  under it are no longer in force (readers count both sides again at once), and both
+  fingerprints are free for another chain. Every row of those links is settled again, so each
+  device that remains counts each record once.
 * ``confirm FROM TO``: reviewed, the chain is right (it leaves the review list; a rejected
   one is live again).
 * ``distinct A B``: two devices, whatever the evidence: a chain between them is no longer used
-  (as after ``reject``).
+  (as after ``reject``). From then on a row of one whose reading comes back only under the
+  other is marked deleted by the next complete fetch of its window, and a mark is permanent:
+  the outcome (and ``--dry-run``) says so.
 * ``not-distinct A B``: ignore the evidence of two devices between them (a stray duplicate):
-  a chain between them refuted by that evidence is live again; the whole data type is settled
-  again.
+  a chain between them refuted by that evidence is live again.
 
+Each decision settles again exactly the rows whose devices it changed: the rows of every link
+between two fingerprints that are no longer one device, and every row written since the later
+of two fingerprints that newly are (app/services/identity_backfill.py, ``_settle_changed``).
 The latest decision per question wins, so every decision is undone by the opposite one, in
 what readers count too: supersessions are in force only while their two fingerprints are one
-device (app/models/identity.py, ``in_force``). A decision that would make two live chains fork
-or cycle is refused (reject the other chain first). ``--dry-run`` writes nothing, takes no
-lock that writers wait for, and reports what the decision would change. Fingerprints are given
-by their first characters as the report prints them (``fingerprints``; 12 are shown, any
-unique prefix of at least 6 is accepted). ``verify`` checks that every chain the owner linked
-names its decision.
+device (app/models/identity.py, ``in_force``), and links are only ever added. There is no
+decision that forgets an earlier one: ``distinct`` undoes ``not-distinct`` (and the reverse),
+``reject`` undoes ``link`` and ``confirm``, ``confirm`` undoes ``reject``. A decision that
+would make two live chains fork or cycle is refused (reject the other chain first).
+``--dry-run`` writes nothing, takes no lock that writers wait for, and reports what the
+decision would change. Fingerprints are given by their first characters as the report prints
+them (``fingerprints``; 12 are shown, any unique prefix of at least 6 is accepted). ``verify``
+checks that every chain the owner linked names its decision.
 
 A deletion deferred because a fingerprint might have been the device renamed is decided by the
 next complete fetch of its window after the decision (the decision itself fetches nothing): the
@@ -69,10 +76,6 @@ from app.services.source_chains import (
 logger = logging.getLogger(__name__)
 
 MIN_PREFIX = 6
-# Decisions after which rows may need linking: the whole data type is settled again (after
-# the others too when they join two devices - ``confirm`` of a rejected chain - or let the
-# rule decide a chain).
-RELINK = ("link", "not-distinct")
 
 
 class DecisionRefused(ValueError):
@@ -197,6 +200,19 @@ class Outcome:
     stats: BackfillStats = field(default_factory=BackfillStats)
 
     def as_dict(self) -> dict[str, Any]:
+        deletions = (
+            "a deletion left undecided because one of these sources might be the other "
+            "renamed is decided by the next complete fetch of its window (the daily "
+            "deletion check, or `health-mirror backfill` of that window)"
+        )
+        if self.decision == "distinct":
+            deletions = (
+                "WARNING: from now on a row of one of these sources whose reading comes back "
+                "only under the other is MARKED DELETED by the next complete fetch of its "
+                "window, and a mark is permanent (undoing this decision with not-distinct "
+                "restores what is counted, not the marks). Decide distinct only when these "
+                "are two devices. " + deletions
+            )
         return {
             "dry_run": self.dry_run,
             "decision": self.decision,
@@ -206,11 +222,7 @@ class Outcome:
             "decision_id": self.decision_id,
             "chain": self.chain,
             "links_between_their_rows": self.links_between,
-            "deletions": (
-                "a deletion left undecided because one of these sources might be the other "
-                "renamed is decided by the next complete fetch of its window (the daily "
-                "deletion check, or `health-mirror backfill` of that window)"
-            ),
+            "deletions": deletions,
             "effect": {
                 name: value
                 for name, value in self.stats.as_dict().items()
@@ -281,18 +293,13 @@ async def decide_sources(
     async with sessions() as session:
         outcome.links_between = await _links_between(session, data_type, first, second)
 
-    joined: list[bool] = []
-
     async def apply(session: AsyncSession, current: Chains) -> None:
         # Under the exclusive lock: the chains may have changed since they were read.
         check(current, decision, first, second)
-        before = current.members(first)
-        joined.append(False)
         if dry_run:
             current.decide(decision, first, second)
             if decision == "link" and (first, second) not in current.links:
                 current.add(first, second)
-            joined[-1] = current.members(first) > before
             return
         now = await source_chains.database_now(session)
         outcome.decision_id = await record_decision(
@@ -311,7 +318,6 @@ async def decide_sources(
             )
             if not inserted:
                 raise DecisionRefused("another chain of these sources was recorded meanwhile")
-        joined[-1] = current.members(first) > before
         event(
             logger,
             "SOURCE_DECISION_RECORDED",
@@ -327,7 +333,6 @@ async def decide_sources(
             sessions,
             data_type,
             apply,
-            link=lambda: decision in RELINK or any(joined),
             batch_size=batch_size,
             dry_run=dry_run,
             statement_timeout=statement_timeout,

@@ -163,6 +163,13 @@ class RawHealthDataSupersession(Base):
         CheckConstraint("old_raw_id <> new_raw_id", name="distinct_rows"),
         Index("ix_raw_health_data_supersessions_new_raw_id", "new_raw_id"),
         Index("ix_raw_health_data_supersessions_old_key", "old_google_data_point_id", "data_type"),
+        # The links between two sources, found when they are no longer one device.
+        Index(
+            "ix_raw_health_data_supersessions_sources",
+            "data_type",
+            "old_fingerprint",
+            "new_fingerprint",
+        ),
     )
 
     # A row may be linked again when its links are no longer in force (in_force below);
@@ -347,6 +354,12 @@ class IdentityReconcileState(Base):
     # JSON summary of the last run (links, chains, ambiguous sources, rows read).
     last_result: Mapped[str | None] = mapped_column(Text)
     last_error: Mapped[str | None] = mapped_column(Text)
+    # JSON: per fingerprint pair of evidence, how many keys both held with the same reading and
+    # how many with two (app/services/source_chains.py, ``agreeing``), as last counted.
+    pair_agreement: Mapped[str | None] = mapped_column(Text)
+    # JSON: the deletions the last complete fetches left undecided (deferred) and why
+    # (app/sync/deletions.py), until the owner or the reconciler decides their sources.
+    deferred_deletions: Mapped[str | None] = mapped_column(Text)
     runs: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -435,17 +448,41 @@ def superseded(raw_id):
 
 
 def held_elsewhere(raw_id):
-    """``EXISTS`` clause: ``raw_id`` is superseded, by an in-force link, by a row that is not
-    marked deleted at the source. Readers skip exactly these rows (the holder counts their
-    record); a superseded row whose holders were all marked deleted counts again when it is
-    live itself, so a link can never hide a live record behind a deleted one, and a link no
-    longer in force hides nothing."""
+    """``EXISTS`` clause: ``raw_id`` is superseded, by an in-force link, by a row that is
+    neither marked deleted at the source nor quarantined. Readers skip exactly these rows (the
+    holder counts their record); a superseded row whose holders were all marked deleted (or
+    quarantined) counts again when it is live itself, so a link can never hide a live record
+    behind a row that is not counted, and a link no longer in force hides nothing. The write
+    path decides with the very same test (app/services/identity.py, ``_Page.hiders``)."""
     holder = aliased(RawHealthData)
     link = aliased(RawHealthDataSupersession)
     return (
         select(link.old_raw_id)
         .join(holder, holder.id == link.new_raw_id)
-        .where(link.old_raw_id == raw_id, holder.source_deleted_at.is_(None), in_force(link))
+        .where(
+            link.old_raw_id == raw_id,
+            holder.source_deleted_at.is_(None),
+            holder.is_quarantined.is_(False),
+            in_force(link),
+        )
+        .exists()
+    )
+
+
+def holds_live(raw_id):
+    """``EXISTS`` clause: ``raw_id`` holds, through an in-force link, a row that is live and
+    not quarantined (a row marked deleted that a live duplicate stands for)."""
+    held = aliased(RawHealthData)
+    link = aliased(RawHealthDataSupersession)
+    return (
+        select(link.new_raw_id)
+        .join(held, held.id == link.old_raw_id)
+        .where(
+            link.new_raw_id == raw_id,
+            held.source_deleted_at.is_(None),
+            held.is_quarantined.is_(False),
+            in_force(link),
+        )
         .exists()
     )
 

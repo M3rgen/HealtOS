@@ -289,30 +289,55 @@ async def chained_band_and_a_watch(sessions, clock, value: int = 60) -> None:
     await store(sessions, HEART, heart(value, name=WATCH))
 
 
-async def test_distinct_from_one_form_is_distinct_from_the_device(sessions, clock) -> None:
-    """Distinctness was checked per fingerprint pair: a watch decided distinct from the band's
-    new name but not its old one; the band deleted the record: its holder was marked, its old
-    row deferred - and counted again. Distinct from a form is distinct from the device."""
+async def test_distinct_from_one_form_reaches_the_device_only_through_reviewed_links(
+    sessions, clock
+) -> None:
+    """A watch decided distinct from the band's new name; the band deleted the record. Its
+    new-name row is marked. Its old-name row is deferred while only the reconciler joined the
+    two names (that chain may be wrong: a mark is permanent), and listed; once the owner
+    confirms the chain, the owner's distinct reaches the old name and it is marked too."""
     await chained_band_and_a_watch(sessions, clock)
     await decide_sources(sessions, "heart-rate", "distinct", WATCH_FP[:12], NEW[:12])
     clock.advance(hours=1)
     fetched_since = clock.now
     await store(sessions, HEART, heart(60, name=WATCH))  # the band's record is gone
-    assert await mark(sessions, HEART, T0 - HOUR, T0 + HOUR, fetched_since) == 2
+    assert await mark(sessions, HEART, T0 - HOUR, T0 + HOUR, fetched_since) == 1
+    assert bpm(await counted_rows(sessions)) == [(OLD_NAME, 60), (WATCH, 60)]
+    [deferred] = (await identity_backfill(sessions, incremental=True))[
+        "heart-rate"
+    ].deferred_deletions
+    assert deferred["fingerprints"] == [OLD[:12], WATCH_FP[:12]] and deferred["deferred"] == 1
+    await decide_sources(sessions, "heart-rate", "confirm", OLD[:12], NEW[:12])
+    clock.advance(hours=1)
+    fetched_since = clock.now
+    await store(sessions, HEART, heart(60, name=WATCH))
+    assert await mark(sessions, HEART, T0 - HOUR, T0 + HOUR, fetched_since) == 1
     assert bpm(await counted_rows(sessions)) == [(WATCH, 60)]
 
 
-async def test_a_revised_then_deleted_record_is_not_counted_again(sessions, clock) -> None:
+async def test_a_revised_then_deleted_record_waits_for_the_owner(sessions, clock) -> None:
     """f1 e2: the band revised a record (70 -> 90) while an undecided watch returned 70 at
-    that instant; then the band deleted it. The band's old row (70, its holder now 90) was
-    deferred because of the watch, and counted again once the holder was marked: two 70s.
-    Its device returned another value for the record, so its 70 is no longer the band's: it
-    is marked when the holder's new value is seen."""
+    that instant; then the band deleted it. Its old row (70) is deferred, not marked: the
+    watch returned its reading and may be the band renamed (AA3: an undecided source that
+    returned the same reading always defers). It is listed with the pair to decide; once the
+    owner decides the two distinct, the next complete fetch marks it."""
     await chained_band_and_a_watch(sessions, clock, 70)
     clock.advance(hours=1)
     fetched_since = clock.now
     await store(sessions, HEART, heart(90, name=NEW_NAME), heart(70, name=WATCH))
+    assert await mark(sessions, HEART, T0 - HOUR, T0 + HOUR, fetched_since) == 0
+    assert bpm(await counted_rows(sessions)) == [(NEW_NAME, 90), (WATCH, 70)]
+    clock.advance(hours=1)
+    fetched_since = clock.now
+    await store(sessions, HEART, heart(70, name=WATCH))
     assert await mark(sessions, HEART, T0 - HOUR, T0 + HOUR, fetched_since) == 1
+    assert bpm(await counted_rows(sessions)) == [(OLD_NAME, 70), (WATCH, 70)]
+    report = (await identity_backfill(sessions, incremental=True))["heart-rate"]
+    assert [entry["fingerprints"] for entry in report.deferred_deletions] == [
+        [OLD[:12], WATCH_FP[:12]]
+    ]
+    assert report.summary()["deferred_deletions"] == 1
+    await decide_sources(sessions, "heart-rate", "distinct", OLD[:12], WATCH_FP[:12])
     clock.advance(hours=1)
     fetched_since = clock.now
     await store(sessions, HEART, heart(70, name=WATCH))

@@ -42,8 +42,10 @@ through a link in force, are left out (before, only quarantined ones); SQLite (t
 keeps the old views.
 
 Fast: empty tables, their indexes and triggers, view definitions, and one partial index on
-`raw_health_data` (its source-deleted rows, so the views never scan the whole table); no
-ALTER of an existing table, so a running pg_dump never blocks it.
+`raw_health_data` (its source-deleted rows, so the views never scan the whole table), built
+`CONCURRENTLY` first, in a step of its own outside the transaction (writers never wait for it;
+when it cannot finish within the lock timeout, the upgrade goes on without it and verify
+names it); no ALTER of an existing table, so a running pg_dump never blocks it.
 Filling them is `health-mirror identity-backfill`, run after the deploy (docs/RUNBOOK.md).
 Like 0011 it sets `lock_timeout` (30 s, `-x lock-timeout=...`): the foreign keys to
 `raw_health_data` need a SHARE ROW EXCLUSIVE lock on it (writers conflict, readers and
@@ -244,7 +246,7 @@ def _view(table: str, *, current_only: bool) -> str:
         f"AND NOT EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
         "JOIN raw_health_data h ON h.id = s.new_raw_id "
         f"WHERE {link_type} AND s.old_google_data_point_id = {table}.google_data_point_id "
-        f"AND h.source_deleted_at IS NULL AND {_IN_FORCE})"
+        f"AND h.source_deleted_at IS NULL AND h.is_quarantined = false AND {_IN_FORCE})"
     )
 
 
@@ -276,8 +278,16 @@ def _lock_timeout() -> str:
 def upgrade() -> None:
     if op.get_context().dialect.name != "postgresql":
         _upgrade("sqlite")
+        op.create_index(
+            DELETED_INDEX,
+            "raw_health_data",
+            ["data_type", "google_data_point_id"],
+            sqlite_where=sa.text("source_deleted_at IS NOT NULL"),
+        )
         return
     timeout = _lock_timeout()
+    # First, outside any transaction: nothing of this revision exists if it fails.
+    _deleted_index(timeout)
     op.execute(f"SET LOCAL lock_timeout = '{timeout}'")
     try:
         _upgrade("postgresql")
@@ -356,6 +366,12 @@ def _upgrade(dialect: str) -> None:
         "ix_raw_health_data_supersessions_old_key",
         SUPERSESSION_TABLE,
         ["old_google_data_point_id", "data_type"],
+    )
+    # The links between two sources, found when they are no longer one device.
+    op.create_index(
+        "ix_raw_health_data_supersessions_sources",
+        SUPERSESSION_TABLE,
+        ["data_type", "old_fingerprint", "new_fingerprint"],
     )
     op.create_table(
         CHAIN_TABLE,
@@ -518,6 +534,8 @@ def _upgrade(dialect: str) -> None:
         sa.Column("last_mode", sa.String(16), nullable=True),
         sa.Column("last_result", sa.Text(), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("pair_agreement", sa.Text(), nullable=True),
+        sa.Column("deferred_deletions", sa.Text(), nullable=True),
         sa.Column("runs", sa.Integer(), server_default="0", nullable=False),
         sa.Column(
             "updated_at",
@@ -536,20 +554,53 @@ def _upgrade(dialect: str) -> None:
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("kind", "key", name="pk_fetch_rounds"),
     )
-    # Under the SHARE ROW EXCLUSIVE lock the foreign keys take anyway (it reads every row
-    # once; measured 0.3 s for 1.4 million rows).
-    op.create_index(
-        DELETED_INDEX,
-        "raw_health_data",
-        ["data_type", "google_data_point_id"],
-        postgresql_where=sa.text("source_deleted_at IS NOT NULL"),
-        sqlite_where=sa.text("source_deleted_at IS NOT NULL"),
-    )
     for statement in POSTGRESQL_DDL if dialect == "postgresql" else SQLITE_DDL:
         op.execute(statement)
     if dialect == "postgresql":
         for table in NORMALIZED_TABLES:
             op.execute(_view(table, current_only=True))
+
+
+def _deleted_index(timeout: str) -> None:
+    """The partial index of source-deleted rows, built ``CONCURRENTLY`` (writers are never
+    blocked, however large the table) in its own non-transactional step. It waits for
+    transactions that write the table, or hold an older snapshot (a running ``pg_dump``), at
+    most ``timeout``: then it is left for later (``health-mirror verify`` names it and the
+    statement that builds it), since it only makes the ``analytics_*`` views faster. An index
+    left invalid by an interrupted build is built again (``REINDEX ... CONCURRENTLY``)."""
+    build = (
+        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {DELETED_INDEX} ON raw_health_data "
+        "(data_type, google_data_point_id) WHERE source_deleted_at IS NOT NULL"
+    )
+    with op.get_context().autocommit_block():
+        if context.is_offline_mode():
+            op.execute(build)
+            return
+        bind = op.get_bind()
+        bind.execute(sa.text(f"SET lock_timeout = '{timeout}'"))
+        try:
+            bind.execute(sa.text(build))
+            valid = bind.scalar(
+                sa.text(
+                    "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = current_schema() AND c.relname = :name"
+                ),
+                {"name": DELETED_INDEX},
+            )
+            if valid is False:
+                bind.execute(sa.text(f"REINDEX INDEX CONCURRENTLY {DELETED_INDEX}"))
+        except sa.exc.DBAPIError as exc:
+            code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+            if code != _LOCK_NOT_AVAILABLE:
+                raise
+            print(
+                f"20261021_0012: {DELETED_INDEX} could not be built within {timeout} (a writer "
+                "or a dump was running); the upgrade goes on without it. Build it later with "
+                f"REINDEX INDEX CONCURRENTLY {DELETED_INDEX} (docs/RUNBOOK.md)."
+            )
+        finally:
+            bind.execute(sa.text("RESET lock_timeout"))
 
 
 def _refuse_while_kept(context_) -> None:
@@ -594,6 +645,6 @@ def downgrade() -> None:
     op.drop_table(CHAIN_TABLE)
     op.drop_table(SUPERSESSION_TABLE)
     op.drop_table(IDENTITY_TABLE)
-    op.drop_index(DELETED_INDEX, table_name="raw_health_data")
+    op.execute(f"DROP INDEX IF EXISTS {DELETED_INDEX}")
     if context_.dialect.name == "postgresql":
         op.execute(f"DROP FUNCTION {SIGHTINGS_FUNCTION}()")

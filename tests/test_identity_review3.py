@@ -108,7 +108,9 @@ async def test_old_package_back_after_a_blip_is_counted(sessions, clock) -> None
     assert await day_steps(sessions) == 40
     await reconcile(sessions)
     assert await day_steps(sessions) == 40
-    assert await problems(sessions) == ([], [])
+    errors, notes = await problems(sessions)
+    # The suffixed row counts again (its holder was marked in the blip): noted, no error.
+    assert errors == [] and len(notes) == 1 and "count again" in notes[0]
 
 
 async def test_a_stray_copy_in_the_new_name_hides_nothing(sessions, clock) -> None:
@@ -173,7 +175,7 @@ async def test_a_growing_period_of_the_old_name_counts_at_its_full_length(sessio
 
 async def test_verify_accepts_links_after_a_later_rename(sessions, clock) -> None:
     """Review 2 (si.py): A -> B decided and linked; then B -> C; the history fetched again in
-    C's form lands on B's rows. The A -> B links stay valid for verify."""
+    C's form gets rows of its own, linked to B's at once. The links stay valid for verify."""
     await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
     await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + 5 * HOUR, last=T0 + 6 * HOUR)
     await identity_backfill(sessions)
@@ -184,7 +186,8 @@ async def test_verify_accepts_links_after_a_later_rename(sessions, clock) -> Non
     await reconcile(sessions)
     clock.advance(hours=1)
     stats = await store(sessions, HEART, heart(60, name=BAND3))
-    assert (stats.inserted, stats.updated) == (0, 1)
+    assert (stats.inserted, stats.updated) == (1, 0)
+    assert len(await counted_rows(sessions)) == 2
     assert await problems(sessions) == ([], [])
 
 

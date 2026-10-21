@@ -84,6 +84,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import (
     DateTime,
@@ -104,6 +105,7 @@ from app.models.identity import (
     CHAIN_DECISIONS,
     PAIR_DECISIONS,
     REFUTED,
+    IdentityReconcileState,
     RawSourceChain,
     RawSourceChainEvent,
     RawSourceDecision,
@@ -117,7 +119,8 @@ CHAIN_GAP = timedelta(minutes=5)
 # Keys with two different readings that establish two distinct devices (from two fetches).
 PAIR_KEYS = 3
 # Two sources established distinct by evidence alone whose sightings overlap by at most this
-# much look like a rename: listed for review, and never a reason to mark a deletion.
+# much look like a rename: listed for review, and never a reason to mark a deletion. Forms of
+# two devices that were seen side by side for longer than this are worn together, not renamed.
 RENAME_OVERLAP = timedelta(days=1)
 # A chain is followed at most this far.
 MAX_CHAIN = 64
@@ -184,6 +187,11 @@ def overlaps(left: Span, right: Span) -> bool:
 def gap_seconds(old: Span, new: Span) -> float:
     """Seconds from ``old``'s last to ``new``'s first sighting (negative: they overlap)."""
     return (new.first - old.last).total_seconds()
+
+
+def worn_together(left: Span, right: Span) -> bool:
+    """Both were seen side by side for longer than ``RENAME_OVERLAP``."""
+    return min(left.last, right.last) - max(left.first, right.first) > RENAME_OVERLAP
 
 
 def back_to_back(left: Span, right: Span) -> bool:
@@ -258,6 +266,11 @@ class Chains:
     refuted_events: set[tuple[str, str]] = field(default_factory=set)
     # Fingerprint -> its latest row in raw_source_devices (what readers use now).
     logged_devices: dict[str, str] = field(default_factory=dict)
+    # Ordered fingerprint pair -> (keys whose rows of both hold the same reading, keys whose
+    # rows hold two readings), as the reconciler last counted them (identity_reconcile_state).
+    agreement: dict[tuple[str, str], tuple[int, int]] = field(default_factory=dict)
+    # (from, to) -> the live links a link of the reconciler relied on (``live``).
+    premises: dict[tuple[str, str], frozenset[tuple[str, str]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._changed()
@@ -268,6 +281,7 @@ class Chains:
         self._devices: dict[str, frozenset[str]] | None = None
         self._joined: dict[str, frozenset[str]] | None = None
         self._distinct: dict[tuple[str, str], bool] = {}
+        self._premise_live: dict[tuple[str, str], bool] = {}
 
     # --- links and their state
 
@@ -283,12 +297,30 @@ class Chains:
         return self.chain_decisions.get((old, new)) == "reject"
 
     def live(self, old: str, new: str) -> bool:
-        """Recorded, not rejected by the owner's latest decision, its forms not distinct."""
-        return (
-            (old, new) in self.links
-            and not self.rejected(old, new)
-            and not self.pair_dead(old, new)
-        )
+        """Recorded, not rejected by the owner's latest decision, its forms not distinct, and
+        - a link the reconciler decided only because other links were live (its *premise*:
+        a form that would have been another candidate already continued as another source)
+        - while those are live, unless the owner linked or confirmed it."""
+        return self._live_link(old, new, frozenset())
+
+    def _live_link(self, old: str, new: str, visiting: frozenset) -> bool:
+        if (old, new) not in self.links or self.rejected(old, new) or self.pair_dead(old, new):
+            return False
+        return self.premise_holds(old, new, visiting)
+
+    def premise_holds(self, old: str, new: str, visiting: frozenset = frozenset()) -> bool:
+        premise = self.premises.get((old, new))
+        if not premise or self.chain_decisions.get((old, new)) in ("link", "confirm"):
+            return True
+        if (old, new) in visiting:
+            return False
+        found = self._premise_live.get((old, new))
+        if found is None:
+            found = all(
+                self._live_link(first, second, visiting | {(old, new)}) for first, second in premise
+            )
+            self._premise_live[(old, new)] = found
+        return found
 
     usable = live
 
@@ -300,7 +332,9 @@ class Chains:
     def state(self, old: str, new: str) -> str:
         if self.live(old, new):
             return "live"
-        return "rejected" if self.rejected(old, new) else "refuted"
+        if self.rejected(old, new):
+            return "rejected"
+        return "refuted" if self.pair_dead(old, new) else "lapsed"
 
     def refutable(self, old: str, new: str) -> bool:
         """A recorded link whose forms became established distinct by evidence, with no refuted
@@ -310,7 +344,7 @@ class Chains:
             (old, new) in self.links
             and (old, new) not in self.refuted_events
             and pair not in self.pair_decisions
-            and established(self.evidence.get(pair, ()))
+            and self.evidence_distinct(old, new)
         )
 
     def _live_maps(self) -> tuple[dict[str, str], dict[str, str]]:
@@ -389,6 +423,19 @@ class Chains:
 
     # --- distinctness
 
+    def agreeing(self, left: str, right: str) -> bool:
+        """Most keys the two fingerprints share hold the same reading in both (at least
+        ``PAIR_KEYS`` of them): one device returned again under another name (a rename with
+        reprocessing), whatever a few keys with two values say."""
+        agree, disagree = self.agreement.get(ordered_pair(left, right), (0, 0))
+        return agree >= PAIR_KEYS and agree >= disagree
+
+    def evidence_distinct(self, left: str, right: str) -> bool:
+        """Established by evidence (``established``), unless the keys they share mostly agree."""
+        return established(self.evidence.get(ordered_pair(left, right), ())) and not (
+            self.agreeing(left, right)
+        )
+
     def pair_distinct(self, left: str, right: str) -> bool:
         """These two fingerprints: the owner's decision, else established by evidence."""
         if left == right:
@@ -397,7 +444,7 @@ class Chains:
         decided = self.pair_decisions.get(pair)
         if decided is not None:
             return decided == "distinct"
-        return established(self.evidence.get(pair, ()))
+        return self.evidence_distinct(left, right)
 
     def distinct(self, left: str, right: str) -> bool:
         """Established distinct *devices*: some form of one is distinct from some form of the
@@ -425,13 +472,70 @@ class Chains:
         )
 
     def looks_like_rename(self, left: str, right: str) -> bool:
-        """Distinct by evidence alone, and their sightings only touch (``back_to_back``)."""
+        """Distinct by evidence alone, and either the keys some forms of the two share mostly
+        agree (``agreeing``: a rename with reprocessing, however long both were seen), or
+        their sightings only touch (``back_to_back``) while no form of one was seen alongside a
+        form of the other for longer than ``RENAME_OVERLAP`` (a device worn together with
+        another is no rename). Listed for the owner's review."""
+        if self.owner_distinct(left, right):
+            return False
+        forms = [(one, other) for one in self.members(left) for other in self.members(right)]
+        if any(self.agreeing(one, other) for one, other in forms):
+            return True
+        before, after = self.spans.get(left), self.spans.get(right)
+        if before is None or after is None or not back_to_back(before, after):
+            return False
+        return not any(
+            worn_together(self.spans[one], self.spans[other])
+            for one, other in forms
+            if one in self.spans and other in self.spans
+        )
+
+    def reviewed_members(self, fingerprint: str) -> frozenset[str]:
+        """The fingerprints joined to this one by live links the owner linked or confirmed
+        (not by a chain only the reconciler suggested, which may be wrong)."""
+        found, frontier = {fingerprint}, [fingerprint]
+        while frontier:
+            current = frontier.pop()
+            for old, new in self.links:
+                if current not in (old, new) or not self.live(old, new):
+                    continue
+                if self.review(old, new) not in ("owner", "confirmed"):
+                    continue
+                other = new if current == old else old
+                if other not in found:
+                    found.add(other)
+                    frontier.append(other)
+        return frozenset(found)
+
+    def owner_decided_distinct(self, left: str, right: str) -> bool:
+        """The owner decided distinct a form of each, joined to it by links the owner
+        reviewed (``reviewed_members``), and not-distinct not these two themselves."""
+        if self.pair_decisions.get(ordered_pair(left, right)) == "not-distinct":
+            return False
+        return any(
+            self.pair_decisions.get(ordered_pair(one, other)) == "distinct"
+            for one in self.reviewed_members(left)
+            for other in self.reviewed_members(right)
+            if one != other
+        )
+
+    def certainly_distinct(self, left: str, right: str) -> bool:
+        """For a deletion mark, which is permanent: these two fingerprints are established
+        distinct by evidence between themselves (not through another form of their devices,
+        whose chain may be wrong) while their keys do not mostly agree and their sightings do
+        not merely touch, with no owner decision about them (``owner_decided_distinct`` is
+        asked separately)."""
+        if left == right:
+            return False
+        if ordered_pair(left, right) in self.pair_decisions:
+            return False
         before, after = self.spans.get(left), self.spans.get(right)
         return (
-            before is not None
+            self.evidence_distinct(left, right)
+            and before is not None
             and after is not None
-            and not self.owner_distinct(left, right)
-            and back_to_back(before, after)
+            and not back_to_back(before, after)
         )
 
     # --- devices
@@ -533,6 +637,8 @@ class Chains:
             pair_decisions=dict(self.pair_decisions),
             refuted_events=set(self.refuted_events),
             logged_devices=dict(self.logged_devices),
+            agreement=dict(self.agreement),
+            premises=dict(self.premises),
         )
 
 
@@ -542,6 +648,8 @@ class Chains:
 @dataclass
 class Decision:
     links: list[tuple[str, str]] = field(default_factory=list)
+    # Per new link: the live links that kept another candidate out (``Chains.premises``).
+    premises: dict[tuple[str, str], frozenset[tuple[str, str]]] = field(default_factory=dict)
     # One entry per fingerprint that might continue another but is not linked, with why.
     ambiguous: list[dict] = field(default_factory=list)
 
@@ -593,14 +701,65 @@ def decide_chains(chains: Chains) -> Decision:
             or (chains.distinct(other, new) and apart(other, old))
         )
 
-    def between(old: str, new: str, members: list[str]) -> list[str]:
+    def kin(name: str, old: str, new: str) -> bool:
+        # A form of either device is no other source: it says nothing about old -> new.
+        return name in chains.members(old) or name in chains.members(new)
+
+    def between(old: str, new: str, members: list[str], *, links: bool = True) -> list[str]:
+        # ``links=False``: as if no live link made a form of either device (a premise).
         return [
             name
             for name in members
             if name not in (old, new)
+            and not (links and kin(name, old, new))
             and blocks(name, old, new)
             and spans[old].last < spans[name].first < spans[new].first
         ]
+
+    def premise_of(old: str, new: str, members: list[str]) -> frozenset[tuple[str, str]]:
+        # The live links without which another source of the class would have competed with
+        # or blocked old -> new: a predecessor candidate that continues as another source, a
+        # successor candidate that continues another one, a form of either device seen in
+        # between or alongside.
+        found: set[tuple[str, str]] = set()
+
+        def device_links(name: str) -> set[tuple[str, str]]:
+            device = chains.members(name)
+            return {
+                link
+                for link in chains.links
+                if link[0] in device and link[1] in device and chains.live(*link)
+            }
+
+        for name in members:
+            if name in (old, new):
+                continue
+            if (
+                name in chains.following
+                and name not in chains.members(new)
+                and not chains.distinct(name, new)
+                and spans[name].last < spans[new].first
+                and (
+                    not precedes(spans[name], spans[new].first)
+                    or not between(name, new, members, links=False)
+                )
+            ):
+                found.add((name, chains.following[name]))
+            if (
+                name in chains.preceding
+                and name not in chains.members(old)
+                and not chains.distinct(name, old)
+                and precedes(spans[old], spans[name].first)
+                and not between(old, name, members, links=False)
+            ):
+                found.add((chains.preceding[name], name))
+            if kin(name, old, new) and blocks(name, old, new):
+                if spans[old].last < spans[name].first < spans[new].first or (
+                    overlaps(spans[name], spans[old]) or overlaps(spans[name], spans[new])
+                ):
+                    found.update(device_links(name))
+        found.discard((old, new))
+        return frozenset(found)
 
     for members in classes.values():
         if len(members) < 2:
@@ -614,11 +773,13 @@ def decide_chains(chains: Chains) -> Decision:
         for new in ordered:
             if new in chains.preceding:
                 continue
-            # Fingerprints that could be this one's earlier form.
+            # Fingerprints that could be this one's earlier form: not of its device, and not
+            # one that already continues as another source (a chain never forks).
             earlier = [
                 name
                 for name in ordered
-                if name != new
+                if name not in chains.members(new)
+                and name not in chains.following
                 and not chains.distinct(name, new)
                 and spans[name].first < spans[new].first
             ]
@@ -654,7 +815,8 @@ def decide_chains(chains: Chains) -> Decision:
             successors = [
                 name
                 for name in ordered
-                if name != old
+                if name not in chains.members(old)
+                and name not in chains.preceding
                 and not chains.distinct(name, old)
                 and precedes(spans[old], spans[name].first)
                 and not between(old, name, ordered)
@@ -665,7 +827,7 @@ def decide_chains(chains: Chains) -> Decision:
             alongside = [
                 name
                 for name in ordered
-                if name not in (old, new)
+                if not kin(name, old, new)
                 and blocks(name, old, new)
                 and (overlaps(spans[name], spans[old]) or overlaps(spans[name], spans[new]))
             ]
@@ -675,7 +837,11 @@ def decide_chains(chains: Chains) -> Decision:
             if chains.reaches(new, old):
                 note(new, "linking would close a cycle", [old])
                 continue
+            premise = premise_of(old, new, ordered)
             chains.add(old, new)
+            if premise:
+                chains.premises[(old, new)] = premise
+                decision.premises[(old, new)] = premise
             decision.links.append((old, new))
     return decision
 
@@ -695,6 +861,9 @@ def evidence(
         "gap_seconds": gap_seconds(before, after),
         "shared_keys": shared_keys,
     }
+    premise = chains.premises.get((old, new))
+    if premise:
+        values["premise"] = sorted(list(link) for link in premise)
     if decision_id is None:
         values["rule"] = RULE
     else:
@@ -738,6 +907,33 @@ def owner_decision_of(value: str) -> int | None:
 # --- storage -----------------------------------------------------------------------------
 
 
+def parse_premise(value: str | None) -> frozenset[tuple[str, str]]:
+    try:
+        found = json.loads(value or "{}").get("premise") or []
+        return frozenset((str(first), str(second)) for first, second in found)
+    except (ValueError, TypeError, AttributeError):
+        return frozenset()
+
+
+def parse_agreement(value: str | None) -> dict[tuple[str, str], tuple[int, int]]:
+    """``identity_reconcile_state.pair_agreement``: ``{"<first>|<second>": [agree, disagree]}``."""
+    try:
+        found = json.loads(value or "{}")
+        return {
+            ordered_pair(*name.split("|", 1)): (int(counts[0]), int(counts[1]))
+            for name, counts in found.items()
+        }
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return {}
+
+
+def dump_agreement(found: Mapping[tuple[str, str], tuple[int, int]]) -> str:
+    return json.dumps(
+        {f"{first}|{second}": list(counts) for (first, second), counts in sorted(found.items())},
+        sort_keys=True,
+    )
+
+
 def _span(row: RawSourceSighting) -> Span:
     return Span(
         as_utc(row.first_seen_at),
@@ -776,7 +972,7 @@ async def load_state(
     )
     zero = literal(0, Integer)
     never = literal(None, DateTime(timezone=True))
-    parts = [
+    parts: list[Any] = [
         select(
             literal("p", String),
             pair.first_fingerprint,
@@ -818,6 +1014,29 @@ async def load_state(
             never,
         ).where(device.data_type == data_type),
     ]
+    parts.append(
+        select(
+            literal("q", String),
+            chain.from_fingerprint,
+            chain.to_fingerprint,
+            chain.evidence,
+            zero,
+            never,
+        ).where(chain.data_type == data_type, chain.evidence.contains('"premise"'))
+    )
+    parts.append(
+        select(
+            literal("g", String),
+            literal("", String),
+            literal("", String),
+            IdentityReconcileState.pair_agreement,
+            zero,
+            never,
+        ).where(
+            IdentityReconcileState.data_type == data_type,
+            IdentityReconcileState.pair_agreement.is_not(None),
+        )
+    )
     seen = sorted(set(seen))
     if seen:
         sighting = RawSourceSighting
@@ -866,6 +1085,12 @@ async def load_state(
             state.known.add(first)
         elif kind == "h":
             state.history_known = True
+        elif kind == "g":
+            chains.agreement.update(parse_agreement(value))
+        elif kind == "q":
+            premise = parse_premise(value)
+            if premise:
+                chains.premises[(first, second)] = premise
     for _, fingerprint, name in sorted(devices):
         chains.logged_devices[fingerprint] = name
     for _, value, first, second in sorted(decisions):

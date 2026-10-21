@@ -18,6 +18,7 @@ from identity_records import (
     PACKAGE,
     SEDENTARY,
     STEPS,
+    SUFFIXED,
     SWIM,
     T0,
     chains,
@@ -37,7 +38,6 @@ from identity_records import (
 )
 from sqlalchemy import select
 
-from app.models.health import HeartRate, Steps
 from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
 from app.models.raw_versions import RawHealthDataVersion
 from app.parsers.common import source_id, temporal
@@ -83,7 +83,8 @@ async def test_an_unknown_fingerprint_gets_a_row_of_its_own(sessions, clock) -> 
 
 async def test_the_reconciler_ends_double_counting_and_the_chain_is_applied(sessions, clock):
     """Archived before v2, then renamed: separate rows until the reconciler decides the chain
-    and links them; from then on the new name is written onto the old rows (versions)."""
+    and links them; from then on the new name gets rows of its own, linked at once to the old
+    ones (a row never holds another source's payload)."""
     old = await legacy(sessions, HEART, heart(60), T0)
     other = await legacy(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1)), T0)
     await identity_backfill(sessions)  # the full run after the deploy
@@ -101,15 +102,19 @@ async def test_the_reconciler_ends_double_counting_and_the_chain_is_applied(sess
         (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED", "reconciler")
     ]
     assert old in await superseded_ids(sessions)
-    # The decided chain is applied: the other record's row gets the new name as a version.
+    # The decided chain is applied: the other record's new form gets a row of its own,
+    # linked at once to the archived row, which keeps only its own source's payloads.
     clock.advance(hours=1)
     stats = await store(sessions, HEART, heart(61, at=T0 + timedelta(minutes=1), name=NEW_NAME))
-    assert (stats.inserted, stats.updated, stats.versions_kept) == (0, 1, 1)
-    assert [name_of_json(v) for v in await versions_of(sessions, other)] == [OLD_NAME]
-    assert await count(sessions, HeartRate) == 3  # normalized rows updated, not doubled
+    assert (stats.inserted, stats.updated, stats.versions_kept) == (1, 0, 0)
+    assert await versions_of(sessions, other) == []
+    assert visible(await counted_rows(sessions)) == [(NEW_NAME, 60), (OLD_NAME, 61)]
+    assert len(await superseded_ids(sessions)) == 2  # counted once each, at once
 
 
-async def test_a_decided_chain_versions_the_archived_row_and_aliases_it(sessions, clock):
+async def test_a_decided_chain_links_the_new_form_and_keeps_the_archived_row_as_it_was(
+    sessions, clock
+):
     raw_id = await legacy(sessions, HEART, heart(60), T0)
     await identity_backfill(sessions)
     clock.advance(hours=6)
@@ -117,11 +122,16 @@ async def test_a_decided_chain_versions_the_archived_row_and_aliases_it(sessions
     await reconcile(sessions)
     clock.advance(hours=1)
     stats = await store(sessions, HEART, heart(60, name=NEW_NAME))
-    assert (stats.inserted, stats.updated) == (0, 1)
+    assert (stats.inserted, stats.updated) == (1, 0)
     rows = await raw_rows(sessions, HEART)
     assert rows[0].id == raw_id
     assert rows[0].google_data_point_id == source_id(HEART, heart(60))  # its key never changes
-    assert name_of(rows[0]) == NEW_NAME
+    assert name_of(rows[0]) == OLD_NAME and await versions_of(sessions, raw_id) == []
+    # The new form is linked to it (counted once), and found again by its own id.
+    assert len(rows) == 3 and len(await counted_rows(sessions)) == 2
+    clock.advance(hours=1)
+    again = await store(sessions, HEART, heart(60, name=NEW_NAME))
+    assert (again.inserted, again.unchanged) == (0, 1)
     async with sessions() as session:
         aliased = (await session.scalars(select(RawHealthDataIdentity.raw_id))).all()
     assert raw_id in aliased
@@ -135,9 +145,10 @@ async def test_package_suffix_change_keeps_one_row_once_decided(sessions, clock)
     await reconcile(sessions)
     await store(sessions, STEPS, steps(40, source=phone(PACKAGE)))
     rows = await raw_rows(sessions, STEPS)
-    assert len(rows) == 2
-    assert rows[0].raw_json["dataSource"]["application"]["packageName"] == PACKAGE
-    assert await count(sessions, Steps) == 2
+    # The suffix-less form has a row of its own, linked to the archived one at once.
+    assert len(rows) == 3
+    assert rows[0].raw_json["dataSource"]["application"]["packageName"] == SUFFIXED
+    assert len(await counted_rows(sessions, STEPS)) == 2
 
 
 async def test_interval_civil_fields_keep_one_row(sessions, clock) -> None:
@@ -281,16 +292,17 @@ async def test_an_old_name_coming_back_keeps_the_chain_and_counts_once(sessions,
     assert old in await superseded_ids(sessions)
     clock.now = T0 + 30 * HOUR
     fetched_since = clock.now
-    # The whole window again, in the old name: both records.
+    # The whole window again, in the old name: both records (the old name's own row, and a
+    # new row of the old name for the record only the new name had, linked at once).
     stats = await store(sessions, HEART, heart(60), heart(65, at=T0 + 7 * HOUR))
-    assert (stats.inserted, stats.updated) == (0, 2)
+    assert (stats.inserted, stats.unchanged) == (1, 1)
     assert await mark(sessions, HEART, T0 - HOUR, T0 + 8 * HOUR, fetched_since) == 0
     await reconcile(sessions)
-    assert visible(await counted_rows(sessions)) == [(OLD_NAME, 60), (OLD_NAME, 65)]
-    # And back again: still one row per record.
+    assert len(visible(await counted_rows(sessions))) == 2
+    # And back again: each form on its own row, each record counted once.
     clock.advance(hours=1)
     stats = await store(sessions, HEART, heart(60, name=NEW_NAME))
-    assert (stats.inserted, stats.updated) == (0, 1)
+    assert (stats.inserted, stats.unchanged) == (0, 1)
     assert len(visible(await counted_rows(sessions))) == 2
     async with sessions() as session:
         _, errors, notes = await verify_identities(session)
@@ -317,7 +329,8 @@ async def test_marking_defers_while_a_rename_is_undecided(sessions, clock) -> No
 
 async def test_three_step_rename_chains_step_by_step(sessions, clock) -> None:
     """A -> B -> C, where B only ever returned new instants (it never met A's rows): each
-    step satisfies the rule, so both links are decided; C's records land on A's rows."""
+    step satisfies the rule, so both links are decided; C's records get rows of their own,
+    linked at once to A's (which keep A's payloads only)."""
     old = await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
     await identity_backfill(sessions)
     clock.now = T0 + 5 * HOUR
@@ -331,9 +344,11 @@ async def test_three_step_rename_chains_step_by_step(sessions, clock) -> None:
     }
     clock.advance(hours=1)
     stats = await store(sessions, HEART, heart(60, name="Example Band 3"))
-    assert (stats.inserted, stats.updated) == (0, 1)
+    assert (stats.inserted, stats.updated) == (1, 0)
     rows = await raw_rows(sessions, HEART)
-    assert [name_of(row) for row in rows if row.id == old] == ["Example Band 3"]
+    assert [name_of(row) for row in rows if row.id == old] == [OLD_NAME]
+    assert [row.id for row in await counted_rows(sessions)][0] == old
+    assert len(await counted_rows(sessions)) == 3
 
 
 async def test_a_second_device_alongside_blocks_a_chain(sessions, clock) -> None:

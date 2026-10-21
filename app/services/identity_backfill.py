@@ -60,11 +60,13 @@ any time. Only one run at a time: a second one refuses at once.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import uuid
+from array import array
 from collections import Counter, defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -99,6 +101,7 @@ from app.services import source_chains
 from app.services.identity import aliases, among
 from app.services.source_chains import (
     LOCK_TIMEOUT,
+    PAIR_KEYS,
     Chains,
     Evidence,
     LockBusy,
@@ -106,11 +109,13 @@ from app.services.source_chains import (
     backfill_lock,
     decide_chains,
     describe,
+    dump_agreement,
     gap_seconds,
     insert_chain,
     load_chains,
     lock_data_type,
     ordered_pair,
+    parse_agreement,
     record_devices,
     record_evidence,
     record_refutations,
@@ -183,8 +188,13 @@ class BackfillStats:
     ambiguous: list[dict] = field(default_factory=list)
     refuted: list[dict] = field(default_factory=list)
     returned: list[dict] = field(default_factory=list)
-    # Pairs established distinct by evidence alone whose sightings look like a rename.
+    # Pairs established distinct by evidence alone that look like a rename.
     review_distinct: list[dict] = field(default_factory=list)
+    # Deletions the last complete fetches left undecided, and the sources they wait for.
+    deferred_deletions: list[dict] = field(default_factory=list)
+    # Ordered pair of fingerprints with evidence -> [keys whose rows of both held the same
+    # reading, keys whose rows held two] among the keys this run settled.
+    agreement: dict[tuple[str, str], list[int]] = field(default_factory=dict)
     # Why an incremental run did nothing, or did a full pass instead.
     skipped: str | None = None
     # The data type failed (the run went on with the others).
@@ -198,12 +208,18 @@ class BackfillStats:
         "refuted",
         "returned",
         "review_distinct",
+        "deferred_deletions",
     )
 
     def add(self, other: BackfillStats) -> None:
         for name in self.__dataclass_fields__:
             if name == "linked":
                 self.linked.update(other.linked)
+            elif name == "agreement":
+                for pair, (agree, disagree) in other.agreement.items():
+                    counts = self.agreement.setdefault(pair, [0, 0])
+                    counts[0] += agree
+                    counts[1] += disagree
             elif name in self._LISTS:
                 getattr(self, name).extend(getattr(other, name))
             elif name in ("mode", "skipped", "error"):
@@ -215,6 +231,10 @@ class BackfillStats:
         values = {name: getattr(self, name) for name in self.__dataclass_fields__}
         values["linked"] = dict(sorted(self.linked.items()))
         values["superseded"] = sum(self.linked.values())
+        values["agreement"] = [
+            {"fingerprints": _fingerprints(*pair), "same_reading": agree, "two_readings": other}
+            for pair, (agree, other) in sorted(self.agreement.items())
+        ]
         return values
 
     def summary(self) -> dict[str, Any]:
@@ -242,6 +262,9 @@ class BackfillStats:
             "deletions_suspicious": self.deletions_suspicious,
             "conflicts": self.conflicts,
             "review_distinct": len(self.review_distinct),
+            "deferred_deletions": sum(
+                entry.get("deferred", 0) for entry in self.deferred_deletions
+            ),
             "skipped": self.skipped,
             "error": self.error,
             "open": {
@@ -250,6 +273,15 @@ class BackfillStats:
                 "kept_apart": short(undecided, "sources", "fingerprints", "why"),
                 "review_distinct": short(self.review_distinct, "sources", "fingerprints", "why"),
                 "refuted": short(self.refuted, "from", "to", "fingerprints"),
+                "deferred_deletions": short(
+                    self.deferred_deletions,
+                    "rows_of",
+                    "returned_by",
+                    "fingerprints",
+                    "deferred",
+                    "at",
+                    "decide",
+                ),
             },
         }
 
@@ -606,16 +638,16 @@ async def _settle_chains(
     statement_timeout: str,
     notice: Notice | None = None,
     apply: Callable[[AsyncSession, Chains], Awaitable[None]] | None = None,
-) -> tuple[Chains, list[str]]:
+) -> tuple[Chains, DeviceChange]:
     """Merge the spans and evidence (full run), refute, decide and record the chains, and log
     the devices that changed, under the exclusive lock. ``apply``: an owner decision applied
     first (identity-decide).
 
-    Returns the chains (with a dry run's planned links) and the fingerprints whose device
-    changed (a link of this run, the decision, a refutation)."""
+    Returns the chains (with a dry run's planned links) and the fingerprint pairs that are
+    no longer, or newly, one device (a link of this run, the decision, a refutation)."""
     decided_by = "backfill" if timeline is not None else "reconciler"
 
-    async def work(session: AsyncSession) -> tuple[Chains, list[str]]:
+    async def work(session: AsyncSession) -> tuple[Chains, DeviceChange]:
         now = await source_chains.database_now(session)
         chains = await load_chains(session, spec.name)
         if timeline is not None:
@@ -637,7 +669,8 @@ async def _settle_chains(
             else:
                 await write_spans(session, spec.name, timeline.spans, now)
                 await record_evidence(session, spec.name, chains, found)
-        members_before = {name: chains.members(name) for name in chains.spans}
+        names = set(chains.spans) | {name for link in chains.links for name in link}
+        members_before = {name: chains.members(name) for name in names}
         if apply is not None:
             await apply(session, chains)
         if dry_run:
@@ -695,16 +728,25 @@ async def _settle_chains(
             # Readers count supersessions by these devices: logged in this same transaction.
             await record_devices(session, spec.name, chains, now)
         _report(chains, timeline, recorded, decision.ambiguous, refuted, stats)
-        changed = {
-            name
-            for name in chains.spans
-            if chains.members(name) != members_before.get(name, frozenset((name,)))
-        }
-        for old, new in recorded:
-            changed |= {old, new}
-        return chains, sorted(changed)
+        stats.deferred_deletions = await _deferred_of(session, spec.name)
+        change = DeviceChange()
+        for name in names | {name for link in chains.links for name in link}:
+            before = members_before.get(name, frozenset((name,)))
+            after = chains.members(name)
+            change.lapsed.update(ordered_pair(name, other) for other in before - after)
+            change.joined.update(ordered_pair(name, other) for other in after - before)
+        return chains, change
 
     return await _exclusively(sessions, spec.name, work, statement_timeout, notice, dry_run=dry_run)
+
+
+@dataclass
+class DeviceChange:
+    """Fingerprint pairs (ordered) that are no longer one device - their links lapsed: both
+    sides are settled again, so each device counts once - and that newly are."""
+
+    lapsed: set[tuple[str, str]] = field(default_factory=set)
+    joined: set[tuple[str, str]] = field(default_factory=set)
 
 
 # --- pass 2: links ------------------------------------------------------------------------
@@ -754,12 +796,22 @@ async def _plan_batch(
     *,
     count_groups: bool = True,
 ) -> _Plan:
-    """Per key and device: one holder (live first, one that already holds others first, then
-    the newest), every other row of the device linked to it (a row of another fingerprint
-    only with the same reading), and the rows those held linked to it too - so two devices
-    joined later, each with rows it held, end with one holder. Links no longer in force
-    (``chains.in_force``) are history: their rows are linked again. A link that would hide a
-    live row behind a deleted one, or close a cycle of links, is not made (``conflicts``)."""
+    """Per key and device, in two steps:
+
+    1. per fingerprint, its *root* (live first, then the one seen last): every other row of
+       that fingerprint not yet superseded by one of its own is linked to it (a duplicate, an
+       older shape or value of what the source returns; such a link is always in force);
+    2. per device, its *holder* among the roots that are counted (live first, the one the
+       others already link to, the one that already holds others, then the newest): every
+       other counted root that measured the same is linked to it (a value of its own is
+       never hidden: ``kept_differing``).
+
+    So only roots get links across fingerprints: when a chain is rejected or refuted, each
+    fingerprint still counts once, and two forms joined later are linked root to root. The
+    rows a newly linked row held are linked to its holder too (one step for readers), where
+    they are of the holder's fingerprint or measured the same. A link that would close a
+    cycle of links (in any state) is not made (``conflicts``). Links no longer in force are
+    history: their rows are settled again like any other."""
     plan = _Plan()
     groups: dict[str, list[_Row]] = defaultdict(list)
     for row in rows:
@@ -769,13 +821,20 @@ async def _plan_batch(
     by_id = {row.raw_id: row for row in rows}
     existing = {(link.old, link.new) for link in links}
     edges: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
-    superseded_now: set[uuid.UUID] = set()
+    # Rows superseded by a row of their own fingerprint (always in force), rows superseded
+    # in force by a counted row (hidden from readers), and the rows each row holds in force.
+    own_superseded: set[uuid.UUID] = set()
+    hidden: set[uuid.UUID] = set()
     dependents: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
     for link in links:
         edges[link.old].add(link.new)
+        if link.old_source == link.new_source:
+            own_superseded.add(link.old)
         if chains.in_force(link.old_source, link.new_source):
-            superseded_now.add(link.old)
             dependents[link.new].append(link.old)
+            holder = by_id.get(link.new)
+            if holder is None or not holder.deleted:
+                hidden.add(link.old)
     pointed = set(dependents)
 
     def reaches(start: uuid.UUID, target: uuid.UUID) -> bool:
@@ -789,10 +848,44 @@ async def _plan_batch(
                     frontier.append(following)
         return False
 
+    def measured(row: _Row) -> str | None:
+        return reading(spec, row.raw_json)
+
     def add_link(row: _Row, holder: _Row) -> None:
         plan.links.append((row, holder, supersession_reason(spec, row.raw_json, holder.raw_json)))
         edges[row.raw_id].add(holder.raw_id)
         existing.add((row.raw_id, holder.raw_id))
+        dependents[holder.raw_id].append(row.raw_id)
+        hidden.add(row.raw_id)
+        # What the row held, the holder holds now (one step for readers): rows of the
+        # holder's fingerprint, and rows of others that measured the same.
+        for dependent in list(dependents.get(row.raw_id, ())):
+            held = by_id.get(dependent)
+            if (
+                held is not None
+                and (
+                    held.identity.source == holder.identity.source
+                    or measured(held) == measured(holder)
+                )
+                and (dependent, holder.raw_id) not in existing
+                and not reaches(holder.raw_id, dependent)
+            ):
+                plan.links.append(
+                    (held, holder, supersession_reason(spec, held.raw_json, holder.raw_json))
+                )
+                edges[dependent].add(holder.raw_id)
+                existing.add((dependent, holder.raw_id))
+                dependents[holder.raw_id].append(dependent)
+
+    def join(row: _Row, holder: _Row) -> bool:
+        if (row.raw_id, holder.raw_id) in existing:
+            return True
+        if reaches(holder.raw_id, row.raw_id):
+            # Left double (listed) unless the row is marked deleted: then it counts nowhere.
+            stats.conflicts += not row.deleted
+            return False
+        add_link(row, holder)
+        return True
 
     for members in groups.values():
         if count_groups:
@@ -800,19 +893,58 @@ async def _plan_batch(
         devices: dict[str, list[_Row]] = defaultdict(list)
         for row in members:
             devices[chains.device(row.identity.source)].append(row)
-        if count_groups and len(devices) > 1:
-            stats.distinct_sources += 1
+        if count_groups:
+            if len(devices) > 1:
+                stats.distinct_sources += 1
+            _tally_agreement(spec, members, chains, stats)
         for device in devices.values():
-            candidates = [row for row in device if row.raw_id not in superseded_now]
             if count_groups:
-                stats.already_superseded += len(device) - len(candidates)
-            if not candidates:
-                continue
-            holder = max(
-                candidates,
-                key=lambda row: (not row.deleted, row.raw_id in pointed, *row.order[1:]),
-            )
-            if count_groups and holder.deleted and all(row.deleted for row in device):
+                stats.already_superseded += sum(row.raw_id in hidden for row in device)
+            by_source: dict[str, list[_Row]] = defaultdict(list)
+            for row in device:
+                by_source[row.identity.source].append(row)
+            roots: list[_Row] = []
+            for own in by_source.values():
+                candidates = [row for row in own if row.raw_id not in own_superseded] or own
+                root = max(
+                    candidates,
+                    key=lambda row: (
+                        not row.deleted,
+                        row.identity.shape or "",
+                        row.last_seen_at,
+                        row.raw_id in pointed,
+                        row.first_seen_at,
+                        str(row.raw_id),
+                    ),
+                )
+                for row in candidates:
+                    if row is not root:
+                        join(row, root)
+                roots.append(root)
+            counted = [root for root in roots if root.raw_id not in hidden]
+            if len(counted) > 1:
+                holder = max(
+                    counted,
+                    key=lambda row: (
+                        not row.deleted,
+                        # A growing interval: its latest shape holds the record.
+                        row.identity.shape or "",
+                        sum((other.raw_id, row.raw_id) in existing for other in counted),
+                        row.raw_id in pointed,
+                        *row.order[1:],
+                    ),
+                )
+                value = measured(holder)
+                for root in counted:
+                    if root is holder:
+                        continue
+                    if measured(root) != value:
+                        # Another fingerprint that measured something else: never hidden.
+                        stats.kept_differing += 1
+                        continue
+                    join(root, holder)
+            if count_groups and all(row.deleted for row in device):
+                holder = max(device, key=lambda row: row.order)
                 others = [
                     row
                     for row in members
@@ -824,41 +956,11 @@ async def _plan_batch(
                     stats.deletions_suspicious += 1
                 else:
                     stats.deletions_kept += 1
-            measured = reading(spec, holder.raw_json)
-
-            def same(row: _Row, holder: _Row = holder, measured: str | None = measured) -> bool:
-                return (
-                    row.identity.source == holder.identity.source
-                    or reading(spec, row.raw_json) == measured
-                )
-
-            for row in candidates:
-                if row is holder:
-                    continue
-                if holder.deleted and not row.deleted:
-                    stats.conflicts += 1
-                    continue
-                if not same(row):
-                    # Another fingerprint that measured something else: never hidden.
-                    stats.kept_differing += 1
-                    continue
-                if (row.raw_id, holder.raw_id) in existing or reaches(holder.raw_id, row.raw_id):
-                    stats.conflicts += 1
-                    continue
-                add_link(row, holder)
-                # What the row held, the holder holds now (one step for readers).
-                for dependent in dependents.get(row.raw_id, ()):
-                    held = by_id.get(dependent)
-                    if (
-                        held is not None
-                        and same(held)
-                        and (dependent, holder.raw_id) not in existing
-                        and not reaches(holder.raw_id, dependent)
-                    ):
-                        add_link(held, holder)
-        # Every row reachable by its key and fingerprint; the holder of its own first.
+        # Every row reachable by its key and fingerprint: its fingerprint's root first.
         for row in sorted(
-            members, key=lambda row: (row.raw_id not in superseded_now, row.order), reverse=True
+            members,
+            key=lambda row: (row.raw_id not in own_superseded, row.order),
+            reverse=True,
         ):
             name = row.identity.specific_key
             if row.google_data_point_id == new_record_id(name):
@@ -869,6 +971,53 @@ async def _plan_batch(
                 continue
             plan.aliases.setdefault(name, row)
     return plan
+
+
+def _review_agreeing(chains: Chains, stats: BackfillStats) -> None:
+    """Pairs established distinct by evidence whose keys this run found mostly agreeing (a
+    rename with reprocessing): listed under ``review_distinct`` at once (the reconciler's
+    next run no longer takes them for two devices)."""
+    listed = {tuple(entry["fingerprints"]) for entry in stats.review_distinct}
+    for pair, (agree, disagree) in sorted(stats.agreement.items()):
+        left, right = pair
+        if (
+            agree < PAIR_KEYS
+            or agree < disagree
+            or pair in chains.pair_decisions
+            or not source_chains.established(chains.evidence.get(pair, ()))
+            or tuple(_fingerprints(left, right)) in listed
+        ):
+            continue
+        labels = [chains.spans[name].label if name in chains.spans else name[:12] for name in pair]
+        stats.review_distinct.append(
+            {
+                "sources": labels,
+                "fingerprints": _fingerprints(left, right),
+                "same_reading_keys": agree,
+                "two_reading_keys": disagree,
+                "why": "different values for a few records, but the same readings for most "
+                "records both hold: it looks like a rename whose records were reprocessed "
+                "(no deletion is marked on it); decide not-distinct and link, or distinct",
+            }
+        )
+
+
+def _tally_agreement(
+    spec: DataTypeSpec, members: list[_Row], chains: Chains, stats: BackfillStats
+) -> None:
+    """For every pair of fingerprints with evidence of two devices that both hold this key:
+    whether some row of each holds the same reading (agree) or not (disagree)."""
+    readings: dict[str, set[str | None]] = defaultdict(set)
+    for row in members:
+        readings[row.identity.source].add(reading(spec, row.raw_json))
+    names = sorted(readings)
+    for position, left in enumerate(names):
+        for right in names[position + 1 :]:
+            pair = ordered_pair(left, right)
+            if pair not in chains.evidence:
+                continue
+            counts = stats.agreement.setdefault(pair, [0, 0])
+            counts[0 if readings[left] & readings[right] else 1] += 1
 
 
 async def _write_plan(
@@ -1070,6 +1219,17 @@ async def _settle_starts(
     await _write_plan(session, spec, plan, stats, dry_run=dry_run)
 
 
+async def _deferred_of(session: AsyncSession, data_type: str) -> list[dict]:
+    """The deletions the last complete fetches deferred (app/sync/deletions.py)."""
+    state = await session.get(IdentityReconcileState, data_type)
+    if state is None or not state.deferred_deletions:
+        return []
+    try:
+        return list(json.loads(state.deferred_deletions).get("sources", []))
+    except (ValueError, AttributeError):
+        return []
+
+
 async def _reconcile_state(sessions: async_sessionmaker, data_type: str):
     async with sessions() as session:
         return await session.get(IdentityReconcileState, data_type)
@@ -1083,6 +1243,7 @@ async def _save_state(
     stats: BackfillStats | None,
     error: str | None = None,
     checkpoint: bool = True,
+    mode: str | None = None,
 ) -> None:
     async with sessions.begin() as session:
         finished = await source_chains.database_now(session)
@@ -1098,11 +1259,20 @@ async def _save_state(
             state.last_mode = stats.mode
             state.last_result = json.dumps(stats.summary(), sort_keys=True)
             state.last_error = None
+            # The latest count per pair that this run saw often enough replaces the last.
+            agreement = parse_agreement(state.pair_agreement)
+            for pair, (agree, disagree) in stats.agreement.items():
+                if agree + disagree >= PAIR_KEYS:
+                    agreement[pair] = (agree, disagree)
+            if agreement:
+                state.pair_agreement = dump_agreement(agreement)
             if stats.skipped is None and checkpoint:
                 state.checkpoint_at = started
                 if stats.mode == "full":
                     state.full_run_at = finished
         else:
+            # The mode of this failed run, not of the last that succeeded.
+            state.last_mode = mode or state.last_mode
             state.last_error = (error or "failed")[:2000]
 
 
@@ -1218,6 +1388,7 @@ async def backfill_data_type(
             )
         )
     total.unidentified += undated or 0
+    _review_agreeing(planned, total)
     if not dry_run:
         await _save_state(sessions, data_type, started=started, stats=total)
     return total
@@ -1228,7 +1399,6 @@ async def relink_data_type(
     data_type: str,
     apply: Callable[[AsyncSession, Chains], Awaitable[None]],
     *,
-    link: bool | Callable[[], bool] = True,
     batch_size: int = 5_000,
     dry_run: bool = False,
     statement_timeout: str = STATEMENT_TIMEOUT,
@@ -1236,14 +1406,15 @@ async def relink_data_type(
     notice: Notice | None = None,
 ) -> BackfillStats:
     """Apply an owner decision (``apply``, run under the exclusive lock first), decide the
-    chains again from the sightings, then - when ``link`` or a chain was decided now - settle
-    the whole data type again: pass 2 over every row (stale stored starts included: their
-    rows have the start of their key)."""
+    chains again from the sightings, then settle again exactly the rows whose devices changed:
+    the rows of every link between two fingerprints that are no longer one device (each side
+    then counts once), and, for two fingerprints that newly are, every row written since the
+    later of them was first seen (``_settle_changed``)."""
     spec = spec_for(data_type)
     total = BackfillStats(mode="decision")
     async with sessions() as session:
         started = await source_chains.database_now(session)
-    planned, _ = await _settle_chains(
+    planned, change = await _settle_chains(
         sessions,
         spec,
         None,
@@ -1253,21 +1424,20 @@ async def relink_data_type(
         notice=notice,
         apply=apply,
     )
-    if (link() if callable(link) else link) or any(
-        chain["decided"] == "this run" for chain in total.chains
-    ):
-        await _link_pass(
-            sessions,
-            spec,
-            planned,
-            total,
-            batch_size=batch_size,
-            dry_run=dry_run,
-            after=None,
-            statement_timeout=statement_timeout,
-            progress=progress,
-            notice=notice,
-        )
+    await _settle_changed(
+        sessions,
+        spec,
+        planned,
+        change,
+        total,
+        since=None,
+        batch_size=batch_size,
+        dry_run=dry_run,
+        statement_timeout=statement_timeout,
+        progress=progress,
+        notice=notice,
+    )
+    _review_agreeing(planned, total)
     if not dry_run:
         await _save_state(sessions, data_type, started=started, stats=total, checkpoint=False)
     return total
@@ -1284,9 +1454,9 @@ async def reconcile_data_type(
     notice: Notice | None = None,
 ) -> BackfillStats:
     """An incremental run for one data type: chains from the sightings as they are, links
-    for the rows changed since the checkpoint (minus ``OVERLAP``). A data type that never had
-    a full run gets its first full pass instead (``skipped`` says so), so none is left out
-    for good."""
+    for the rows changed since the checkpoint (minus ``OVERLAP``) and for every row whose
+    device changed (``_settle_changed``). A data type that never had a full run gets its first
+    full pass instead (``skipped`` says so), so none is left out for good."""
     spec = spec_for(data_type)
     state = await _reconcile_state(sessions, data_type)
     if state is None or state.full_run_at is None or state.checkpoint_at is None:
@@ -1304,7 +1474,7 @@ async def reconcile_data_type(
     total = BackfillStats(mode="incremental")
     async with sessions() as session:
         started = await source_chains.database_now(session)
-    planned, changed = await _settle_chains(
+    planned, change = await _settle_chains(
         sessions,
         spec,
         None,
@@ -1313,82 +1483,105 @@ async def reconcile_data_type(
         statement_timeout=statement_timeout,
         notice=notice,
     )
-    since = as_utc(state.checkpoint_at) - OVERLAP
-    for fingerprint in changed:
-        # Every row of a newly joined fingerprint was written after its first sighting.
-        if fingerprint in planned.spans:
-            since = min(since, planned.spans[fingerprint].first - OVERLAP)
-    full_run = as_utc(state.full_run_at)
-    if any(
-        chain["decided"] == "this run"
-        and all(planned.spans[name].first < full_run for name in _full(planned, chain))
-        for chain in total.chains
-    ):
-        # Both forms were in the archive before the last full run: their rows may predate
-        # 0011 (no payload_received_at), so only a pass over every row finds them all. (A
-        # device that parted needs nothing: its links simply stop being in force.)
-        await _link_pass(
-            sessions,
-            spec,
-            planned,
-            total,
-            batch_size=batch_size,
-            dry_run=dry_run,
-            after=None,
-            statement_timeout=statement_timeout,
-            progress=progress,
-            notice=notice,
-        )
-        if not dry_run:
-            await _save_state(sessions, data_type, started=started, stats=total)
-        return total
+    await _settle_changed(
+        sessions,
+        spec,
+        planned,
+        change,
+        total,
+        since=as_utc(state.checkpoint_at) - OVERLAP,
+        batch_size=batch_size,
+        dry_run=dry_run,
+        statement_timeout=statement_timeout,
+        progress=progress,
+        notice=notice,
+    )
+    _review_agreeing(planned, total)
+    if not dry_run:
+        await _save_state(sessions, data_type, started=started, stats=total)
+    return total
+
+
+async def _settle_changed(
+    sessions: async_sessionmaker,
+    spec: DataTypeSpec,
+    planned: Chains,
+    change: DeviceChange,
+    total: BackfillStats,
+    *,
+    since: datetime | None,
+    batch_size: int,
+    dry_run: bool,
+    statement_timeout: str,
+    progress: Callable[[str, BackfillStats, datetime], None] | None,
+    notice: Notice | None,
+) -> None:
+    """Settle again, batch by batch, the start times of
+
+    * rows created or given a new payload since ``since`` (an incremental run);
+    * every row of a link between two fingerprints that are no longer one device (``lapsed``:
+      a rejected or refuted chain, a ``distinct`` decision), whatever its age - its two sides
+      are linked again within each device, so neither counts twice;
+    * every row touched since the later of two fingerprints that are newly one device was
+      first seen (``joined``): each of its rows was written since, also one stored before
+      migration 20261020_0011 (without ``payload_received_at``).
+
+    The start times are read first, each set in one short transaction (none is held open
+    while they are settled), and kept as integers."""
+    touched: datetime | None = None
+    for left, right in change.joined:
+        spans = [planned.spans.get(left), planned.spans.get(right)]
+        if spans[0] is None or spans[1] is None:
+            touched = datetime(1970, 1, 1, tzinfo=UTC)
+            continue
+        later = max(span.first for span in spans if span is not None) - OVERLAP
+        touched = later if touched is None else min(touched, later)
+    starts = await _collect_starts(
+        sessions, spec.name, since=since, touched=touched, lapsed=change.lapsed
+    )
     step = max(1, batch_size // 10)
-    async for chunk in _changed_starts(sessions, data_type, since, step):
-        stats = BackfillStats(mode="incremental")
+    for offset in range(0, len(starts), step):
+        chunk = [_from_micros(value) for value in starts[offset : offset + step]]
+        stats = BackfillStats(mode=total.mode)
 
         async def settle(session: AsyncSession, chunk=chunk, stats=stats) -> None:
             await _settle_starts(
                 session, spec, chunk, (), planned, stats, dry_run=dry_run, count=True
             )
 
-        await _exclusively(sessions, data_type, settle, statement_timeout, notice, dry_run=dry_run)
+        await _exclusively(sessions, spec.name, settle, statement_timeout, notice, dry_run=dry_run)
         total.add(stats)
         if progress is not None:
-            progress(data_type, total, chunk[-1])
-    if not dry_run:
-        await _save_state(sessions, data_type, started=started, stats=total)
-    return total
+            progress(spec.name, total, chunk[-1])
 
 
-async def _changed_starts(
-    sessions: async_sessionmaker, data_type: str, since: datetime, size: int
-) -> AsyncIterator[list[datetime]]:
-    """The distinct start times of rows created or given a new payload since ``since``, in
-    order, ``size`` at a time: streamed from a read-only transaction of its own, so a run
-    after millions of changed rows never holds them all in memory."""
-    async with sessions() as session:
-        if session.get_bind().dialect.name != "postgresql":
-            # SQLite (tests): one connection, which the batches need meanwhile.
-            starts = (
-                await session.scalars(
-                    select(RawHealthData.source_start_time)
-                    .where(
-                        RawHealthData.data_type == data_type,
-                        RawHealthData.updated_at >= since,
-                        RawHealthData.payload_received_at >= since,
-                        RawHealthData.source_start_time.is_not(None),
-                    )
-                    .distinct()
-                    .order_by(RawHealthData.source_start_time)
-                )
-            ).all()
-            await session.rollback()
-            for offset in range(0, len(starts), size):
-                yield [as_utc(start) for start in starts[offset : offset + size]]
-            return
-        result = await session.stream(
-            select(RawHealthData.source_start_time)
-            .where(
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _micros(value: datetime) -> int:
+    return (as_utc(value) - _EPOCH) // timedelta(microseconds=1)
+
+
+def _from_micros(value: int) -> datetime:
+    return _EPOCH + timedelta(microseconds=value)
+
+
+async def _collect_starts(
+    sessions: async_sessionmaker,
+    data_type: str,
+    *,
+    since: datetime | None,
+    touched: datetime | None,
+    lapsed: set[tuple[str, str]],
+) -> array:
+    """The distinct start times (microseconds since the epoch, sorted) of the rows
+    ``_settle_changed`` settles; each query streamed in a short read-only transaction of its
+    own, so a long run never holds one snapshot (vacuum is not held back)."""
+    sources: list[array] = []
+    queries = []
+    if since is not None:
+        queries.append(
+            select(RawHealthData.source_start_time).where(
                 RawHealthData.data_type == data_type,
                 # ix_raw_health_data_updated_at finds what a fetch touched; only rows created
                 # or given a new payload since can need a link.
@@ -1396,18 +1589,51 @@ async def _changed_starts(
                 RawHealthData.payload_received_at >= since,
                 RawHealthData.source_start_time.is_not(None),
             )
-            .distinct()
-            .order_by(RawHealthData.source_start_time)
-            .execution_options(yield_per=size)
         )
-        chunk: list[datetime] = []
-        async for (start,) in result:
-            chunk.append(as_utc(start))
-            if len(chunk) >= size:
-                yield chunk
-                chunk = []
-        if chunk:
-            yield chunk
+    if touched is not None:
+        queries.append(
+            select(RawHealthData.source_start_time).where(
+                RawHealthData.data_type == data_type,
+                RawHealthData.updated_at >= touched,
+                RawHealthData.source_start_time.is_not(None),
+            )
+        )
+    if lapsed:
+        link = RawHealthDataSupersession
+        pairs = sorted({*lapsed, *((right, left) for left, right in lapsed)})
+        for column in (link.old_raw_id, link.new_raw_id):
+            queries.append(
+                select(RawHealthData.source_start_time)
+                .join(link, column == RawHealthData.id)
+                .where(
+                    link.data_type == data_type,
+                    tuple_(link.old_fingerprint, link.new_fingerprint).in_(pairs),
+                    RawHealthData.source_start_time.is_not(None),
+                )
+            )
+    for query in queries:
+        found = array("q")
+        async with sessions() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                result = await session.stream(
+                    query.distinct()
+                    .order_by(RawHealthData.source_start_time)
+                    .execution_options(yield_per=10_000)
+                )
+                async for (start,) in result:
+                    found.append(_micros(start))
+            else:
+                result = await session.scalars(
+                    query.distinct().order_by(RawHealthData.source_start_time)
+                )
+                found.extend(_micros(start) for start in result.all())
+            await session.rollback()
+        sources.append(found)
+    merged = array("q")
+    for value in heapq.merge(*sources):
+        if not merged or merged[-1] != value:
+            merged.append(value)
+    return merged
 
 
 async def data_types_in_archive(sessions: async_sessionmaker) -> list[str]:
@@ -1467,7 +1693,14 @@ async def identity_backfill(
                     extra={"event": "IDENTITY_RECONCILE_DATA_TYPE_FAILED", "data_type": name},
                 )
                 if not dry_run:
-                    await _save_state(sessions, name, started=started, stats=None, error=f"{exc}")
+                    await _save_state(
+                        sessions,
+                        name,
+                        started=started,
+                        stats=None,
+                        error=f"{exc}",
+                        mode="incremental" if incremental else "full",
+                    )
                 results[name] = BackfillStats(
                     mode="incremental" if incremental else "full", error=f"{exc}"[:2000]
                 )

@@ -11,7 +11,17 @@ import asyncio
 from datetime import timedelta
 
 import pytest
-from identity_records import HEART, NEW_NAME, OLD_NAME, T0, fitbit, heart, legacy, store
+from identity_records import (
+    HEART,
+    NEW_NAME,
+    OLD_NAME,
+    T0,
+    counted_rows,
+    fitbit,
+    heart,
+    legacy,
+    store,
+)
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
@@ -160,9 +170,10 @@ async def test_sightings_keep_their_label_and_source_on_postgresql(pg_sessions) 
                 await session.execute(text(statement))
 
 
-async def test_the_incremental_run_streams_changed_starts(pg_sessions, clock) -> None:
-    """The incremental run held every changed start time in memory (hundreds of MB after
-    a large import); it streams them in chunks and links all."""
+async def test_the_incremental_run_collects_changed_starts_compactly(pg_sessions, clock) -> None:
+    """The incremental run held every changed start time in memory as objects, and one
+    snapshot open for the whole run: it reads them into an integer array in a short
+    transaction of its own, then settles them in chunks, and links all."""
     for minute in range(30):
         await legacy(pg_sessions, HEART, heart(60, at=T0 + minute * MINUTE), T0, last=T0 + HOUR)
     await identity_backfill(pg_sessions)
@@ -170,17 +181,27 @@ async def test_the_incremental_run_streams_changed_starts(pg_sessions, clock) ->
     for minute in range(30):
         await store(pg_sessions, HEART, heart(60, at=T0 + minute * MINUTE, name=NEW_NAME))
     chunks: list[int] = []
-    original = reconciler._changed_starts
+    collected: list = []
+    original_settle, original_collect = reconciler._settle_starts, reconciler._collect_starts
 
-    async def counting(*args):
-        async for chunk in original(*args):
-            chunks.append(len(chunk))
-            yield chunk
+    async def counting(session, spec, starts, *args, **kwargs):
+        chunks.append(len(starts))
+        return await original_settle(session, spec, starts, *args, **kwargs)
 
-    reconciler._changed_starts = counting
+    async def collecting(*args, **kwargs):
+        found = await original_collect(*args, **kwargs)
+        collected.append(found)
+        return found
+
+    reconciler._settle_starts = counting
+    reconciler._collect_starts = collecting
     try:
         report = await identity_backfill(pg_sessions, incremental=True, batch_size=100)
     finally:
-        reconciler._changed_starts = original
+        reconciler._settle_starts = original_settle
+        reconciler._collect_starts = original_collect
+    # The chain is decided by this run: every row since the new name appeared is settled.
     assert sum(report["heart-rate"].linked.values()) == 30
+    assert len(await counted_rows(pg_sessions)) == 30
+    assert [found.typecode for found in collected] == ["q"] and len(collected[0]) == 30
     assert chunks == [10, 10, 10]

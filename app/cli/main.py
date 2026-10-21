@@ -82,6 +82,13 @@ def status() -> None:
                 # Chains the reconciler decided that the owner has not confirmed or rejected
                 # yet (health-mirror identity-decide confirm|reject).
                 "identity_review_suggested": open_chains,
+                # Deletions complete fetches left undecided: a source that may be the
+                # record's device renamed returned its reading (identity-decide).
+                "identity_deferred_deletions": [
+                    {"data_type": row.data_type, **json.loads(row.deferred_deletions)}
+                    for row in identity
+                    if row.deferred_deletions
+                ],
             }
 
     typer.echo(json.dumps(run(command()), indent=2))
@@ -512,11 +519,14 @@ def identity_decide(
 ) -> None:
     """Decide what the reconciler left open: two sources are one device, or two devices.
 
-    Recorded append-only (raw_source_decisions) and applied at once: after ``link`` and
-    ``not-distinct`` the data type is settled again (its rows are linked where they hold the
-    same reading). ``reject`` stops using a chain (the rows it linked stay linked: they held
-    equal readings), ``confirm`` takes it off the review list, ``distinct`` declares two
-    devices. Run with --dry-run first (docs/RUNBOOK.md).
+    Recorded append-only (raw_source_decisions) and applied at once; the rows whose devices
+    change are settled again. ``link`` joins two sources into one device (their rows are
+    linked where they hold the same reading); ``reject`` stops using a chain: its links no
+    longer hide anything, both sources count on their own (each record once per device), and
+    ``confirm`` undoes that; ``confirm`` also takes a chain off the review list; ``distinct``
+    declares two devices (a row whose reading then comes back only under the other source is
+    marked deleted by the next complete fetch: permanent) and ``not-distinct`` undoes it. Run
+    with --dry-run first (docs/RUNBOOK.md).
     """
     from app.services.identity_backfill import LockUnavailable
     from app.services.identity_decisions import DecisionRefused, decide_sources

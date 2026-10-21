@@ -35,8 +35,8 @@ NORMALIZED_TABLES = {
 def view_select(table: str) -> str:
     """The ``SELECT`` of ``analytics_<table>``: like the dashboard, a normalized row counts
     unless it is quarantined, its raw record (same key) is marked deleted at the source, or
-    that record is superseded, by a link in force, by a row that is not marked deleted
-    (``held_elsewhere``). The lookups are index probes: the raw table's (data_type,
+    that record is superseded, by a link in force, by a row that is neither marked deleted nor
+    quarantined (``held_elsewhere``). The lookups are index probes: the raw table's (data_type,
     google_data_point_id) key and the supersessions' (old_google_data_point_id, data_type)
     index; the fingerprints joined now are computed once per query."""
     types = NORMALIZED_TABLES[table]
@@ -53,5 +53,5 @@ def view_select(table: str) -> str:
         f"AND NOT EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
         "JOIN raw_health_data h ON h.id = s.new_raw_id "
         f"WHERE {link_type} AND s.old_google_data_point_id = {table}.google_data_point_id "
-        f"AND h.source_deleted_at IS NULL AND {in_force_sql('s')})"
+        f"AND h.source_deleted_at IS NULL AND h.is_quarantined = false AND {in_force_sql('s')})"
     )

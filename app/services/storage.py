@@ -23,7 +23,7 @@ from app.models.state import RawHealthData
 from app.parsers import normalize
 from app.parsers.common import payload_hash, temporal
 from app.services import source_chains
-from app.services.identity import add_aliases, among, resolve_ids
+from app.services.identity import add_aliases, add_links, among, resolve_ids
 from app.services.source_chains import record_evidence, record_sightings
 
 logger = logging.getLogger(__name__)
@@ -208,7 +208,8 @@ async def _store(
             event(logger, "RECORD_BATCH_DUPLICATE_CONFLICT", data_type=spec.name)
         sequence.append((record, google_id, digest, start, end, timezone))
 
-    google_ids = sorted(by_id)
+    # The rows written onto and the rows new ones are linked to (resolution.locked).
+    google_ids = sorted(set(by_id) | resolution.locked)
     existing = await _lock_rows(session, spec, google_ids, resolution)
     # After the data type's lock and the row locks: a writer that waited never stamps an
     # older time than a fetch that began while it waited.
@@ -266,6 +267,9 @@ async def _store(
             rows.sort(key=lambda row: row["google_data_point_id"])
             await _upsert_raw_many(session, rows)
     await add_aliases(session, spec.name, resolution.new_aliases, raw_ids)
+    # New rows of a decided device that show what a counted row of it shows: linked at once,
+    # so the record is counted once (readers skip a row superseded by a link in force).
+    await add_links(session, spec.name, resolution.links, raw_ids, now)
     for model, values in normalized_values.items():
         values.sort(key=lambda row: (row.get("data_type", ""), row["google_data_point_id"]))
         await _upsert_normalized_many(session, model, values)

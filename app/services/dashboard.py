@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timeutil import as_utc
 from app.google_health.data_types import supported_data_types
 from app.models.health import HeartRate, SleepSession, Steps, Weight
-from app.models.identity import held_elsewhere, superseded
+from app.models.identity import held_elsewhere, holds_live, superseded
 from app.models.manual import ManualMeasurement
 from app.models.state import RawHealthData
 from app.parsers.common import first_number, parse_date, payload_for
@@ -71,10 +71,17 @@ async def dashboard_data(
 
     # A superseded row is a duplicate of a record another row holds now (migration
     # 20261021_0012): not counted while that row is live (a live superseded row whose holder
-    # was marked deleted counts again). With source deletions included, the holder stands
-    # for its duplicates whatever its mark.
+    # was marked deleted counts again). With source deletions included, a deleted row is not
+    # counted when it is superseded, or when a live duplicate it holds counts instead (never
+    # a deleted holder's value in place of a live row's).
     raw_superseded = held_elsewhere(RawHealthData.id)
-    any_superseded = superseded(RawHealthData.id)
+    any_superseded = or_(
+        raw_superseded,
+        and_(
+            RawHealthData.source_deleted_at.is_not(None),
+            or_(superseded(RawHealthData.id), holds_live(RawHealthData.id)),
+        ),
+    )
 
     def valid_source(model, data_type: str):
         raw = select(RawHealthData.id).where(
