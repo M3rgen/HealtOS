@@ -128,7 +128,7 @@ BACKFILL_LOCK = (0x48454932, 1)
 # wait behind it meanwhile), then how long it waits in the lock queue (every new writer of the
 # data type waits behind it then), before it backs off and retries; once it holds the lock, how
 # long it waits for any row lock (a long transaction of another writer).
-LOCK_TIMEOUT = "10s"
+LOCK_TIMEOUT = "100ms"
 QUEUE_TIMEOUT = "1s"
 ROW_LOCK_TIMEOUT = "2s"
 RULE = (
@@ -1186,7 +1186,7 @@ async def lock_data_type(
         return
     if wait is not None:
         loop = asyncio.get_running_loop()
-        deadline, pause = loop.time() + seconds(wait), 0.02
+        deadline, pause = loop.time() + seconds(wait), 0.01
         while True:
             if await session.scalar(
                 text("SELECT pg_try_advisory_xact_lock(:namespace, :key)"), arguments
@@ -1196,7 +1196,7 @@ async def lock_data_type(
                 await _queue_for_lock(session, arguments)
                 break
             await asyncio.sleep(pause)
-            pause = min(pause * 2, 0.25)
+            pause = min(pause * 2, 0.05)
     else:
         await session.execute(text("SELECT pg_advisory_xact_lock(:namespace, :key)"), arguments)
     await session.execute(text(f"SET LOCAL lock_timeout = '{ROW_LOCK_TIMEOUT}'"))

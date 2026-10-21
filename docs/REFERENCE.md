@@ -684,9 +684,10 @@ that the `analytics_*` views are the ones of 0012, and the links and chains them
 bookkeeping.
 
 **Concurrency.** `store_records` and deletion marking take a shared transaction lock per data type,
-each reconciler batch the exclusive one: it tries for it without queueing for up to 10 s (a waiting
-exclusive request would queue every new writer behind it, so writers never wait for a batch that
-is still waiting), then queues for at most 1 s; once it holds it, it waits at most 2 s for any row
+each reconciler batch the exclusive one: it tries for it without queueing for 0.1 s, then waits in
+the queue for at most 1 s (a waiting exclusive request queues every new writer behind it, so no
+sync waits more than about a second for a batch that is still waiting, even behind a long
+transaction); once it holds it, it waits at most 2 s for any row
 lock of another transaction (a long import holding rows), then rolls back, waits 2, 4, 8 … s and
 retries (`IDENTITY_RECONCILE_LOCK_BUSY`; the CLI prints each retry), and after 8 attempts gives up
 on that data type clearly; a sync of that data type waits for one batch (seconds), then continues.
