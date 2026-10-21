@@ -115,7 +115,7 @@ async def linked_pair(sessions) -> None:
     """A renamed duplicate linked to its successor by the backfill (with its source chain)."""
     from app.services.identity_backfill import identity_backfill
 
-    await legacy(sessions, HEART, heart(60), T0, deleted=T0 + timedelta(days=1))
+    await legacy(sessions, HEART, heart(60), T0)
     await legacy(sessions, HEART, heart(60, name="Example Band"), T0 + timedelta(days=1))
     await identity_backfill(sessions)
 

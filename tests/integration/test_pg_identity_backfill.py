@@ -110,7 +110,7 @@ async def execute(sessions, *statements: str) -> None:
 async def archive(pg_sessions) -> dict[str, uuid.UUID]:
     day = timedelta(days=1)
     return {
-        "old": await legacy(pg_sessions, HEART, heart(60), T0, deleted=T0 + day),
+        "old": await legacy(pg_sessions, HEART, heart(60), T0),
         "new": await legacy(pg_sessions, HEART, heart(60, name="Example Band"), T0 + day),
         "deleted": await legacy(
             pg_sessions, HEART, heart(70, at=T0 + timedelta(minutes=4)), T0, deleted=T0 + day

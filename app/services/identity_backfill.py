@@ -1027,17 +1027,19 @@ async def _plan_batch(
             # only live roots are linked across fingerprints.
             counted = [root for root in roots if root.raw_id not in hidden and not root.deleted]
             if len(counted) > 1:
-                # The row returned last holds the record (a later value under its name is
-                # written onto it, never hidden behind a stale one); of rows returned
-                # together, the device's newest form (the one returned again, as a rule).
                 holder = max(
                     counted,
                     key=lambda row: (
-                        row.last_seen_at,
-                        newest_form(row),
+                        # A growing interval: the end returned last holds the record (an end
+                        # Google no longer returns is stale, longer or not).
+                        row.last_seen_at if row.identity.shape else _EPOCH,
                         row.identity.shape or "",
                         sum((other.raw_id, row.raw_id) in existing for other in counted),
                         row.raw_id in pointed,
+                        row.last_seen_at,
+                        # Of rows returned together, the device's newest form (the one
+                        # returned again, as a rule).
+                        newest_form(row),
                         row.first_seen_at,
                         str(row.raw_id),
                     ),
