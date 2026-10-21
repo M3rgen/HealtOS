@@ -309,6 +309,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 | `EXTRA_DATA_TYPES` | Comma-separated evolving v4 data types; defaults to interval filtering |
 | `ENABLED_DATA_TYPES` | Optional comma-separated allowlist; blank enables the complete built-in registry |
 | `RECONCILIATION_*` | Daily/weekly schedule and lookback lengths |
+| `IDENTITY_RECONCILE_ENABLED`, `IDENTITY_RECONCILE_HOUR_UTC`, `IDENTITY_RECONCILE_MINUTE` | Nightly identity reconciler (default on, 02:30 UTC; see [Record identity](#record-identity)) |
 | `WATCHDOG_ENABLED`, `WATCHDOG_INTERVAL_SECONDS` | Enable local pipeline checks; defaults to every 15 minutes |
 | `PIPELINE_STALE_THRESHOLD_MINUTES` | Age at which frequently updated sync streams are stale; defaults to 120 minutes |
 | `STARTUP_GAP_THRESHOLD_MINUTES` | Minimum persisted sync/write gap that permits startup recovery; defaults to 120 minutes |
@@ -420,14 +421,19 @@ never marked.
 - A record whose time was moved upstream out of the window that is re-fetched looks deleted from
   that window and is marked until a fetch covering its new time returns it again (and unmarks it).
   For a move of more than 7 days that is the weekly 90-day reconciliation.
-- "Not returned" is decided per [record identity](#record-identity), not per row: a row that was
-  archived under an older id of a record (a grown interval, civil times added, or, once chained,
-  a device rename or package suffix change) is not marked while a row of the same v2 key **and the
-  same device** was returned by the same fetch. A row of another source never keeps a record:
-  of two devices that recorded at one instant, one can be deleted alone. Before
-  `health-mirror identity-backfill` has decided the chains, a renamed device's old rows are
-  marked by a complete fetch (the new rows show the same readings) and the backfill then
-  supersedes them. Superseded rows are skipped; candidates are read in chunks of 2,000.
+- "Not returned" is decided per [record identity](#record-identity), not per row. A row is not
+  marked while the same fetch returned its v2 key under **the same device** (its own fingerprint,
+  or one of its decided chain: a duplicate of the record under another id), or under a
+  fingerprint **not yet decided distinct** from the row's (the two were never seen together, so
+  it may be the row's device renamed, which only the nightly reconciler decides): that mark is
+  *deferred* (`SOURCE_DELETIONS_DEFERRED` in the log), never guessed. A row of a fingerprint
+  decided distinct (once returned together with the row's own **for one key**, recorded in
+  `raw_source_pairs` by the page or fetch that did, or by the full backfill) never keeps a record:
+  of two devices that recorded at one instant, one can be deleted alone. Overlapping sightings
+  alone do not decide that: a device whose old name comes back overlaps its new name, but never
+  returns both forms of one record. Only a fetch from page 1
+  marks (a resumed fetch does not, whatever its pages returned). Superseded rows are skipped;
+  candidates are read in chunks of 2,000.
 
 ## Record identity
 
@@ -458,47 +464,66 @@ Left out (but kept in the record's *fingerprint*): `displayName` and every other
 field, and a growing interval's end. The value never belongs to the identity; a changed value of
 the same identity is a new [version](#raw-record-versions) of the same row.
 
-**Renames are decided per source, never per record.** Fitbit sends no serial number, only
+**Renames are decided per source, by the reconciler only.** Fitbit sends no serial number, only
 `displayName`, and Apple Health sometimes differs only by the package's `.<UUID>` suffix, so a
 renamed device and a second device recording at the same instant look alike in one record. The
-question is therefore asked of the *sources* (`app/services/source_chains.py`): per data type every
-fingerprint (hash of the whole `dataSource`) has a sighting span in `raw_source_sightings` (first
-time any record carrying it was received, last time one was seen). Fingerprint *old* → *new* is a
-link of one device's **chain** (`raw_source_chains`) only when
+question is therefore asked of the *sources*, per data type and **stable class** (the stable
+source fields above: only fingerprints of one class can share a key), from every fingerprint's
+sighting span in `raw_source_sightings` (first time any record carrying it was received, last time
+one was seen, by the **database clock**). `app/services/source_chains.py` links *A* → *B* in a
+device's **chain** (`raw_source_chains`) only when
 
-1. they share at least one v2 key (they describe the same records);
-2. *old* was last seen **more than 5 minutes** before *new* was first seen (`CHAIN_GAP`): never
-   returned together, nor by two pages of one fetch, nor by the CLI and the server side by side;
-3. *old* ends its chain and *new* starts its own (a chain never forks; no cycles);
-4. both spans are complete (built from the whole archive by `identity-backfill`, or the data type
-   had no rows when the fingerprint first appeared);
-5. *old* is the only candidate. Two candidates are ambiguous: nothing is linked, the dry run lists
-   them.
+1. every fingerprint of the class has a complete span (built from the whole archive by a full
+   `identity-backfill`, or first seen after that);
+2. *B* was first seen **more than 5 minutes** after *A* was last seen (`CHAIN_GAP`);
+3. *A* is *B*'s only predecessor candidate (last seen before *B* appeared, with nothing of the
+   class appearing in between) and *B* is *A*'s only successor candidate (first to appear after
+   *A* ended);
+4. no other fingerprint of the class was first seen in between, or was seen **alongside** either
+   *A* or *B* (overlapping spans: a second device of the class makes any rename near it undecided);
+5. neither already has a link the other way (a chain never forks; no cycles: *A* → *B* → *A* is
+   never a chain).
 
-Overlapping spans are two devices: they are never paired, merged, superseded onto each other, and
-never make each other "present" for deletion marking. The tolerance only errs towards keeping
-sources apart: a rename whose two forms appear within 5 minutes of each other (Google switching in
-the middle of a fetch), or records whose suffixed and plain package forms were returned in the
-same fetch, stay two sources: both rows remain visible (double counted) rather than one hiding
-the other, and the dry run lists the pair under `kept_apart` with the overlap. On 19 Oct the old
-device name was last seen six hours before the new one appeared; Apple's suffix change three hours.
+A three-step rename *A* → *B* → *C* chains step by step even when *B* only ever returned new
+instants and never met *A*'s rows. Everything else is **ambiguous**: nothing is linked, both
+sources keep their rows (visible, at worst counted twice, never hidden), and the report lists the
+case under `ambiguous` with its reason (`a source of its class ended less than five minutes
+before`, `more than one source of its class ended before it`, `another source of its class was
+seen alongside`, `history incomplete`, …). On 19 Oct the old device name was last seen six hours
+before the new one appeared; Apple's suffix change three hours. The archive (21 Oct) holds at most
+two fingerprints per class, one after the other.
 
-A link is decided by `identity-backfill` (full history) or by a page of a fetch: a page compares
-with the start of *its fetch* (`store_records(fetch_started=...)`), never the wall clock, so a
-source returned by an earlier page of the same fetch is never "absent". A recorded link is kept for
-good, but used only while the sightings agree: if the old form is ever seen again within 5 minutes
-of the new one, the link is *contradicted*, both are separate sources again, and `verify` prints a
-note (the rows it paired kept every payload as a version).
+A link records the spans it was decided on as `evidence`. When a later sighting contradicts it
+(*A* seen again after, or within 5 minutes of, *B*'s first sighting), a `contradicted` event is
+appended to `raw_source_chain_events` and the link is **no longer used for new pairings** (*A*'s
+records get rows of their own again); the supersessions made under it stay valid, and `verify`
+prints a note, not an error. Two fingerprints returned together for one key are **decided
+distinct** without any reconciler run (`raw_source_pairs`, append-only).
 
-**Writing a record** (`store_records`, `app/services/identity.py`). Records of one page are grouped
-by v2 key and fingerprint; every group is paired with at most one stored row of that key (the row
-that holds it now, following supersession links), and every row with at most one group: a row of
-the same fingerprint first, then a row of a fingerprint in the same chain (the closest one), then,
-when the page itself decides a new link, that chain. There is no "newest row" fallback: a device's
-payload is never written onto another device's row. Otherwise the record is a source of its own:
-a new row `synthetic:v2:<hash>` when nothing was stored under the key, else `synthetic:v2s:<hash>`
-(key plus fingerprint). The payload then goes through the usual UPSERT: a renamed device's record
-becomes a new version of its existing row, nothing is deleted or re-keyed.
+**Writing a record** (`store_records`, `app/services/identity.py`). The write path never decides a
+rename; it applies decided chains. Records of one page are grouped by v2 key and fingerprint, and
+every group is written onto
+
+1. a row that holds this key from this **same** fingerprint (a returning record, civil times
+   added, a grown interval; the row that holds it now when it was merged into another row of the
+   same fingerprint; the old form returning after a contradiction goes back onto its own row);
+2. else, along a decided, never contradicted chain, the row of the closest **earlier**
+   fingerprint whose **reading** (the payload without the source, times as parsed) is the same:
+   the renamed device's record becomes a new version of its existing row;
+3. else a **new row of its own**, `synthetic:v2s:<hash of key and fingerprint>` (a spare id of the
+   same kind if a chain wrote another fingerprint's payload onto the row of that id).
+
+Rows are found by id only: the record's v1 id (rows archived before v2), the `v2s` id of its key
+and fingerprint (rows stored since 0012), and the alias table. There is no "newest row" fallback
+and no scan by start time: a device's payload is never written onto another device's row, and an
+unknown fingerprint (a rename not decided yet, a second device, a late upload) is counted twice at
+worst until the reconciler links it, never hidden. Concurrency: the rows a page writes onto are
+locked (`FOR UPDATE`, key order) and checked against what the resolution read, and new rows are
+inserted with `ON CONFLICT DO NOTHING`; when another writer changed or created one meanwhile, the
+page is resolved again inside a savepoint (`RECORD_BATCH_RESOLVED_AGAIN`). The time written to
+`last_seen_at` is read after the data type's lock was granted, and `last_seen_at` never moves
+backwards (`GREATEST`), so a writer that waited cannot make a record look unseen to a fetch that
+started meanwhile.
 
 **Heart-rate zones.** v1 left `heartRateZoneType` out of the key, so the four zone records of one
 interval (`LIGHT`, `MODERATE`, `VIGOROUS`, `PEAK`) were written onto one row, each overwriting the
@@ -510,44 +535,58 @@ intervals never re-fetched keep showing one zone type of four.
 
 **Aliases.** A raw row's `google_data_point_id` never changes (trigger), so existing rows are not
 re-keyed. `raw_health_data_identity (data_type, identity_key → raw_id, google_data_point_id,
-created_at)` points a v2 key (and, where a key has more than one source, the fingerprint-specific
-key) at the row that holds it; rows archived before v2 are also found by their own v1 id and,
-failing that, among the rows with the same `source_start_time`.
+created_at)` points the fingerprint-specific key (`v2s:…`) of every row archived under a v1 id at
+that row (the reconciler adds them; the write path adds one when it writes onto such a row), so a
+record whose v1 id changed is found again. Rows stored since 0012 need none.
 
-**Supersession.** Duplicates archived before v2 remain rows of their own. `health-mirror
-identity-backfill` decides the chains (pass 1: sighting spans of every row and version, keys
-shared between fingerprints), then, per v2 key and per device (one fingerprint or one chain), links
-every other row of that device to the row that holds the record now (one already linked to, else
-the aliased one, else the newest live row; a deleted-marked row only when the device has no live
-row) in
-`raw_health_data_supersessions (old_raw_id → new_raw_id, data_type, both keys, reason,
-created_at)`, with the reason `display-name-change`, `package-suffix-change`, `source-change`,
-`interval-shape-change`, `growing-interval` or `duplicate`, and appends an `identity-merged`
-event for the superseded row. A superseded row is **history, not data**: its payload, versions,
-`source_deleted_at` and events stay exactly as they were, but dashboards, Umay, the `analytics_*`
-views and the normalized-table readers skip it, as they skip a source deletion, so a record is
-counted once. Old deletion marks are not cleared: they truthfully say that the row's form of the
-record stopped being returned on that date; the record itself lives on in the successor row.
-A marked row with no live row of its device is a genuine deletion and is never linked
-(`deletions_kept`). Rows of different devices are never linked. A link never points at a
-superseded row and never supersedes a row that others point at (no chains of links, no cycles);
-a group that would need one is left alone and counted in `conflicts`. Rows whose stored
-`source_start_time` differs from the parsed start (written by an older parser) are settled last,
-with the rows of their parsed start (`start_mismatches`); a page stored before that finds such a
-row only by its v1 id, so it may get a twin, which deletion marking treats as the same record and
-the backfill links.
+**The reconciler** (`health-mirror identity-backfill`, `app/services/identity_backfill.py`) is the
+only place that decides chains, and it links what it decided. A **full** run (after the deploy,
+and whenever wanted) reads every row and earlier version (pass 1: sighting spans; rows whose
+stored `source_start_time` differs from the parsed one are noted by id), merges the spans into
+`raw_source_sightings` (complete from then on), decides the chains, then per v2 key and per device
+(one fingerprint or one usable chain) links every other row of that device to the row that holds
+the record now (one already linked to, else the newest live row; a deleted-marked row only when the
+device has no live row) in `raw_health_data_supersessions (old_raw_id → new_raw_id, data_type, both
+keys, reason, created_at)` with the reason `display-name-change`, `package-suffix-change`,
+`source-change`, `interval-shape-change`, `growing-interval` or `duplicate`, and appends an
+`identity-merged` event for the superseded row. A row of **another fingerprint** of the device is
+linked only when it measured the same (its reading equals the holder's); otherwise both stay
+(`kept_differing`). The **incremental** run (`--incremental`, the nightly scheduler job
+`identity-reconcile`, 02:30 UTC by default) decides chains from the sightings as the write path
+keeps them and links only the start times of rows created or given a new payload since its
+checkpoint minus one hour, plus, after a new link, everything since the new fingerprint's first
+sighting; a data type that never had a full run is skipped and says so. Checkpoints and the last result per
+data type are in `identity_reconcile_state` and in `health-mirror status` (`identity_reconcile`).
 
-The alias, supersession and chain tables are append-only (no `UPDATE`, `DELETE` or `TRUNCATE`,
-`ENABLE ALWAYS` triggers; `health-mirror verify` checks them with the other guards, their keys
-and checks, that no rule sits on a guarded table, and the links themselves: see
-[Integrity verification](#integrity-verification)). `raw_source_sightings` is bookkeeping, updated in place like
-`raw_health_data.last_seen_at` and rebuilt by every backfill from the rows and versions; it holds
-no received data.
+A superseded row is **history, not data**: its payload, versions, `source_deleted_at` and events
+stay exactly as they were, but dashboards, Umay, the `analytics_*` views and the normalized-table
+readers skip it, as they skip a source deletion, so a record is counted once. Old deletion marks
+are not cleared: they truthfully say that the row's form of the record stopped being returned on
+that date; the record itself lives on in the successor row. A marked row with no live row of its
+device is a genuine deletion and is never linked (`deletions_kept`). Rows of different devices are
+never linked. A link never points at a superseded row and never supersedes a row that others point
+at (no chains of links, no cycles); a group that would need one is left alone (`conflicts`). Rows
+with a stale stored start are settled last, with the rows of their parsed start
+(`start_mismatches`), also when `--after` skipped the rest of the second pass.
+
+The alias, supersession, chain, chain-event and pair tables are append-only (no `UPDATE`, `DELETE` or
+`TRUNCATE`, `ENABLE ALWAYS` triggers); `raw_source_sightings` may only widen (no `DELETE` or
+`TRUNCATE`; an `UPDATE` may only move `first_seen_at` earlier, `last_seen_at` later and `complete`
+to true). `health-mirror verify` checks them with the other guards, their keys and checks, that no
+rule, row-level security or policy sits on a guarded table, that no guard sits on a table that is
+not guarded (a guarded table renamed away), that every `identity-merged` event still has its link,
+that the `analytics_*` views are the ones of 0012, and the links and chains themselves: see
+[Integrity verification](#integrity-verification). `identity_reconcile_state` and `fetch_rounds`
+(when a sync round or backfill window fetch began at its first page; a resumed fetch keeps it) are
+bookkeeping.
 
 **Concurrency.** `store_records` and deletion marking take a shared transaction lock per data type,
-each `identity-backfill` batch the exclusive one (a sync of that data type waits for one batch,
-seconds, then continues), and only one backfill runs at a time: a second one refuses at once
-(`another identity-backfill is running`). Syncs, webhooks and the scheduler can keep running.
+each reconciler batch the exclusive one: it waits at most 10 s for it (a waiting exclusive request
+queues every new writer behind it), then rolls back, waits 2, 4, 8 … s and retries
+(`IDENTITY_RECONCILE_LOCK_BUSY`), and after 8 attempts gives up clearly; a sync of that data type
+waits for one batch (seconds), then continues. Only one reconciler runs at a time: a second one
+refuses at once (`another identity-backfill is running`); the nightly job then skips. Inserts are
+chunked (1,000 rows a statement, far below PostgreSQL's 32,767 parameters) for any `--batch-size`.
 
 ```sql
 -- Bağlanan kopyalar (superseded duplicates) per data type and reason
@@ -556,6 +595,9 @@ SELECT data_type, reason, count(*) FROM raw_health_data_supersessions GROUP BY 1
 -- Kaynak zincirleri (source chains: renamed devices, dropped package suffixes)
 SELECT data_type, from_label, to_label, decided_by, evidence::json->>'gap_seconds' AS gap_s
 FROM raw_source_chains ORDER BY data_type, decided_at;
+
+-- Çelişen zincirler (chains a later sighting contradicted; no longer used)
+SELECT data_type, from_fingerprint, to_fingerprint, occurred_at FROM raw_source_chain_events;
 
 -- Bir kopyanın yerine geçen kayıt (the row that holds a duplicate's record now)
 SELECT s.reason, n.google_data_point_id, n.raw_json
@@ -692,7 +734,9 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 | Record identities (v2 key → row) | `raw_health_data_identity` | append-only (no `UPDATE`/`DELETE`/`TRUNCATE`) |
 | Duplicate row → row holding its record | `raw_health_data_supersessions` | append-only; the superseded row itself is unchanged |
 | Source fingerprint → the same device after a rename | `raw_source_chains` | append-only (decisions with their evidence) |
-| First/last sighting per source fingerprint | `raw_source_sightings` | derived bookkeeping, updated in place, rebuilt by `identity-backfill` |
+| First/last sighting per source fingerprint | `raw_source_sightings` | widen-only (trigger), written by every page and by `identity-backfill` |
+| Contradicted source chains | `raw_source_chain_events` | append-only (trigger) |
+| Reconciler checkpoints, fetch round starts | `identity_reconcile_state`, `fetch_rounds` | bookkeeping |
 | Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
 | Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only |
 | Manual measurements and workouts | `manual_measurements`, `manual_workouts` | append-only: the UI only adds entries; a correction is a new entry (for the same measurement time the newest entry wins) |
@@ -768,7 +812,7 @@ above, and why it is allowed:
 | `store_records` UPSERT (`app/services/storage.py`) | `raw_health_data` | onto the row that holds the record's identity (never re-keyed); payload change → kept as a version by trigger first; `last_seen_at`, `source_deleted_at` → `NULL` (logged as an event), `payload_received_at`/`payload_source`/`response_id` change only with the payload; derived `source_*_time`/`source_timezone` |
 | `store_records` aliases and chains (`app/services/identity.py`) | `raw_health_data_identity`, `raw_source_chains` | `INSERT ... ON CONFLICT DO NOTHING` only |
 | `store_records` sightings (`app/services/source_chains.py`) | `raw_source_sightings` | first/last sighting widened in place (bookkeeping, no received data) |
-| `identity-backfill` (`app/services/identity_backfill.py`) | `raw_health_data_identity`, `raw_health_data_supersessions`, `raw_source_chains`, `raw_health_data_events`, `raw_source_sightings` | inserts only (sightings widened); `raw_health_data` and its versions are only read |
+| `identity-backfill` and the nightly `identity-reconcile` job (`app/services/identity_backfill.py`) | `raw_health_data_identity`, `raw_health_data_supersessions`, `raw_source_chains`, `raw_source_chain_events`, `raw_health_data_events`, `raw_source_sightings`, `identity_reconcile_state` | inserts only (sightings widened); `raw_health_data` and its versions are only read |
 | `mark_source_deletions` (`app/sync/deletions.py`) | `raw_health_data` | sets `source_deleted_at` only (logged as an event); nothing deleted |
 | import-restored row takes a newer dump payload (`app/services/raw_history.py`) | `raw_health_data` | only rows the import itself created; the old payload is kept as a version by trigger |
 | version renumbering (`import-versions`) | `raw_health_data_versions` | `version` only, in a transaction with `healthos.renumber = '1'` |
@@ -911,6 +955,10 @@ Defaults:
 
 - Daily at 02:00 UTC: re-read the last 7 days.
 - Sunday at 03:00 UTC: re-read the last 90 days.
+- Daily at 02:30 UTC: the identity reconciler (`identity-backfill --incremental`): decides
+  renamed sources and links the duplicate rows written since its last run
+  ([Record identity](#record-identity)). Away from the 03:30 (local) backup; it waits for no
+  sync longer than 10 s at a time.
 
 These use normal idempotent UPSERTs. Disable in `.env` when another scheduler instance owns the jobs.
 Run either depth manually with `health-mirror reconcile --days 7` or
@@ -1084,9 +1132,13 @@ It then recomputes the SHA-256 of every stored Google response body and of every
 body, and checks that every `response_id` points to a stored response, and that every identity
 alias and supersession link matches the rows it names: same data type and key, no link to a
 superseded row and no cycle of any length, no link hiding a record with a Google id or a live row
-behind a deleted one, every link within one v2 key and one device (same fingerprint or a recorded
-chain), no cycle in the source chains, the identity tables' keys and checks unchanged and no rule
-on a guarded table. A chain its sightings contradict is printed as a note (not an error). It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
+behind a deleted one, every link within one v2 key and either one fingerprint or two that a chain
+recorded *before the link was made* joins, every `identity-merged` event still with its link, no
+cycle in the source chains, every chain decided by the reconciler on evidence that satisfies the
+rule, with sightings for both of its sources that never narrowed since, the identity tables' keys
+and checks unchanged, no rule, row-level security or policy on a guarded table, no guard on a table
+that is not guarded, and the `analytics_*` views exactly as 0012 defines them. A chain its
+sightings contradict is printed as a note (not an error). It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
 
 ## Troubleshooting
 
