@@ -36,8 +36,8 @@ leaves its fingerprints free for another link.
 
 ``raw_source_devices`` logs, per fingerprint that ever had a link, the device it belongs to
 (its smallest fingerprint) whenever that changes; the latest row per fingerprint is current.
-Readers decide whether a link is in force from it alone (index lookups), and verify checks it
-against the links and decisions.
+Readers decide whether a link is in force from it alone (computed once per query), and verify
+checks it against the links and decisions.
 
 ``raw_source_pairs`` records evidence of two distinct sources: a key returned in one response
 under two fingerprints with two different readings (one record has one value), with when its
@@ -79,10 +79,12 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     event,
     func,
     or_,
     select,
+    tuple_,
 )
 from sqlalchemy.orm import Mapped, aliased, mapped_column
 from sqlalchemy.sql.naming import conv
@@ -375,40 +377,54 @@ class RawSourceSighting(Base):
     )
 
 
-def device_now(data_type, fingerprint):
-    """Scalar subquery: the device ``fingerprint`` of ``data_type`` belongs to now (the latest
-    ``raw_source_devices`` row; NULL when it never had a link)."""
-    device = aliased(RawSourceDevice)
-    return (
-        select(device.device)
-        .where(device.data_type == data_type, device.fingerprint == fingerprint)
-        .order_by(device.id.desc())
-        .limit(1)
-        .scalar_subquery()
+def joined_pairs():
+    """``SELECT`` of every (data type, fingerprint, fingerprint) that are one device now (the
+    latest ``raw_source_devices`` row of each, alike). Uncorrelated, so a reader computes it
+    once (a hashed subplan that keeps parallel plans possible), however many rows it checks."""
+    device, later = aliased(RawSourceDevice), aliased(RawSourceDevice)
+    current = (
+        select(device.data_type, device.fingerprint, device.device)
+        .where(
+            ~select(later.id)
+            .where(
+                later.data_type == device.data_type,
+                later.fingerprint == device.fingerprint,
+                later.id > device.id,
+            )
+            .exists()
+        )
+        .subquery()
+    )
+    one, other = current.alias(), current.alias()
+    return select(one.c.data_type, one.c.fingerprint, other.c.fingerprint).join(
+        other, and_(other.c.data_type == one.c.data_type, other.c.device == one.c.device)
     )
 
 
 def in_force(link=RawHealthDataSupersession):
     """The supersession ``link`` (the class or an alias) is in force: its two fingerprints
     are one, or one device now. A link whose fingerprints are no longer one device (a
-    rejected or refuted chain, two devices decided by the owner) hides nothing."""
+    rejected or refuted chain, two devices decided by the owner) hides nothing; one whose
+    fingerprints never had a device logged is not in force either."""
     return or_(
         link.old_fingerprint == link.new_fingerprint,
-        device_now(link.data_type, link.old_fingerprint)
-        == device_now(link.data_type, link.new_fingerprint),
+        tuple_(link.data_type, link.old_fingerprint, link.new_fingerprint).in_(joined_pairs()),
     )
 
 
 def in_force_sql(link: str) -> str:
     """``in_force`` as SQL text, for the supersession alias ``link`` (the analytics views)."""
-
-    def device(side: str) -> str:
-        return (
-            f"(SELECT d.device FROM {DEVICE_TABLE} d WHERE d.data_type = {link}.data_type "
-            f"AND d.fingerprint = {link}.{side}_fingerprint ORDER BY d.id DESC LIMIT 1)"
-        )
-
-    return f"({link}.old_fingerprint = {link}.new_fingerprint OR {device('old')} = {device('new')})"
+    current = (
+        f"(SELECT d.data_type, d.fingerprint, d.device FROM {DEVICE_TABLE} d WHERE NOT EXISTS "
+        f"(SELECT 1 FROM {DEVICE_TABLE} e WHERE e.data_type = d.data_type "
+        "AND e.fingerprint = d.fingerprint AND e.id > d.id))"
+    )
+    return (
+        f"({link}.old_fingerprint = {link}.new_fingerprint OR ({link}.data_type, "
+        f"{link}.old_fingerprint, {link}.new_fingerprint) IN (SELECT a.data_type, a.fingerprint, "
+        f"b.fingerprint FROM {current} a JOIN {current} b ON b.data_type = a.data_type "
+        "AND b.device = a.device))"
+    )
 
 
 def superseded(raw_id):

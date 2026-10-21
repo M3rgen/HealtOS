@@ -229,8 +229,8 @@ def _view(table: str, *, current_only: bool) -> str:
     # Like the dashboard: a normalized row counts unless its raw record (same key) is marked
     # deleted at the source or superseded, by a link in force, by a row that is not. The
     # lookups are index probes: the raw table's (data_type, google_data_point_id) key, the
-    # supersessions' (old_google_data_point_id, data_type) index and the devices' (data_type,
-    # fingerprint, id) index.
+    # supersessions' (old_google_data_point_id, data_type) index, and the devices joined now,
+    # computed once per query.
     types = NORMALIZED_TABLES[table]
     if types:
         names = ", ".join(f"'{name}'" for name in types)
@@ -248,15 +248,18 @@ def _view(table: str, *, current_only: bool) -> str:
     )
 
 
-def _device(side: str) -> str:
-    return (
-        f"(SELECT d.device FROM {DEVICE_TABLE} d WHERE d.data_type = s.data_type "
-        f"AND d.fingerprint = s.{side}_fingerprint ORDER BY d.id DESC LIMIT 1)"
-    )
-
-
-# A link is in force while its two fingerprints are one, or one device now.
-_IN_FORCE = f"(s.old_fingerprint = s.new_fingerprint OR {_device('old')} = {_device('new')})"
+_CURRENT = (
+    f"(SELECT d.data_type, d.fingerprint, d.device FROM {DEVICE_TABLE} d WHERE NOT EXISTS "
+    f"(SELECT 1 FROM {DEVICE_TABLE} e WHERE e.data_type = d.data_type "
+    "AND e.fingerprint = d.fingerprint AND e.id > d.id))"
+)
+# A link is in force while its two fingerprints are one, or one device now (the latest
+# raw_source_devices row of each alike).
+_IN_FORCE = (
+    "(s.old_fingerprint = s.new_fingerprint OR (s.data_type, s.old_fingerprint, "
+    "s.new_fingerprint) IN (SELECT a.data_type, a.fingerprint, b.fingerprint FROM "
+    f"{_CURRENT} a JOIN {_CURRENT} b ON b.data_type = a.data_type AND b.device = a.device))"
+)
 
 
 LOCK_TIMEOUT = "30s"

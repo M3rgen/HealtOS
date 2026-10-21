@@ -37,8 +37,8 @@ def view_select(table: str) -> str:
     unless it is quarantined, its raw record (same key) is marked deleted at the source, or
     that record is superseded, by a link in force, by a row that is not marked deleted
     (``held_elsewhere``). The lookups are index probes: the raw table's (data_type,
-    google_data_point_id) key, the supersessions' (old_google_data_point_id, data_type) index
-    and, for a link between two fingerprints, the devices' (data_type, fingerprint, id)."""
+    google_data_point_id) key and the supersessions' (old_google_data_point_id, data_type)
+    index; the fingerprints joined now are computed once per query."""
     types = NORMALIZED_TABLES[table]
     if types:
         names = ", ".join(f"'{name}'" for name in types)
