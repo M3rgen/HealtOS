@@ -20,8 +20,9 @@ append-only tables and one bookkeeping table:
 The three append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
 triggers calling 0011's `healthos_refuse_change()`); `health-mirror verify` checks them, their
 constraints and that no rule sits on them. On PostgreSQL the `analytics_*` views are replaced
-(`CREATE OR REPLACE`, same columns) so they also hide superseded rows; SQLite (tests only) keeps
-the old views.
+(`CREATE OR REPLACE`, same columns) so they show what the dashboard counts: rows of a
+quarantined, source-deleted or superseded raw record are left out (before, only quarantined
+ones); SQLite (tests only) keeps the old views.
 
 Catalog-only and fast: two empty tables, their indexes and triggers, and view definitions.
 Filling them is `health-mirror identity-backfill`, run after the deploy (docs/RUNBOOK.md).
@@ -95,24 +96,25 @@ POSTGRESQL_DDL = (
 )
 SQLITE_DDL = tuple(sql for _, sql in _SQLITE_TRIGGERS.values())
 
-# The analytics views of migration 20260818_0002.
-NORMALIZED_TABLES = (
-    "active_zone_minutes",
-    "distance",
-    "energy_expenditure",
-    "exercise_sessions",
-    "heart_rate",
-    "heart_rate_variability",
-    "oxygen_saturation",
-    "respiratory_rate",
-    "resting_heart_rate",
-    "scalar_metrics",
-    "sleep_sessions",
-    "steps",
-    "temperature",
-    "vo2_max",
-    "weight",
-)
+# The analytics views of migration 20260818_0002, and the raw data types each table is
+# normalized from (app/parsers/normalize.py; scalar_metrics carries its own data_type).
+NORMALIZED_TABLES = {
+    "active_zone_minutes": ("active-zone-minutes",),
+    "distance": ("distance",),
+    "energy_expenditure": ("active-energy-burned", "total-calories"),
+    "exercise_sessions": ("exercise",),
+    "heart_rate": ("heart-rate",),
+    "heart_rate_variability": ("heart-rate-variability", "daily-heart-rate-variability"),
+    "oxygen_saturation": ("oxygen-saturation", "daily-oxygen-saturation"),
+    "respiratory_rate": ("daily-respiratory-rate", "respiratory-rate-sleep-summary"),
+    "resting_heart_rate": ("daily-resting-heart-rate",),
+    "scalar_metrics": (),
+    "sleep_sessions": ("sleep",),
+    "steps": ("steps",),
+    "temperature": ("core-body-temperature", "daily-sleep-temperature-derivations"),
+    "vo2_max": ("vo2-max", "daily-vo2-max", "run-vo2-max"),
+    "weight": ("weight",),
+}
 
 
 def _view(table: str, *, current_only: bool) -> str:
@@ -122,12 +124,20 @@ def _view(table: str, *, current_only: bool) -> str:
     )
     if not current_only:
         return sql
-    # A normalized row carries its raw row's key; only scalar_metrics shares one table
-    # between data types.
-    same_type = f" AND s.data_type = {table}.data_type" if table == "scalar_metrics" else ""
+    # Like the dashboard: a normalized row counts unless its raw record (same key) is marked
+    # deleted at the source or superseded. The data type keeps the lookup on the raw table's
+    # (data_type, google_data_point_id) key.
+    types = NORMALIZED_TABLES[table]
+    same_type = (
+        f"r.data_type = {table}.data_type"
+        if not types
+        else "r.data_type IN (" + ", ".join(f"'{name}'" for name in types) + ")"
+    )
     return (
-        f"{sql} AND NOT EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
-        f"WHERE s.old_google_data_point_id = {table}.google_data_point_id{same_type})"
+        f"{sql} AND NOT EXISTS (SELECT 1 FROM raw_health_data r "
+        f"WHERE {same_type} AND r.google_data_point_id = {table}.google_data_point_id "
+        f"AND (r.source_deleted_at IS NOT NULL OR EXISTS (SELECT 1 FROM {SUPERSESSION_TABLE} s "
+        "WHERE s.old_raw_id = r.id)))"
     )
 
 

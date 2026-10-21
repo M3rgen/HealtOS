@@ -6,7 +6,7 @@ Synthetic records only (tests/identity_records.py).
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pytest
 from identity_records import (
@@ -17,6 +17,7 @@ from identity_records import (
     heart,
     legacy,
     name_of,
+    phone,
     raw_rows,
     steps,
     store,
@@ -26,6 +27,7 @@ from sqlalchemy import func, select, text
 
 from app.models.identity import RawHealthDataSupersession
 from app.models.raw_versions import RawHealthDataEvent
+from app.services.dashboard import dashboard_data
 from app.services.identity import verify_identities
 from app.services.identity_backfill import identity_backfill
 from app.services.source_chains import (
@@ -171,6 +173,23 @@ async def test_verify_reports_bad_links_chains_constraints_and_rules(pg_sessions
         "rule keep_quiet on guarded table raw_health_data_identity",
     ):
         assert expected in text_, (expected, errors)
+
+
+async def test_analytics_views_count_what_the_dashboard_counts(pg_sessions) -> None:
+    """Review 2: the analytics_* views leave out source-deleted and superseded rows."""
+    await legacy(pg_sessions, STEPS, steps(40), T0)
+    await legacy(pg_sessions, STEPS, steps(40, source=phone("com.example.health")), T0 + 24 * HOUR)
+    await legacy(pg_sessions, STEPS, steps(7, start=T0 + HOUR), T0, deleted=T0 + HOUR)
+
+    async def counted() -> tuple:
+        async with pg_sessions() as session:
+            data = await dashboard_data(session, date(2026, 10, 18), 1, "UTC")
+            view = await session.scalar(text("SELECT sum(count) FROM analytics_steps"))
+        return data["days"][0]["steps"], float(view)
+
+    assert await counted() == (80, 80.0)  # the deleted 7 is left out by both
+    await identity_backfill(pg_sessions)
+    assert await counted() == (40, 40.0)
 
 
 async def test_backfill_never_chains_links(pg_sessions, clock) -> None:
