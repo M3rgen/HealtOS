@@ -456,6 +456,13 @@ async def _timeline(
     return timeline
 
 
+def _full(chains: Chains, chain: dict) -> list[str]:
+    """The fingerprints of a reported chain entry (``fingerprints`` holds prefixes)."""
+    return [
+        name for prefix in chain["fingerprints"] for name in chains.spans if name.startswith(prefix)
+    ][:2]
+
+
 def _fingerprints(*names: str) -> list[str]:
     return [name[:12] for name in names]
 
@@ -1083,15 +1090,17 @@ async def relink_data_type(
     data_type: str,
     apply: Callable[[AsyncSession, Chains], Awaitable[None]],
     *,
+    link: bool = True,
     batch_size: int = 5_000,
     dry_run: bool = False,
     statement_timeout: str = STATEMENT_TIMEOUT,
     progress: Callable[[str, BackfillStats, datetime], None] | None = None,
     notice: Notice | None = None,
 ) -> BackfillStats:
-    """Apply an owner decision (``apply``, run under the exclusive lock first) and settle
-    the whole data type again: chains decided from the sightings, then pass 2 over every
-    row (stale stored starts included: their rows have the start of their key)."""
+    """Apply an owner decision (``apply``, run under the exclusive lock first), decide the
+    chains again from the sightings, then - when ``link`` or a chain was decided now - settle
+    the whole data type again: pass 2 over every row (stale stored starts included: their
+    rows have the start of their key)."""
     spec = spec_for(data_type)
     total = BackfillStats(mode="decision")
     async with sessions() as session:
@@ -1106,18 +1115,19 @@ async def relink_data_type(
         notice=notice,
         apply=apply,
     )
-    await _link_pass(
-        sessions,
-        spec,
-        planned,
-        total,
-        batch_size=batch_size,
-        dry_run=dry_run,
-        after=None,
-        statement_timeout=statement_timeout,
-        progress=progress,
-        notice=notice,
-    )
+    if link or any(chain["decided"] == "this run" for chain in total.chains):
+        await _link_pass(
+            sessions,
+            spec,
+            planned,
+            total,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            after=None,
+            statement_timeout=statement_timeout,
+            progress=progress,
+            notice=notice,
+        )
     if not dry_run:
         await _save_state(sessions, data_type, started=started, stats=total, checkpoint=False)
     return total
@@ -1157,6 +1167,29 @@ async def reconcile_data_type(
         # Every row of a newly joined fingerprint was written after its first sighting.
         if fingerprint in planned.spans:
             since = min(since, planned.spans[fingerprint].first - OVERLAP)
+    full_run = as_utc(state.full_run_at)
+    if any(
+        chain["decided"] == "this run"
+        and all(planned.spans[name].first < full_run for name in _full(planned, chain))
+        for chain in total.chains
+    ):
+        # Both forms were in the archive before the last full run: their rows may predate
+        # 0011 (no payload_received_at), so only a pass over every row finds them all.
+        await _link_pass(
+            sessions,
+            spec,
+            planned,
+            total,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            after=None,
+            statement_timeout=statement_timeout,
+            progress=progress,
+            notice=notice,
+        )
+        if not dry_run:
+            await _save_state(sessions, data_type, started=started, stats=total)
+        return total
     async with sessions() as session:
         starts = sorted(
             {

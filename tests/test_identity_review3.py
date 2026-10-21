@@ -388,6 +388,21 @@ async def test_a_decided_chain_is_listed_for_review_and_can_be_rejected(sessions
     assert errors == [] and any("rejected by the owner" in note for note in notes)
 
 
+async def test_the_nightly_job_logs_what_is_left_to_decide(sessions, clock) -> None:
+    """B4/B6: the nightly job's summary (log and status) counts the chains to review and the
+    pairs nothing decided, not only the ambiguous sources."""
+    from app.services.identity_reconciler import IdentityReconciler
+
+    await legacy(sessions, HEART, heart(60), T0, last=T0 + HOUR)
+    await identity_backfill(sessions)
+    clock.now = T0 + 9 * HOUR
+    await store(sessions, HEART, heart(80, at=T0 + 9 * HOUR, name=NEW_NAME))
+    summary = await IdentityReconciler(sessions).run()
+    assert summary is not None
+    assert summary["heart-rate"]["review_suggested"] == 1
+    assert summary["heart-rate"]["open"]["review"][0]["fingerprints"] == [OLD[:12], NEW[:12]]
+
+
 # --- B7: suspicious deletions ---------------------------------------------------------------
 
 
@@ -421,6 +436,27 @@ async def test_a_watch_worn_alongside_does_not_block_the_bands_rename(sessions) 
     assert [(chain["from"], chain["to"]) for chain in report.chains] == [
         (f"FITBIT / {OLD_NAME} / DERIVED", f"FITBIT / {NEW_NAME} / DERIVED")
     ]
+    assert len(await counted_rows(sessions)) == 6
+    assert await problems(sessions) == ([], [])
+
+
+async def test_deciding_a_watch_distinct_lets_the_rename_chain_and_links_at_once(sessions):
+    """B8 with a later full run: the watch was seen with the band's new name in no page
+    together, so nothing proves it another device and the rename stays open. The owner says
+    the watch is another device: the rename is chained and its rows linked at once (not by
+    the nightly run, which only reads rows written since its checkpoint)."""
+    for minute in range(3):
+        at = T0 + minute * MINUTE
+        await legacy(sessions, HEART, heart(60 + minute, at=at), T0, last=T0 + HOUR)
+        await legacy(
+            sessions, HEART, heart(90 + minute, at=at, name=WATCH), T0, last=T0 + 10 * HOUR
+        )
+        await legacy(sessions, HEART, heart(60 + minute, at=at, name=NEW_NAME), T0 + 9 * HOUR)
+    report = (await identity_backfill(sessions))["heart-rate"]
+    assert report.chains == [] and len(await counted_rows(sessions)) == 9
+    watch = source_fingerprint(fitbit(WATCH))
+    outcome = await decide_sources(sessions, "heart-rate", "distinct", watch[:12], NEW[:12])
+    assert [chain["decided"] for chain in outcome.stats.chains] == ["this run"]
     assert len(await counted_rows(sessions)) == 6
     assert await problems(sessions) == ([], [])
 

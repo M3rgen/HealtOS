@@ -281,7 +281,8 @@ async def test_a_device_seen_alongside_keeps_a_rename_undecided(sessions) -> Non
 
 async def test_backfill_keeps_two_devices_stored_seconds_apart(sessions) -> None:
     """Review 1: two devices at one instant, stored on two pages five seconds apart and
-    never fetched again, are two sources (seen together within the chain gap)."""
+    never fetched again, are never linked (a rename within five minutes is left open, listed
+    as ambiguous for the owner; rows seen seconds apart are no evidence either way)."""
     await legacy(sessions, HEART, heart(60), T0)
     await legacy(sessions, HEART, heart(90, name="Other Watch"), T0 + timedelta(seconds=5))
     report = await identity_backfill(sessions)

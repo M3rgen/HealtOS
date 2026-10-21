@@ -172,40 +172,48 @@ hand: restore from a backup rather than patching it.
 
 Adds `raw_health_data_identity` (fingerprint-specific v2 key → raw row), `raw_health_data_supersessions`
 (duplicate row → the row holding its record now), `raw_source_chains` (source fingerprint → the
-same device after a rename or a dropped package suffix), `raw_source_chain_events` (a chain a
-later sighting contradicted) and `raw_source_pairs` (two sources returned together for one key:
-two devices), all append-only with `ENABLE ALWAYS` guards; `raw_source_sightings`
-(first/last sighting per source, widen-only guard); and the bookkeeping tables
-`identity_reconcile_state` and `fetch_rounds`. It replaces the `analytics_*` views so they count
-what the dashboard counts (no superseded, no source-deleted rows). See
-[Record identity](REFERENCE.md#record-identity). It copies no rows and alters no existing table:
-empty tables, triggers and view definitions; measured 0.02 s on a synthetic 515,151-row
-`raw_health_data` (PostgreSQL 16). The foreign keys need a SHARE ROW EXCLUSIVE lock on
-`raw_health_data`, which a running `pg_dump` does **not** block (tested), but a writing transaction
-does: with the app container restarting nothing else should write, but stop a CLI
-`backfill`/`import-versions` first. The upgrade sets `lock_timeout = 30s` and otherwise fails with
-`20261021_0012 could not lock its tables within 30s`, changing nothing.
+same device after a rename or a dropped package suffix), `raw_source_chain_events` (a chain that
+turned out to join two devices), `raw_source_pairs` (evidence of two devices: one response
+returned a key under two sources with two values) and `raw_source_decisions` (your decisions,
+`identity-decide`), all append-only with `ENABLE ALWAYS` guards; `raw_source_sightings`
+(first/last sighting per source, widen-only guard); the bookkeeping tables
+`identity_reconcile_state` and `fetch_rounds`; and one partial index on `raw_health_data` (its
+source-deleted rows). It replaces the `analytics_*` views so they count what the dashboard counts
+(no source-deleted rows, no rows superseded by a live row). See
+[Record identity](REFERENCE.md#record-identity). It copies no rows and alters no existing table;
+the partial index reads `raw_health_data` once (measured 0.3 s for 1.4 million rows on a developer
+laptop, PostgreSQL 16; expect seconds for several million). The foreign keys and the index need a
+SHARE ROW EXCLUSIVE lock on `raw_health_data`, which a running `pg_dump` does **not** block
+(tested), but a writing transaction does: with the app container restarting nothing else should
+write, but stop a CLI `backfill`/`import-versions` first. The upgrade sets `lock_timeout = 30s` and
+otherwise fails with `20261021_0012 could not lock its tables within 30s`, changing nothing.
 
-**The model.** The live write path is conservative: it never decides that two `dataSource` forms are
-one renamed device. A record of a known fingerprint goes onto that fingerprint's row (a changed
-payload is a version); along a chain the reconciler has decided, onto the old form's row when the
-reading is the same; any other fingerprint gets rows of its own (`synthetic:v2s:…`). So a rename
-that happens is **counted twice** (both rows visible) until the reconciler links the rows, and a
-genuinely distinct device is never hidden. A complete fetch does not mark the old form's rows as
-deleted while the new form returns the same records (the mark is deferred, never guessed). The
-**reconciler** (`health-mirror identity-backfill`) is the only place that decides chains, from
-every source's whole sighting history, and links the duplicates; it runs once in full after the
-deploy and then **nightly** at 02:30 UTC as the scheduler job `identity-reconcile` (incremental:
-rows changed since its last run; `IDENTITY_RECONCILE_ENABLED`, `IDENTITY_RECONCILE_HOUR_UTC`,
-`IDENTITY_RECONCILE_MINUTE`). Double counting after a rename therefore lasts until the next night
-at most, or for good in a case the rule leaves open (below), which you review.
+**The model.** The live write path never decides that two `dataSource` forms are one renamed
+device. A record of a known fingerprint goes onto that fingerprint's row (a changed payload is a
+version); along a decided chain, onto the row of the device that holds the same reading; any
+other fingerprint gets rows of its own (`synthetic:v2s:…`). So a rename that happens is **counted
+twice** (both rows visible) until the reconciler links the rows, and a genuinely distinct device
+is never hidden. Nothing Google currently returns is ever hidden: a superseded row counts again
+when the row holding it is marked deleted, and a returned value that differs from the device's
+row gets a row of its own. A complete fetch does not mark the old form's rows as deleted while
+the new form returns the same records with the same values (the mark is deferred, never
+guessed). The **reconciler** (`health-mirror identity-backfill`) decides chains only when every
+fingerprint's whole sighting history leaves no doubt, and links the duplicates; it runs once in
+full after the deploy and then **nightly** at 02:30 UTC as the scheduler job `identity-reconcile`
+(incremental: rows changed since its last run; `IDENTITY_RECONCILE_ENABLED`,
+`IDENTITY_RECONCILE_HOUR_UTC`, `IDENTITY_RECONCILE_MINUTE`). Everything it leaves open, and every
+chain it decided, is listed in its report and in `health-mirror status`; **you** decide those with
+`health-mirror identity-decide` (below). Double counting after a rename therefore lasts until the
+next night, or until you decide a case the rule leaves open.
 
 Order: **backup → deploy → `identity-backfill --dry-run` → review → `identity-backfill` → verify →
-check that the nightly job is active**. The scheduler, webhooks and manual syncs can keep running
-throughout: a page being stored and a deletion check hold a shared lock per data type, each
-reconciler batch the exclusive one (it waits at most 10 s for it, then backs off and retries, so no
-sync waits behind it for long), and a second run refuses at once with `identity-backfill refused:
-another identity-backfill is running`.
+review the chains and open cases, decide them (`identity-decide`) → check that the nightly job is
+active**. The scheduler, webhooks and manual syncs can keep running throughout: a page being
+stored and a deletion check hold a shared lock per data type, each reconciler batch the exclusive
+one (it waits at most 10 s for it and, once it holds it, at most 5 s for any row another
+transaction holds, then backs off and retries, saying so on stderr, so no sync waits behind it
+for long), and a second run refuses at once with `identity-backfill refused: another
+identity-backfill is running`.
 
 ```sh
 make backup
@@ -213,78 +221,118 @@ docker compose exec app alembic current          # expect 20261020_0011
 git pull --ff-only
 docker compose up -d --build
 docker compose exec app alembic current          # expect 20261021_0012 (head)
-df -h /var/lib/docker                            # the aliases need ~2 GB (≈ 310 bytes per row)
+df -h /var/lib/docker                            # the aliases need ≈ 360 bytes per raw row
 docker compose exec -T app health-mirror identity-backfill --dry-run > /tmp/identity-dry.json
 ```
+
+The alias table holds about one row per raw row without a Google id, ≈ 360 bytes each with its
+index (measured): plan ≈ 0.35 GB per million raw rows.
 
 Review the dry run before writing anything. Per data type:
 
 - `chains`: every link it would record, `from` → `to` (labels: platform / device or package /
-  recording method) with `gap_seconds` between the old form's last and the new form's first
-  sighting. Expect the Fitbit rename of 19 Oct (`Google Fitbit Air` → `Fitbit Air`, gap ≈ 6 h) in
-  each Fitbit data type and the Apple package (suffixed → plain) in the Apple types; nothing else
-  (the archive of 21 Oct holds at most two sources per class, one after the other). A chain
-  between two devices you know are different (two watches) is wrong: stop and look at their
-  sightings (`raw_source_sightings`) before running it.
+  recording method; `fingerprints`: the first 12 characters of each source's fingerprint) with
+  `gap_seconds` between the old form's last and the new form's first sighting. Expect one chain
+  per device rename or package-suffix change you know of, in each data type that device writes.
+  A chain between two devices you know are different (a band replaced by a watch of the same
+  platform, worn one after the other) is wrong: reject it after the run
+  (`identity-decide reject`, below); it only ever merges rows with equal readings, so nothing is
+  lost meanwhile.
+- `review`: the chains decided by the reconciler that you have not confirmed or rejected yet
+  (all of them, after the first run). `health-mirror status` lists them too
+  (`identity_review_suggested`) until you decide.
 - `ambiguous`: sources the rule left open, each with `why` and the `candidates`: `a source of its
   class ended less than five minutes before` (a rename in the middle of a fetch), `more than one
-  source of its class ended before it`, `its predecessor has more than one successor candidate`,
-  `another source of its class was seen alongside` (a second device of the same platform and
-  recording method while the rename happened), `history incomplete`. **Nothing is linked for
-  them**: both sources keep their rows, the readings are visible (counted twice where they are the
-  same records), and deletion marks between them stay deferred. That is the safe side. If you
-  know an entry is a rename, leave it: double counting is visible in the dashboard and never loses
-  data; a manual decision would need a new tool, not a hand-written `INSERT` (verify rejects
-  chains without the reconciler's evidence).
-- `contradicted`: chains a later sighting contradicted (the old name seen again): no longer used
-  for new pairings; the links made under them stay. `verify` prints a note for each.
-- `kept_apart`: pairs of sources that share records but stay separate, `seen together
-  (overlapping sightings): two devices`, or `not decided as one device (see ambiguous)`. Your
-  second watch belongs here, against both names of the band.
-- `linked` (rows that would be superseded, by reason) should be in the order of the numbers above;
-  `superseded_marked` of those carried a deletion mark (it stays, as history); `deletions_kept` is
-  the number of genuinely deleted records that stay marked (a handful); `kept_differing` rows of a
-  chained source that measured something else than the row holding the record (kept, both count);
-  `distinct_sources` the keys held by two devices; `conflicts` should be 0; `start_mismatches`
-  rows with a stale stored start (settled last).
+  source of its class ended before it`, `another source of its class appeared in between`,
+  `its predecessor has more than one successor candidate`, `another source of its class was seen
+  alongside` / `seen alongside another source of its class` (a second device of the same platform
+  and recording method around the rename, not yet known to be another device), `history
+  incomplete`. **Nothing is linked for them**: both sources keep their rows, the readings are
+  visible (counted twice where they are the same records), and deletion marks between them stay
+  deferred. That is the safe side; decide each with `identity-decide`.
+- `kept_apart`: pairs of sources of one class that stay separate; `established: true` when one
+  response returned different values for the same record under both at least three times (two
+  devices: your second watch belongs here, against both names of the band), `false` when nothing
+  decided them (see `ambiguous`).
+- `refuted`: chains whose two forms turned out to be two devices (no longer used; the rows they
+  linked held equal readings and stay linked); `returned`: chains whose old form was seen again
+  (a name changed back: still one device, its records go onto the device's rows).
+- `linked` (rows that would be superseded, by reason) should be in the order of the chains above;
+  `superseded_marked` of those carried a deletion mark (it stays, as history); `deletions_kept`
+  the deleted records with no other source at their instant (genuine deletions; expect a few per
+  data type), `deletions_suspicious` deleted records whose instant another, undecided source still
+  holds live (possibly a rename nobody decided: look at `ambiguous`); `kept_differing` rows of a
+  chained source that measured something else than the row holding the record (kept, both
+  count); `distinct_sources` the keys held by two devices; `conflicts` should be 0;
+  `start_mismatches` rows with a stale stored start (settled last).
 
 Then:
 
 ```sh
 docker compose exec -T app health-mirror identity-backfill > /tmp/identity.json
 docker compose exec app health-mirror verify     # exit 0: guards, keys, links, chains, views
-docker compose exec app health-mirror status     # identity_reconcile: full_run_at per data type
+docker compose exec app health-mirror status     # identity_reconcile per data type; review list
 docker compose logs app | grep SCHEDULER_STARTED # identity_reconcile_enabled: true
 api /health
 ```
 
+**Deciding what the reconciler left open** (`health-mirror identity-decide`). Each decision is
+recorded append-only in `raw_source_decisions` (with the time and your `--note`), applied at once,
+and `verify` checks that every chain you linked names its decision. Always run it with
+`--dry-run` first: it writes nothing and prints the effect (links it would make, chains, open
+cases afterwards). Fingerprints are given as the reports print them (12 characters; any unique
+prefix of at least 6); `health-mirror identity-sources --data-type <type>` lists every source of a
+data type with its fingerprint, sightings, device, the sources it is established distinct from,
+the chains with their review state and what the rule leaves open.
+
+```sh
+# A rename the rule left open (e.g. within five minutes): FROM is the earlier form.
+docker compose exec app health-mirror identity-decide link --data-type <type> \
+    --from <fingerprint> --to <fingerprint> --note "renamed in the app" --dry-run
+# A chain you checked: off the review list. A wrong one: no longer used.
+docker compose exec app health-mirror identity-decide confirm --data-type <type> --from … --to …
+docker compose exec app health-mirror identity-decide reject  --data-type <type> --from … --to …
+# Two devices whatever the evidence, or a stray duplicate that is not a second device.
+docker compose exec app health-mirror identity-decide distinct     --data-type <type> --from … --to …
+docker compose exec app health-mirror identity-decide not-distinct --data-type <type> --from … --to …
+```
+
+After `link` and `not-distinct` the whole data type is settled again (like a full run's second
+pass; minutes for millions of rows), so the rows of both forms are linked where they hold the same
+reading. `reject`, `confirm` and `distinct` only decide chains anew. The latest decision per
+question wins (`link` after `reject` uses the chain again).
+
 The next morning, `health-mirror status` shows `last_mode: incremental` with a fresh
-`last_finished_at` per data type, and the log has `IDENTITY_RECONCILE_COMPLETED` (and one
-`IDENTITY_RECONCILE_DATA_TYPE` per data type with the links, chains and ambiguous counts). A data
-type that never had a full run is skipped (`skipped: no full identity-backfill of this data type
-yet`): run `identity-backfill --data-type <it>` once. `IDENTITY_RECONCILE_LOCK_BUSY` means a batch
-waited for a long sync and retried; `identity-backfill refused: … could not get the identity lock`
-that it gave up after 8 attempts (nothing of that batch was written; the next run resumes).
-Run the incremental pass by hand with `identity-backfill --incremental [--dry-run]`.
+`last_finished_at` per data type, its `last_result` with the counts and an `open` section
+(chains to review, ambiguous sources, pairs kept apart that nothing decided, refuted chains), and
+the log has `IDENTITY_RECONCILE_COMPLETED` (and one `IDENTITY_RECONCILE_DATA_TYPE` per data type).
+Check `open` after every rename you notice; anything listed there is counted twice (never
+hidden) until you decide it. A data type that never had a full run is skipped (`skipped: no full
+identity-backfill of this data type yet`): run `identity-backfill --data-type <it>` once.
+`IDENTITY_RECONCILE_LOCK_BUSY` (and `retrying in … s` on stderr) means a batch met a long sync, a
+deletion check or an import and backed off; `identity-backfill refused: … could not get the
+identity lock` that it gave up after 8 attempts (nothing of that batch was written; the next run
+resumes). Run the incremental pass by hand with `identity-backfill --incremental [--dry-run]`.
 
 Duration: the first pass (timelines) reads every row once, the second links in batches of 5,000
-rows, each its own transaction with `statement_timeout` 120 s. On the synthetic review archive
-(258,097 rows in 9 data types, PostgreSQL 16, developer laptop) a full run took 30 s (≈ 8,700
-rows/s, 6,737 links, 257,518 aliases); an incremental run right after 2 s. The 5.8 million rows of
-production are therefore about 11 minutes at that speed; plan for 30–60 minutes on the 2-vCPU VM. It prints its
-progress per batch on stderr and is idempotent: if it is interrupted (or a batch times out), run
-it again, or resume the second pass where it stopped with the `--data-type ... --after ...` that
-the last progress line names (the first pass always reads the whole data type, and rows with a
-stale start before `--after` are still settled), then once more without them. `--batch-size`
-(default 5,000; inserts are chunked for any size) and `--statement-timeout` tune it.
+rows, each its own transaction with `statement_timeout` 120 s. On a synthetic archive of 1.4
+million rows (PostgreSQL 16, developer laptop) a full run took 2 min 19 s (≈ 10,000 rows/s); an
+incremental run right after under a second. Scale by your row count (`health-mirror status`
+prints `raw_records`) and allow several times longer on a small server. It prints its progress per
+batch on stderr and is idempotent: if it is interrupted (or a batch times out), run it again, or
+resume the second pass where it stopped with the `--data-type ... --after ...` that the last
+progress line names (the first pass always reads the whole data type, and rows with a stale start
+before `--after` are still settled), then once more without them. `--batch-size` (default 5,000;
+inserts are chunked for any size) and `--statement-timeout` tune it.
 
 Rolling back the application: as for 0011, never downgrade the schema (`alembic downgrade
-20261020_0011` refuses while the append-only tables hold rows; `-x allow-identity-loss=1` would
-drop the links and chains, never on the live archive; a re-upgrade and backfill afterwards links the
-same rows again without repeating their `identity-merged` events). The previous image runs against
-the 0012 schema with the no-migrate override above; it ignores aliases, chains and links (and does
-not run the nightly job), so its dashboard counts the duplicates again and new renames duplicate
-again until you roll forward.
+20261020_0011` refuses while the append-only tables or the sightings hold rows;
+`-x allow-identity-loss=1` would drop the links, chains, decisions and sightings, never on the
+live archive; a re-upgrade and backfill afterwards links the same rows again without repeating
+their `identity-merged` events, while your decisions would have to be made again). The previous
+image runs against the 0012 schema with the no-migrate override above; it ignores aliases, chains
+and links (and does not run the nightly job), so its dashboard counts the duplicates again and new
+renames duplicate again until you roll forward.
 
 ## Import payload versions from archive dumps
 

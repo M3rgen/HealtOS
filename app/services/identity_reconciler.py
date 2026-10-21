@@ -1,8 +1,10 @@
 """The nightly identity reconciler: ``identity-backfill --incremental`` as a scheduler job.
 
 It runs over every archived data type that had a full ``identity-backfill`` (others are
-skipped and say so), decides new source chains, records contradicted ones and links the
-duplicate rows written since its checkpoint (app/services/identity_backfill.py). The result
+skipped and say so), decides new source chains, records refuted ones and links the
+duplicate rows written since its checkpoint (app/services/identity_backfill.py). What it leaves
+to the owner (chains to review, ambiguous sources, pairs nothing decided) goes to the log and to
+``health-mirror status``. The result
 of each data type goes to the log and to ``identity_reconcile_state``, which
 ``health-mirror status`` shows. Another run of identity-backfill holding the single-run lock
 makes the job skip (logged); a data type whose lock stays busy is retried on the next night.
@@ -48,6 +50,8 @@ class IdentityReconciler:
             superseded=sum(values["superseded"] for values in summary.values()),
             chains_decided=sum(values["chains_decided"] for values in summary.values()),
             ambiguous=sum(values["ambiguous"] for values in summary.values()),
+            review_suggested=sum(values["review_suggested"] for values in summary.values()),
+            kept_apart_undecided=sum(values["kept_apart_undecided"] for values in summary.values()),
             skipped=sum(1 for values in summary.values() if values["skipped"]),
         )
         return summary

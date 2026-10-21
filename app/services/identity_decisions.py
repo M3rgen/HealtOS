@@ -60,7 +60,8 @@ from app.services.source_chains import (
 logger = logging.getLogger(__name__)
 
 MIN_PREFIX = 6
-# Decisions after which rows may need linking: the whole data type is settled again.
+# Decisions after which rows may need linking: the whole data type is settled again (after
+# the others too when they let the rule decide a chain).
 RELINK = ("link", "not-distinct")
 
 
@@ -252,45 +253,20 @@ async def decide_sources(
         )
 
     async with backfill_lock(sessions):
-        if decision in RELINK:
-            outcome.stats = await relink_data_type(
-                sessions,
-                data_type,
-                apply,
-                batch_size=batch_size,
-                dry_run=dry_run,
-                statement_timeout=statement_timeout,
-                progress=progress,
-                notice=notice,
-            )
-        else:
-            outcome.stats = await _settle_only(
-                sessions, data_type, apply, dry_run=dry_run, notice=notice
-            )
+        outcome.stats = await relink_data_type(
+            sessions,
+            data_type,
+            apply,
+            link=decision in RELINK,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            statement_timeout=statement_timeout,
+            progress=progress,
+            notice=notice,
+        )
         if not dry_run:
             await analyze_identity_tables(sessions)
     return outcome
-
-
-async def _settle_only(
-    sessions: async_sessionmaker, data_type: str, apply, *, dry_run: bool, notice: Notice | None
-) -> BackfillStats:
-    """Apply the decision and decide chains again (no rows need linking after a reject,
-    confirm or distinct: links only ever merge rows of one device)."""
-    from app.services.identity_backfill import _settle_chains
-
-    stats = BackfillStats(mode="decision")
-    await _settle_chains(
-        sessions,
-        spec_for(data_type),
-        None,
-        stats,
-        dry_run=dry_run,
-        statement_timeout=STATEMENT_TIMEOUT,
-        notice=notice,
-        apply=apply,
-    )
-    return stats
 
 
 async def list_sources(sessions: async_sessionmaker, data_type: str) -> dict[str, Any]:
