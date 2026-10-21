@@ -111,7 +111,10 @@ async def execute(sessions, *statements: str) -> None:
 
 
 async def test_rename_keeps_one_row_a_version_and_no_deletion_mark(pg_sessions, clock) -> None:
+    from app.services.identity_backfill import identity_backfill
+
     await legacy(pg_sessions, HEART, heart(60), T0)
+    await identity_backfill(pg_sessions)  # the old name's sightings are known from now on
     await store(pg_sessions, HEART, heart(61, at=T0 + timedelta(minutes=1)))
     clock.now = T0 + timedelta(hours=7)
     fetched_since = clock.now
@@ -125,6 +128,7 @@ async def test_rename_keeps_one_row_a_version_and_no_deletion_mark(pg_sessions, 
     assert marked == 0
     assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthData)) == 2
     assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthDataVersion)) == 2
+    # One per key: the renamed rows hold the new name now, so the key's alias leads to them.
     assert await scalar(pg_sessions, select(func.count()).select_from(RawHealthDataIdentity)) == 2
 
 

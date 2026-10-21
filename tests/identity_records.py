@@ -95,14 +95,18 @@ class Clock:
         return self.now
 
 
-async def store(sessions, spec, *records):
+async def store(sessions, spec, *records, fetch_started=None):
+    """One page; ``fetch_started``: when its fetch began (default: the page is the fetch)."""
     async with sessions.begin() as session:
-        return await store_records(session, spec, list(records))
+        return await store_records(session, spec, list(records), fetch_started=fetch_started)
 
 
-async def legacy(sessions, spec, record, seen: datetime, *, last=None, deleted=None):
-    """A row as stored before v2: its v1 id, no alias; normalized like store_records did."""
-    start, end, zone = temporal(spec, record)
+async def legacy(sessions, spec, record, seen: datetime, *, last=None, deleted=None, start=None):
+    """A row as stored before v2: its v1 id, no alias; normalized like store_records did.
+
+    ``start``: a stored source_start_time other than the parsed one (an older parser)."""
+    parsed, end, zone = temporal(spec, record)
+    start = start or parsed
     row = RawHealthData(
         id=uuid.uuid4(),
         google_data_point_id=source_id(spec, record),
@@ -138,3 +142,24 @@ async def count(sessions, model) -> int:
 async def mark(sessions, spec, start, end, since) -> int:
     async with sessions.begin() as session:
         return await mark_source_deletions(session, spec, start, end, since)
+
+
+async def versions_of(sessions, raw_id) -> list[dict]:
+    from app.models.raw_versions import RawHealthDataVersion
+
+    async with sessions() as session:
+        query = select(RawHealthDataVersion.raw_json).where(RawHealthDataVersion.raw_id == raw_id)
+        return list((await session.scalars(query.order_by(RawHealthDataVersion.version))).all())
+
+
+async def chains(sessions) -> list[tuple[str, str, str]]:
+    """(from label, to label, decided by) of every recorded source chain link."""
+    from app.models.identity import RawSourceChain
+
+    async with sessions() as session:
+        rows = (await session.scalars(select(RawSourceChain))).all()
+    return sorted((row.from_label, row.to_label, row.decided_by) for row in rows)
+
+
+def name_of(row) -> str | None:
+    return row.raw_json.get("dataSource", {}).get("device", {}).get("displayName")

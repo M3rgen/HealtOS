@@ -4,19 +4,24 @@ Records that Google sends without a `name` were archived under a synthetic id th
 raw interval object and the whole `dataSource`. A device rename, a dropped `.<UUID>` package
 suffix, civil times added to `interval` and a growing in-progress interval each made the same
 record a new row (see app/parsers/identity.py for the v2 key that replaces it). Existing rows
-cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds two
-append-only tables:
+cannot be re-keyed (`google_data_point_id` is frozen by 0011), so this revision adds three
+append-only tables and one bookkeeping table:
 
 * `raw_health_data_identity`: v2 identity key -> the raw row that holds the record. New
   writes resolve a record through it (app/services/storage.py).
 * `raw_health_data_supersessions`: a duplicate row -> the row that holds its record now, with
   a reason. Superseded rows stay (payload, versions, `source_deleted_at`, events); readers and
   the `analytics_*` views skip them.
+* `raw_source_chains`: per data type, source fingerprint -> the fingerprint the same device has
+  after a rename or a dropped package suffix (decided from sighting timelines; see
+  app/services/source_chains.py). Only fingerprints of one chain are ever paired or merged.
+* `raw_source_sightings` (not guarded, derived): first and last sighting of each fingerprint.
 
-Both refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS` triggers calling 0011's
-`healthos_refuse_change()`); `health-mirror verify` checks them. On PostgreSQL the
-`analytics_*` views are replaced (`CREATE OR REPLACE`, same columns) so they also hide
-superseded rows; SQLite (tests only) keeps the old views.
+The three append-only tables refuse `UPDATE`, `DELETE` and `TRUNCATE` (`ENABLE ALWAYS`
+triggers calling 0011's `healthos_refuse_change()`); `health-mirror verify` checks them, their
+constraints and that no rule sits on them. On PostgreSQL the `analytics_*` views are replaced
+(`CREATE OR REPLACE`, same columns) so they also hide superseded rows; SQLite (tests only) keeps
+the old views.
 
 Catalog-only and fast: two empty tables, their indexes and triggers, and view definitions.
 Filling them is `health-mirror identity-backfill`, run after the deploy (docs/RUNBOOK.md).
@@ -25,8 +30,9 @@ Like 0011 it sets `lock_timeout` (30 s, `-x lock-timeout=...`): the foreign keys
 pg_dump do not), and a lock held too long makes the upgrade fail fast, changing nothing,
 instead of queueing every writer behind it.
 
-downgrade() refuses while either table has rows (dropping them would lose which duplicates
-were linked); pass `-x allow-identity-loss=1` after a backup.
+downgrade() refuses while an append-only table has rows (dropping them would lose which
+duplicates were linked and which sources were chained); pass `-x allow-identity-loss=1` after
+a backup.
 
 The trigger SQL below is a frozen copy of app/models/identity.py; tests/test_identity_keys.py
 compares them.
@@ -36,6 +42,7 @@ import re
 
 import sqlalchemy as sa
 from alembic import context, op
+from sqlalchemy.dialects import postgresql
 
 revision = "20261021_0012"
 down_revision = "20261020_0011"
@@ -44,7 +51,9 @@ depends_on = None
 
 IDENTITY_TABLE = "raw_health_data_identity"
 SUPERSESSION_TABLE = "raw_health_data_supersessions"
-IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE)
+CHAIN_TABLE = "raw_source_chains"
+SIGHTING_TABLE = "raw_source_sightings"
+IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE)
 
 _PG_TRIGGERS = {}
 for _table in IDENTITY_TABLES:
@@ -106,12 +115,12 @@ NORMALIZED_TABLES = (
 )
 
 
-def _view(table: str, *, skip_superseded: bool) -> str:
+def _view(table: str, *, current_only: bool) -> str:
     sql = (
         f"CREATE OR REPLACE VIEW analytics_{table} AS "
         f"SELECT * FROM {table} WHERE is_quarantined = false"
     )
-    if not skip_superseded:
+    if not current_only:
         return sql
     # A normalized row carries its raw row's key; only scalar_metrics shares one table
     # between data types.
@@ -211,11 +220,53 @@ def _upgrade(dialect: str) -> None:
         SUPERSESSION_TABLE,
         ["old_google_data_point_id", "data_type"],
     )
+    op.create_table(
+        CHAIN_TABLE,
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("from_fingerprint", sa.String(64), nullable=False),
+        sa.Column("to_fingerprint", sa.String(64), nullable=False),
+        sa.Column("from_label", sa.String(255), nullable=False),
+        sa.Column("to_label", sa.String(255), nullable=False),
+        sa.Column("decided_by", sa.String(16), nullable=False),
+        sa.Column("evidence", sa.Text(), nullable=False),
+        sa.Column("decided_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "from_fingerprint <> to_fingerprint",
+            name=op.f("ck_raw_source_chains_distinct_sources"),
+        ),
+        sa.PrimaryKeyConstraint("data_type", "from_fingerprint", name="pk_raw_source_chains"),
+        sa.UniqueConstraint("data_type", "to_fingerprint", name="uq_raw_source_chains_data_type"),
+    )
+    raw_json = sa.JSON().with_variant(postgresql.JSONB(), "postgresql")
+    op.create_table(
+        SIGHTING_TABLE,
+        sa.Column("data_type", sa.String(128), nullable=False),
+        sa.Column("fingerprint", sa.String(64), nullable=False),
+        sa.Column("stable_class", sa.String(64), nullable=False),
+        sa.Column("label", sa.String(255), nullable=False),
+        sa.Column("data_source", raw_json, nullable=True),
+        sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("complete", sa.Boolean(), nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("data_type", "fingerprint", name="pk_raw_source_sightings"),
+    )
     for statement in POSTGRESQL_DDL if dialect == "postgresql" else SQLITE_DDL:
         op.execute(statement)
     if dialect == "postgresql":
         for table in NORMALIZED_TABLES:
-            op.execute(_view(table, skip_superseded=True))
+            op.execute(_view(table, current_only=True))
 
 
 def _refuse_while_kept(context_) -> None:
@@ -250,7 +301,9 @@ def downgrade() -> None:
     if context_.dialect.name == "postgresql":
         # The views depend on the supersession table: restore them first.
         for table in NORMALIZED_TABLES:
-            op.execute(_view(table, skip_superseded=False))
+            op.execute(_view(table, current_only=False))
     # Dropping a table drops its triggers; healthos_refuse_change() belongs to 0011.
+    op.drop_table(SIGHTING_TABLE)
+    op.drop_table(CHAIN_TABLE)
     op.drop_table(SUPERSESSION_TABLE)
     op.drop_table(IDENTITY_TABLE)

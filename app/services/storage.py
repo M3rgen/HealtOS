@@ -64,11 +64,23 @@ async def insert_responses(
 
 
 async def store_page(
-    session: AsyncSession, spec: DataTypeSpec, page, *, source: str | None = None
+    session: AsyncSession,
+    spec: DataTypeSpec,
+    page,
+    *,
+    source: str | None = None,
+    fetch_started: datetime | None = None,
 ) -> StoreStats:
-    """Store a fetched page: its Google responses and its records, in one transaction."""
+    """Store a fetched page: its Google responses and its records, in one transaction.
+
+    ``fetch_started``: when the fetch (the run of pages) this page belongs to began."""
     return await store_records(
-        session, spec, page.data_points, source=source, responses=page.responses
+        session,
+        spec,
+        page.data_points,
+        source=source,
+        responses=page.responses,
+        fetch_started=fetch_started,
     )
 
 
@@ -79,6 +91,7 @@ async def store_records(
     *,
     source: str | None = None,
     responses: Sequence[CapturedResponse] = (),
+    fetch_started: datetime | None = None,
 ) -> StoreStats:
     """Archive one page of records; a changed payload keeps the previous one as a version.
 
@@ -91,6 +104,10 @@ async def store_records(
     ``responses`` are the HTTP exchanges the records were read from: they are appended to
     ``raw_api_responses`` first, in this same transaction, and each new payload is linked
     to the last of them (``response_id``), so a crash keeps both or neither.
+
+    ``fetch_started`` is when the fetch that returned these records began (default: now, a
+    fetch of one page). Whether a source "was seen in this fetch" is judged against it when
+    deciding that two source fingerprints are one renamed device (app/services/identity.py).
     """
     stats = StoreStats()
     now = datetime.now(UTC)
@@ -100,7 +117,7 @@ async def store_records(
     # Records without a Google id are written onto the row that holds their identity
     # (app/services/identity.py), whatever key that row was first stored under.
     digests = [payload_hash(record) for record in records]
-    resolution = await resolve_ids(session, spec, records, digests, now)
+    resolution = await resolve_ids(session, spec, records, digests, now, fetch_started)
     # Per record id, the distinct consecutive payloads of this page, in page order.
     by_id: dict[str, list[tuple]] = {}
     duplicates = 0

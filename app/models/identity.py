@@ -12,6 +12,15 @@ dashboards, Umay and the ``analytics_*`` views skip it, as they skip a source de
 
 Both tables are append-only (no ``UPDATE``, ``DELETE`` or ``TRUNCATE``; triggers
 ``ENABLE ALWAYS``) and ``health-mirror verify`` checks those triggers like the ones of 0011.
+``raw_source_chains`` records which source fingerprints are one device seen before and after
+a change (a ``displayName`` rename, a dropped package suffix): one row per link ``from -> to``,
+decided per data type from the sources' sighting timelines (app/services/source_chains.py).
+It is append-only too. ``raw_source_sightings`` is the bookkeeping those decisions read: when
+each source fingerprint was first and last seen. It is derived (like
+``raw_health_data.last_seen_at``, updated in place on every fetch) and rebuilt by
+``health-mirror identity-backfill`` from the raw rows and their versions; it holds no received
+data.
+
 The trigger SQL is duplicated, frozen, in the migration; tests/test_identity_keys.py compares
 the two.
 """
@@ -23,12 +32,15 @@ from datetime import datetime
 
 from sqlalchemy import (
     DDL,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
     PrimaryKeyConstraint,
     String,
+    Text,
+    UniqueConstraint,
     event,
     func,
     select,
@@ -36,13 +48,17 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.models.state import RawJSON
 
 # Its after_create DDL defines healthos_refuse_change(), which the triggers below call.
 import app.models.raw_versions  # noqa: E402, F401  isort: skip
 
 IDENTITY_TABLE = "raw_health_data_identity"
 SUPERSESSION_TABLE = "raw_health_data_supersessions"
-IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE)
+CHAIN_TABLE = "raw_source_chains"
+SIGHTING_TABLE = "raw_source_sightings"
+# The append-only tables of this revision (the sightings are bookkeeping, not guarded).
+IDENTITY_TABLES = (IDENTITY_TABLE, SUPERSESSION_TABLE, CHAIN_TABLE)
 # Why a row was superseded (app.parsers.identity.supersession_reason).
 REASONS = (
     "display-name-change",
@@ -91,6 +107,57 @@ class RawHealthDataSupersession(Base):
     new_google_data_point_id: Mapped[str] = mapped_column(String(512), nullable=False)
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RawSourceChain(Base):
+    """One link of a device's chain of source fingerprints, per data type."""
+
+    __tablename__ = CHAIN_TABLE
+    __table_args__ = (
+        # A fingerprint has at most one successor and one predecessor: a chain, never a tree.
+        PrimaryKeyConstraint("data_type", "from_fingerprint"),
+        UniqueConstraint("data_type", "to_fingerprint"),
+        CheckConstraint("from_fingerprint <> to_fingerprint", name="distinct_sources"),
+    )
+
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    # app.parsers.identity.source_fingerprint of the dataSource before and after the change.
+    from_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    to_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    from_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    to_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    # "backfill" or "live" (a page of a fetch, app.services.identity).
+    decided_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    # JSON: both sighting spans, the gap, keys shared, the rule's tolerance.
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class RawSourceSighting(Base):
+    """When a source fingerprint of a data type was first and last seen (derived)."""
+
+    __tablename__ = SIGHTING_TABLE
+    __table_args__ = (PrimaryKeyConstraint("data_type", "fingerprint"),)
+
+    data_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Hash of the stable source fields (app.parsers.identity.stable_class): only fingerprints
+    # of one class can share a v2 key.
+    stable_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    data_source: Mapped[dict | None] = mapped_column(RawJSON)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The span covers the whole archive (identity-backfill built it, or the data type had no
+    # rows when the fingerprint was first seen). Chains are only decided between complete
+    # spans.
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 

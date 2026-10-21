@@ -210,10 +210,13 @@ class BackfillService:
         event(logger, "BACKFILL_WINDOW_STARTED", data_type=spec.name, window_start=str(start))
         try:
             with provenance(source="backfill", context_id=f"backfill:{job_id}"):
+                run_started = datetime.now(UTC)
                 async for page in iter_pages(self.client, spec, start, end, token):
                     try:
                         async with self.sessions.begin() as session:
-                            await store_page(session, spec, page, source="backfill")
+                            await store_page(
+                                session, spec, page, source="backfill", fetch_started=run_started
+                            )
                             job = await session.get(BackfillJob, job_id)
                             job.page_token = page.next_page_token
                             job.records_downloaded += len(page.data_points)

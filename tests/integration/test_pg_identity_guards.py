@@ -16,7 +16,6 @@ from sqlalchemy.pool import NullPool
 from typer.testing import CliRunner
 
 from app.google_health.data_types import REGISTRY
-from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
 from app.models.state import RawHealthData
 from app.parsers import normalize
 from app.parsers.common import payload_hash, source_id, temporal
@@ -113,28 +112,25 @@ async def execute(sessions, *statements: str) -> None:
 
 
 async def linked_pair(sessions) -> None:
-    """A renamed duplicate linked to its successor, written as the backfill would."""
-    old = await legacy(sessions, HEART, heart(60), T0, deleted=T0 + timedelta(days=1))
-    new = await legacy(sessions, HEART, heart(60, name="Example Band"), T0 + timedelta(days=1))
-    async with sessions.begin() as session:
-        rows = {row.id: row for row in (await session.scalars(select(RawHealthData))).all()}
-        session.add(
-            RawHealthDataIdentity(
-                data_type="heart-rate",
-                identity_key="v2:20261018T090000:" + "a" * 64,
-                raw_id=new,
-                google_data_point_id=rows[new].google_data_point_id,
+    """A renamed duplicate linked to its successor by the backfill (with its source chain)."""
+    from app.services.identity_backfill import identity_backfill
+
+    await legacy(sessions, HEART, heart(60), T0, deleted=T0 + timedelta(days=1))
+    await legacy(sessions, HEART, heart(60, name="Example Band"), T0 + timedelta(days=1))
+    await identity_backfill(sessions)
+
+
+async def merged_events(sessions) -> int:
+    from sqlalchemy import func
+
+    from app.models.raw_versions import RawHealthDataEvent
+
+    async with sessions() as session:
+        return (
+            await session.scalar(
+                select(func.count()).where(RawHealthDataEvent.event == "identity-merged")
             )
-        )
-        session.add(
-            RawHealthDataSupersession(
-                old_raw_id=old,
-                new_raw_id=new,
-                data_type="heart-rate",
-                old_google_data_point_id=rows[old].google_data_point_id,
-                new_google_data_point_id=rows[new].google_data_point_id,
-                reason="display-name-change",
-            )
+            or 0
         )
 
 
@@ -147,6 +143,9 @@ async def test_identity_tables_refuse_update_delete_truncate(pg_sessions) -> Non
         "UPDATE raw_health_data_supersessions SET reason = 'duplicate'",
         "DELETE FROM raw_health_data_supersessions",
         "TRUNCATE raw_health_data_supersessions",
+        "UPDATE raw_source_chains SET to_label = 'x'",
+        "DELETE FROM raw_source_chains",
+        "TRUNCATE raw_source_chains",
         "TRUNCATE raw_health_data CASCADE",
     ):
         with pytest.raises(DBAPIError, match="keeps every record"):
@@ -185,6 +184,10 @@ async def test_verify_detects_tampered_identity_guards(pg_sessions) -> None:
             ["DROP TRIGGER raw_health_data_identity_no_truncate ON raw_health_data_identity"],
             "protective trigger missing: "
             "raw_health_data_identity.raw_health_data_identity_no_truncate",
+        ),
+        (
+            ["ALTER TABLE raw_source_chains ENABLE TRIGGER raw_source_chains_append_only"],
+            "protective trigger raw_source_chains.raw_source_chains_append_only is enabled",
         ),
     )
     for statements, message in tampering:
@@ -247,6 +250,23 @@ def test_migration_up_down_refuses_while_identity_rows_exist(
             )
             # Raw rows, their versions and events were not touched by the downgrade.
             assert connection.scalar(text("SELECT count(*) FROM raw_health_data")) == 2
+
+        # Review 2: upgrading again and re-running the backfill links the pair again but
+        # does not repeat its identity-merged event.
+        command.upgrade(alembic_config, "head")
+
+        async def refill() -> tuple[int, int]:
+            from app.services.identity_backfill import identity_backfill
+
+            async_engine = create_async_engine(database_url, poolclass=NullPool)
+            sessions = async_sessionmaker(async_engine, expire_on_commit=False)
+            try:
+                report = await identity_backfill(sessions)
+                return sum(report["heart-rate"].linked.values()), await merged_events(sessions)
+            finally:
+                await async_engine.dispose()
+
+        assert asyncio.run(refill()) == (1, 1)
     finally:
         engine.dispose()
 

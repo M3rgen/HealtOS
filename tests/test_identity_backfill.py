@@ -44,8 +44,10 @@ async def archive_with_duplicates(sessions) -> dict[str, uuid.UUID]:
         "lone-deleted": await legacy(
             sessions, HEART, heart(80, at=T0 + timedelta(minutes=9)), T0, deleted=T0 + day
         ),
+        # The band (old name) was last seen half a day before the new name first appeared;
+        # the watch, another device, was seen together with both.
         "band": await legacy(
-            sessions, HEART, heart(70, at=T0 + timedelta(minutes=3)), T0, last=T0 + day
+            sessions, HEART, heart(70, at=T0 + timedelta(minutes=3)), T0, last=T0 + day / 2
         ),
         "watch": await legacy(
             sessions,
@@ -147,14 +149,14 @@ async def test_store_after_backfill_follows_the_links(sessions, clock) -> None:
     await identity_backfill(sessions)
     clock.now = T0 + timedelta(days=3)
     await store(sessions, HEART, heart(60, name=NEW_NAME))
-    await store(sessions, STEPS, steps(41))
+    await store(sessions, STEPS, steps(41, source=phone(PACKAGE)))
     await store(sessions, SEDENTARY, sedentary(60))
     async with sessions() as session:
         renamed = await session.get(RawHealthData, ids["renamed-new"])
         plain = await session.get(RawHealthData, ids["plain"])
         growing = await session.get(RawHealthData, ids["sedentary-45"])
     assert renamed is not None and renamed.last_seen_at.replace(tzinfo=UTC) == clock.now
-    assert plain is not None and plain.raw_json == steps(41)
+    assert plain is not None and plain.raw_json == steps(41, source=phone(PACKAGE))
     assert growing is not None and temporal(SEDENTARY, growing.raw_json)[1] == T0 + timedelta(
         hours=1
     )
@@ -191,8 +193,8 @@ async def test_verify_reports_an_alias_that_does_not_match_its_row(sessions) -> 
     ids = await archive_with_duplicates(sessions)
     await identity_backfill(sessions)
     async with sessions() as session:
-        count, errors = await verify_identities(session)
-    assert count == 9 and errors == []
+        count, errors, notes = await verify_identities(session)
+    assert count == 9 and errors == [] and notes == []
     async with sessions.begin() as session:
         session.add(
             RawHealthDataIdentity(
@@ -203,7 +205,7 @@ async def test_verify_reports_an_alias_that_does_not_match_its_row(sessions) -> 
             )
         )
     async with sessions() as session:
-        _, errors = await verify_identities(session)
+        _, errors, _ = await verify_identities(session)
     assert errors == [f"identity alias steps/v2:{'0' * 64} does not match its raw row"]
 
 
@@ -240,3 +242,124 @@ def test_cli_identity_backfill_reports_per_type_and_reason(tmp_path, monkeypatch
         assert bad.exit_code != 0
     finally:
         asyncio.run(engine.dispose())
+
+
+# --- review findings ----------------------------------------------------------------------
+
+
+async def test_backfill_links_within_a_chain_next_to_an_overlapping_device(sessions) -> None:
+    """Review 1 (high) / review 2 blocker 3: old and new name of one device are linked even
+    where a second device recorded at the same instant; the second device is never linked."""
+    hour = timedelta(hours=1)
+    later = T0 + timedelta(minutes=1)
+    old = await legacy(sessions, HEART, heart(60), T0, last=T0 + 3 * hour)
+    old_later = await legacy(sessions, HEART, heart(61, at=later), T0, last=T0 + 3 * hour)
+    new = await legacy(
+        sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * hour, last=T0 + 30 * hour
+    )
+    new_later = await legacy(
+        sessions, HEART, heart(61, at=later, name=NEW_NAME), T0 + 9 * hour, last=T0 + 30 * hour
+    )
+    await legacy(sessions, HEART, heart(90, name="Example Watch"), T0, last=T0 + 30 * hour)
+    dry = await identity_backfill(sessions, dry_run=True)
+    report = dry["heart-rate"]
+    assert [(chain["from"], chain["to"]) for chain in report.chains] == [
+        ("FITBIT / Example Band Pro / DERIVED", "FITBIT / Example Band / DERIVED")
+    ]
+    assert report.chains[0]["gap_seconds"] == 6 * 3600
+    assert sorted(tuple(pair["sources"]) for pair in report.kept_apart) == [
+        ("FITBIT / Example Band Pro / DERIVED", "FITBIT / Example Watch / DERIVED"),
+        ("FITBIT / Example Watch / DERIVED", "FITBIT / Example Band / DERIVED"),
+    ]
+    assert await links(sessions) == {}
+    result = await identity_backfill(sessions)
+    assert await links(sessions) == {
+        old: (new, "display-name-change"),
+        old_later: (new_later, "display-name-change"),
+    }
+    assert result["heart-rate"].linked == {"display-name-change": 2} == dry["heart-rate"].linked
+    assert result["heart-rate"].distinct_sources == 1
+
+
+async def test_backfill_keeps_two_devices_stored_seconds_apart(sessions) -> None:
+    """Review 1: two devices at one instant, stored on two pages five seconds apart and
+    never fetched again, are two sources (seen together within the chain gap)."""
+    await legacy(sessions, HEART, heart(60), T0)
+    await legacy(sessions, HEART, heart(90, name="Other Watch"), T0 + timedelta(seconds=5))
+    report = await identity_backfill(sessions)
+    assert await links(sessions) == {}
+    assert report["heart-rate"].chains == []
+    assert report["heart-rate"].kept_apart[0]["why"].startswith("seen together")
+
+
+async def test_backfill_never_links_across_fingerprints_with_two_candidates(sessions) -> None:
+    """Ambiguous: two old sources both end before the new one: nothing is linked."""
+    hour = timedelta(hours=1)
+    await legacy(sessions, HEART, heart(60), T0, last=T0 + hour)
+    await legacy(sessions, HEART, heart(90, name="Example Watch"), T0, last=T0 + 2 * hour)
+    await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + 9 * hour)
+    report = await identity_backfill(sessions)
+    assert await links(sessions) == {}
+    assert report["heart-rate"].ambiguous == [
+        {
+            "source": "FITBIT / Example Band / DERIVED",
+            "candidates": [
+                "FITBIT / Example Band Pro / DERIVED",
+                "FITBIT / Example Watch / DERIVED",
+            ],
+        }
+    ]
+
+
+async def test_backfill_counts_only_links_it_inserted_and_genuine_deletions(
+    sessions, monkeypatch
+) -> None:
+    """Review 2: ``linked`` counts the links this run inserted (another run may insert some
+    first); ``deletions_kept`` counts deleted records with no live row of their device."""
+    from app.services import identity_backfill as backfill
+
+    day = timedelta(days=1)
+    renamed_old = await legacy(sessions, HEART, heart(60), T0, deleted=T0 + day)
+    await legacy(sessions, HEART, heart(60, name=NEW_NAME), T0 + day)
+    both_old = await legacy(
+        sessions, HEART, heart(62, at=T0 + timedelta(minutes=2)), T0, deleted=T0 + day
+    )
+    both_new = await legacy(
+        sessions,
+        HEART,
+        heart(62, at=T0 + timedelta(minutes=2), name=NEW_NAME),
+        T0 + day,
+        deleted=T0 + 2 * day,
+    )
+    await legacy(sessions, HEART, heart(80, at=T0 + timedelta(minutes=9)), T0, deleted=T0 + day)
+    original = backfill._write_plan
+
+    async def racing(session, spec, plan, stats, *, dry_run):
+        # Another run linked the first row a moment earlier.
+        if plan.links and not dry_run:
+            row, holder, reason = plan.links[0]
+            session.add(
+                RawHealthDataSupersession(
+                    old_raw_id=row.raw_id,
+                    new_raw_id=holder.raw_id,
+                    data_type=spec.name,
+                    old_google_data_point_id=row.google_data_point_id,
+                    new_google_data_point_id=holder.google_data_point_id,
+                    reason=reason,
+                )
+            )
+            await session.flush()
+        await original(session, spec, plan, stats, dry_run=dry_run)
+
+    monkeypatch.setattr(backfill, "_write_plan", racing)
+    result = (await identity_backfill(sessions))["heart-rate"]
+    assert sum(result.linked.values()) == 1  # two planned, one inserted by this run
+    found = await links(sessions)
+    assert set(found) == {renamed_old, both_old} and found[both_old][0] == both_new
+    # The lone deletion and the record deleted under both names; not the renamed one.
+    assert result.deletions_kept == 2
+    async with sessions() as session:
+        merged = await session.scalar(
+            select(func.count()).where(RawHealthDataEvent.event == "identity-merged")
+        )
+    assert merged == 1  # only for the link this run inserted

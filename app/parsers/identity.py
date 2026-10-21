@@ -18,11 +18,12 @@ The v2 key hashes only what identifies the record physically:
   ``device.manufacturer`` and ``application.packageName`` without a trailing ``.<UUID>``.
 
 ``displayName`` and every other ``dataSource`` field are left out of the key but kept in the
-*fingerprint*: two records with the same key and different fingerprints are either the same
-record seen before and after a change, or two sources that really are distinct (two devices
-recording at the same instant). Records seen together, in one batch or while the other is
-still being returned, are distinct; they fall back to ``specific_key``, which includes the
-fingerprint (see app/services/storage.py and app/services/identity_backfill.py).
+*fingerprint* (the hash of the whole ``dataSource``): two records with the same key and
+different fingerprints are either the same record seen before and after a change of its
+source, or two sources that really are distinct (two devices recording at the same instant).
+That is decided per source, never per record: app/services/source_chains.py links two
+fingerprints into one device's chain only when their sighting timelines say one replaced the
+other. A source kept apart gets ``specific_key``, which includes the fingerprint.
 """
 
 from __future__ import annotations
@@ -81,6 +82,26 @@ def stable_source(data_source: object) -> object:
     }
 
 
+def stable_class(data_source: object) -> str:
+    """Hash of the stable source fields: fingerprints of one class can share a v2 key."""
+    return payload_hash(stable_source(data_source))
+
+
+def source_label(data_source: object) -> str:
+    """A short readable name of a source for reports: platform, device or package name."""
+    if not isinstance(data_source, dict):
+        return "(no dataSource)"
+    device = _object(data_source.get("device"))
+    application = _object(data_source.get("application"))
+    parts = [
+        data_source.get("platform"),
+        device.get("displayName"),
+        application.get("packageName"),
+        data_source.get("recordingMethod"),
+    ]
+    return " / ".join(str(part) for part in parts if part)[:255] or "(empty dataSource)"
+
+
 def instant(value: datetime | None) -> str | None:
     return as_utc(value).isoformat() if value is not None else None
 
@@ -101,6 +122,8 @@ class RecordIdentity:
     shape: str | None
     # The physical start (``temporal``), where stored rows of the same identity are found.
     start: datetime | None
+    # Hash of the stable source fields (the part of ``source`` that is in ``key``).
+    stable: str
 
     @property
     def fingerprint(self) -> tuple[str, str | None]:
@@ -134,13 +157,15 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
     moment = start if start is not None else end
     assert moment is not None
     stamp = as_utc(moment).strftime("%Y%m%dT%H%M%S")
-    specific = payload_hash({"key": key, "dataSource": data_source, "shape": shape})
+    source = source_fingerprint(data_source)
+    specific = payload_hash({"key": key, "source": source, "shape": shape})
     return RecordIdentity(
         key=f"{KEY_PREFIX}:{stamp}:{key}",
         specific_key=f"{SPECIFIC_PREFIX}:{stamp}:{specific}",
-        source=source_fingerprint(data_source),
+        source=source,
         shape=shape,
         start=start,
+        stable=payload_hash(parts["source"]),
     )
 
 

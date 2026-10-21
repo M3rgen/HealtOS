@@ -231,18 +231,20 @@ def verify() -> None:
             errors.extend(version_errors)
             responses, response_errors = await verify_responses(session)
             errors.extend(response_errors)
-            aliases, identity_errors = await verify_identities(session)
+            aliases, identity_errors, notes = await verify_identities(session)
             errors.extend(identity_errors)
             failed = (
                 await session.scalars(select(SyncState).where(SyncState.last_error.is_not(None)))
             ).all()
-        return count, versions, responses, aliases, errors, failed
+        return count, versions, responses, aliases, errors, notes, failed
 
-    count, versions, responses, aliases, errors, failed = run(command())
+    count, versions, responses, aliases, errors, notes, failed = run(command())
     typer.echo(
         f"Verified {count} raw records, {versions} earlier versions, "
         f"{responses} stored Google responses and {aliases} identity aliases"
     )
+    for note in notes:
+        typer.echo(f"note: {note}", err=True)
     for error in errors:
         typer.echo(error, err=True)
     for state in failed:
@@ -369,11 +371,16 @@ def identity_backfill(
         "120s", help="PostgreSQL statement_timeout for each batch (e.g. 120s, 5min)."
     ),
 ) -> None:
-    """Add v2 identity aliases and link duplicate rows of the same record (idempotent)."""
+    """Decide source chains, add v2 aliases and link duplicate rows of a record (idempotent).
+
+    The report lists, per data type, every chain (from -> to source, gap in seconds) and
+    every pair of sources that share records but are kept apart; review both after a dry run.
+    """
     import re
 
     from app.services.identity_backfill import BackfillStats
     from app.services.identity_backfill import identity_backfill as run_backfill
+    from app.services.source_chains import BackfillRunning
 
     if not re.fullmatch(r"[1-9][0-9]*(ms|s|min)", statement_timeout):
         raise typer.BadParameter(
@@ -388,17 +395,21 @@ def identity_backfill(
             err=True,
         )
 
-    results = run(
-        run_backfill(
-            SessionLocal,
-            data_types=data_type,
-            batch_size=batch_size,
-            dry_run=dry_run,
-            after=after.replace(tzinfo=UTC) if after else None,
-            statement_timeout=statement_timeout,
-            progress=progress,
+    try:
+        results = run(
+            run_backfill(
+                SessionLocal,
+                data_types=data_type,
+                batch_size=batch_size,
+                dry_run=dry_run,
+                after=after.replace(tzinfo=UTC) if after else None,
+                statement_timeout=statement_timeout,
+                progress=progress,
+            )
         )
-    )
+    except BackfillRunning as exc:
+        typer.echo(f"identity-backfill refused: {exc}", err=True)
+        raise typer.Exit(1) from exc
     total = BackfillStats()
     for stats in results.values():
         total.add(stats)

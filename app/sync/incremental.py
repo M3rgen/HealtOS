@@ -191,11 +191,12 @@ class IncrementalSync:
             state.last_page_token = page_token
         # Only a fetch that starts at the first page sees the whole window, so only
         # then can records that stopped appearing be marked as deleted at the source.
-        fetched_since = datetime.now(UTC) if page_token is None else None
+        round_started = datetime.now(UTC)
+        fetched_since = round_started if page_token is None else None
         async for page in iter_pages(self.client, spec, start, end, page_token):
             try:
                 async with self.sessions.begin() as session:
-                    total.add(await store_page(session, spec, page))
+                    total.add(await store_page(session, spec, page, fetch_started=round_started))
                     state = await session.get(SyncState, data_type)
                     state.last_page_token = page.next_page_token
                     state.records_downloaded += len(page.data_points)

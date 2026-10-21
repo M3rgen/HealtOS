@@ -15,7 +15,12 @@ from app.models.health import (
     Vo2Max,
     Weight,
 )
-from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
+from app.models.identity import (
+    RawHealthDataIdentity,
+    RawHealthDataSupersession,
+    RawSourceChain,
+    RawSourceSighting,
+)
 from app.models.manual import ManualMeasurement, ManualWorkout
 from app.models.raw_versions import RawApiResponse, RawHealthDataEvent, RawHealthDataVersion
 from app.models.settings import AppearanceSettings
@@ -51,6 +56,8 @@ __all__ = [
     "RawHealthDataIdentity",
     "RawHealthDataSupersession",
     "RawHealthDataVersion",
+    "RawSourceChain",
+    "RawSourceSighting",
     "ReliabilityState",
     "ScalarMetric",
     "SleepSession",
