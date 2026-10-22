@@ -23,7 +23,7 @@ link no longer in force, then another holder); the newest in-force link names it
 
 ``raw_source_chains`` records which source fingerprints are one device seen before and after
 a change (a ``displayName`` rename, a dropped package suffix): one row per link ``from -> to``,
-decided per data type and stable source class by the reconciler from the sources' sighting
+decided per data type and source family by the reconciler from the sources' sighting
 timelines (app/services/source_chains.py), with the spans it was decided on as ``evidence``,
 or by the owner (``health-mirror identity-decide link``). A link joins the two forms into one
 device in both directions: the old form coming back later does not undo it.

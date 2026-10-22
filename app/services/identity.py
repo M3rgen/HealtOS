@@ -29,6 +29,10 @@ the other fingerprints of its device. ``store_records`` locks the rows it relies
 writes onto, every row that could hide them, the rows it links) and re-resolves when one
 changed, was revived or linked meanwhile.
 
+Rows of two fingerprints are compared by their *match key* (app/parsers/identity.py: the v2 key
+without the optional device fields), when the two are compatible: Google adding ``formFactor``
+to a band's records changes their key, not the record.
+
 ``present_records`` decides, for deletion marking, whether an unseen row's record is still
 returned: with the same reading under its own device (present); with the same reading under a
 fingerprint not *certainly* another device (deferred: possibly a rename nobody decided yet, or
@@ -71,12 +75,15 @@ from app.models.state import RawHealthData
 from app.parsers.common import google_name, source_id
 from app.parsers.identity import (
     RecordIdentity,
+    key_under,
     new_record_id,
+    pair_key,
     reading,
     record_identity,
     source_label,
     spare_record_id,
     specific_key,
+    stable_class,
     supersession_reason,
 )
 from app.services.source_chains import (
@@ -259,8 +266,9 @@ class _Rows:
         # what it showed matters to no one).
         self.named = named
         self.rows: dict[uuid.UUID, StoredRow] = {}
-        # v2 key -> its rows (every source).
+        # v2 key -> its rows (every source); match key -> its rows (every source).
         self.of_key: dict[str, list[StoredRow]] = defaultdict(list)
+        self.of_match: dict[str, list[StoredRow]] = defaultdict(list)
         # google id -> raw id, alias key -> raw id (of what was looked up and found).
         self.by_id: dict[str, uuid.UUID] = {}
         self.alias: dict[str, uuid.UUID] = {}
@@ -289,6 +297,7 @@ class _Rows:
             return row
         if row.identity is not None:
             self.of_key[row.identity.key].append(row)
+            self.of_match[row.identity.match].append(row)
         return row
 
     async def complete(self) -> None:
@@ -307,6 +316,7 @@ class _Rows:
                 row.raw_json = raw_json
                 if row.identity is not None:
                     self.of_key[row.identity.key].append(row)
+                    self.of_match[row.identity.match].append(row)
 
     def holding(self, name: tuple[str, str]) -> list[StoredRow]:
         """The rows of the record ``name`` (v2 key, fingerprint)."""
@@ -545,17 +555,17 @@ async def resolve_ids(
     state = await load_state(session, spec.name, resolution.seen)
     resolution.state = state
     chains = state.chains
-    by_key: dict[str, list[_Group]] = defaultdict(list)
+    by_match: dict[str, list[_Group]] = defaultdict(list)
     for group in groups.values():
-        by_key[group.key].append(group)
-    # One response returned this key under two fingerprints with two values: evidence of
-    # two devices (one record has one value).
+        by_match[group.identity.match].append(group)
+    # One response returned this record under two compatible fingerprints with two values:
+    # evidence of two devices (one record has one value).
     resolution.evidence = [
-        (left.source, right.source, key)
-        for key, found in by_key.items()
+        (left.source, right.source, pair_key(left.identity, right.identity))
+        for found in by_match.values()
         for position, left in enumerate(found)
         for right in found[position + 1 :]
-        if left.reading != right.reading
+        if left.reading != right.reading and left.identity.compatible(right.identity)
     ]
 
     # The record's own rows: by id (its v1 ids, its v2s id), then by alias for the records
@@ -658,9 +668,19 @@ async def resolve_ids(
         # row this page makes counted (new, or marked deleted until now) holds those that show
         # its reading.
         others: set[str] = set()
+        forms = await _data_sources(
+            session,
+            spec.name,
+            {source for group, _ in linkable for source in chains.members(group.source)},
+        )
         for group, _ in linkable:
             for source in chains.members(group.source) - {group.source}:
-                other = specific_key(group.key, source)
+                # Its key for this record: another one when their optional device fields differ.
+                key = group.key
+                if source in forms and stable_class(forms[source]) != group.identity.stable:
+                    assert isinstance(group.record, dict)
+                    key = key_under(spec, group.record, forms[source]) or key
+                other = specific_key(key, source)
                 others |= {new_record_id(other), other}
         await stored.find(
             {name for name in others if name.startswith("synthetic:")},
@@ -669,6 +689,24 @@ async def resolve_ids(
         await stored.load_links(stored.rows)
         _link_written(spec, linkable, stored, page, resolution, ids)
     return resolution
+
+
+async def _data_sources(
+    session: AsyncSession, data_type: str, fingerprints: set[str]
+) -> dict[str, object]:
+    """The ``dataSource`` of each of these fingerprints that has a sighting."""
+    from app.models.identity import RawSourceSighting
+
+    found: dict[str, object] = {}
+    for chunk in _chunks(sorted(fingerprints)):
+        rows = await session.execute(
+            select(RawSourceSighting.fingerprint, RawSourceSighting.data_source).where(
+                RawSourceSighting.data_type == data_type,
+                among(session, RawSourceSighting.fingerprint, chunk),
+            )
+        )
+        found.update(rows.tuples().all())
+    return found
 
 
 def _expect(resolution: Resolution, row: StoredRow) -> None:
@@ -703,16 +741,17 @@ def _link_written(
     newly: dict[tuple, list[tuple[_Group, StoredRow | None]]] = defaultdict(list)
     for group, row in written:
         shown = (group.reading, group.identity.shape)
-        newly[(group.key, chains.device(group.source), shown)].append((group, row))
+        newly[(group.identity.match, chains.device(group.source), shown)].append((group, row))
     for (key, device, value), entries in sorted(newly.items(), key=lambda item: item[0][:2]):
         # google id -> (fingerprint, end, stored row or None, the page's group or None)
         members: dict[str, tuple[str, str | None, StoredRow | None, _Group | None]] = {}
         for group, row in entries:
             members[ids[group.indexes[0]]] = (group.source, group.identity.shape, row, group)
-        for other in stored.of_key.get(key, ()):
+        for other in stored.of_match.get(key, ()):
             if (
                 other.google_data_point_id in members
                 or other.identity is None
+                or not other.identity.compatible(entries[0][0].identity)
                 or chains.device(other.identity.source) != device
                 or not page.counted(other)
                 or page.shown(other) != value
@@ -920,7 +959,9 @@ async def present_records(
 ) -> Presence:
     """Candidates (raw id, raw_json, stored start) that must not be marked deleted.
 
-    For each candidate, the rows with its v2 key seen at or after ``seen_since`` decide:
+    For each candidate, the rows with its match key and a compatible source (its v2 key, or
+    the key of a form of its source with an optional device field added or dropped) seen at or
+    after ``seen_since`` decide:
 
     * one *with the same reading* of its *device* (the same fingerprint, or one joined to it
       by live chain links; every link in force is one of these) - a duplicate of the record
@@ -946,6 +987,7 @@ async def present_records(
     """
     from app.core.timeutil import as_utc
     from app.parsers.common import temporal
+    from app.parsers.identity import compatible
 
     presence = Presence()
     # Each candidate's instants: its parsed start and (a stale one, written by an older
@@ -965,7 +1007,9 @@ async def present_records(
     starts = set().union(*instants.values()) if instants else set()
     if not starts:
         return presence
-    seen_rows: dict[str, list[tuple[uuid.UUID, str, str | None, str | None]]] = defaultdict(list)
+    seen_rows: dict[str, list[tuple[uuid.UUID, str, str | None, str | None, tuple]]] = defaultdict(
+        list
+    )
     seen_at: set[datetime] = set()
     for chunk in _chunks(sorted(starts)):
         rows = await session.execute(
@@ -982,8 +1026,14 @@ async def present_records(
             if identity is not None and identity.start is not None:
                 seen_at.add(identity.start)
             if identity is not None:
-                seen_rows[identity.key].append(
-                    (raw_id, identity.source, reading(spec, raw_json), identity.shape)
+                seen_rows[identity.match].append(
+                    (
+                        raw_id,
+                        identity.source,
+                        reading(spec, raw_json),
+                        identity.shape,
+                        identity.optional,
+                    )
                 )
     if not seen_rows:
         return presence
@@ -1004,11 +1054,20 @@ async def present_records(
     # Per (candidate fingerprint, other fingerprint): keys the other returned with the
     # candidate's reading, and with another one.
     tally: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+
+    def seen_of(identity: RecordIdentity) -> list[tuple[uuid.UUID, str, str | None, str | None]]:
+        # The rows seen of its record under its source or a compatible one.
+        return [
+            (other_id, source, value, shape)
+            for other_id, source, value, shape, optional in seen_rows.get(identity.match, [])
+            if compatible(identity.optional, optional)
+        ]
+
     for raw_id, identity in identities.items():
         if identity is None:
             continue
         returned: dict[str, bool] = {}
-        for other_id, source, value, _ in seen_rows.get(identity.key, []):
+        for other_id, source, value, _ in seen_of(identity):
             if other_id != raw_id and not chains.same_device(identity.source, source):
                 returned[source] = returned.get(source, False) or value == values[raw_id]
         for source, same in returned.items():
@@ -1018,7 +1077,7 @@ async def present_records(
             continue
         same_value = [
             (other_id, source, shape)
-            for other_id, source, value, shape in seen_rows.get(identity.key, [])
+            for other_id, source, value, shape in seen_of(identity)
             if other_id != raw_id and value == values[raw_id]
         ]
         if any(
@@ -1325,7 +1384,7 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
             errors.append(f"supersession of raw row {raw_id} hides a record with a Google id")
         spec = spec_for(data_type)
         old, new = record_identity(spec, old_json), record_identity(spec, new_json)
-        if old is None or new is None or old.key != new.key:
+        if old is None or new is None or old.match != new.match or not old.compatible(new):
             errors.append(f"supersession of raw row {raw_id} links two different records")
             continue
         current = chains.get(data_type) or Chains()
@@ -1597,7 +1656,7 @@ async def _counted_twice(
         if identity is None:
             continue
         device = (chains.get(data_type) or Chains()).device(identity.source)
-        group[(identity.key, device, reading(spec, raw_json))] += 1
+        group[(identity.match, device, reading(spec, raw_json))] += 1
         by_source[(identity.key, identity.source)] += 1
     close()
     return {

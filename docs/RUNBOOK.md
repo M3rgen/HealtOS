@@ -284,6 +284,11 @@ Review the dry run before writing anything. Per data type:
   reprocessed old records under the new name, a few with other values). Nothing is merged and no
   deletion is marked because of them; confirm with `identity-decide distinct`, or, if it was a
   rename, decide `not-distinct` and `link`.
+- A device field Google adds to a source's records (`formFactor`, `manufacturer`: e.g. a band
+  sent until then by its name alone, now with `formFactor: "FITNESS_BAND"`, sometimes without the
+  name) makes a new form of that source, like a rename: it appears under `chains`/`review` (or
+  `ambiguous` when Google sends both forms side by side), and is decided the same way. Two
+  different values of such a field (a phone and a watch) are never one device.
 - `deferred_deletions`: rows complete fetches did not mark because another source, that may be
   their device renamed, returned the same reading (`rows_of`, `returned_by`, how many, since
   when; one row each in `identity_deferred_deletions` until a later complete fetch of their

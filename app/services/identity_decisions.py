@@ -112,10 +112,11 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
         raise DecisionRefused(f"unknown decision {decision!r} (one of {', '.join(DECISIONS)})")
     if first == second:
         raise DecisionRefused("the two fingerprints are the same")
-    if chains.spans[first].stable != chains.spans[second].stable:
+    if not chains.kindred(first, second):
         raise DecisionRefused(
-            "the two sources differ in their stable fields (platform, recording method, device "
-            "form factor or manufacturer, package without suffix): they never share a record"
+            "the two sources differ in their stable fields (platform, recording method, package "
+            "without suffix, or two values of the device form factor or manufacturer): they "
+            "never share a record"
         )
     recorded = (first, second) in chains.links
     if decision in ("reject", "confirm") and not recorded:

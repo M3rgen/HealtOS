@@ -11,8 +11,11 @@ two different ``dataSource`` fingerprints are either
 The write path never decides which (app/services/identity.py): an unknown fingerprint always
 gets rows of its own, so at worst a renamed device is counted twice until the reconciler has
 run. Only the reconciler (``health-mirror identity-backfill``, nightly as an incremental run)
-and the owner (``health-mirror identity-decide``) decide, per data type and *stable class*
-(the source fields a rename keeps).
+and the owner (``health-mirror identity-decide``) decide, per data type and *family* (the source
+fields a rename keeps, without the optional device fields ``formFactor`` and ``manufacturer``),
+between fingerprints that are *kindred*: of one stable class, or whose optional device fields do
+not conflict (one has a field the other lacks: Google added ``formFactor`` to a band's records).
+Two fingerprints with two values of such a field (a phone and a watch) are never one device.
 
 **Evidence of two devices** (``raw_source_pairs``): a key that one Google response returned
 under two fingerprints *with two different readings*. A renamed device never returns two values
@@ -97,6 +100,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import cached_property
 from typing import Any
 
 from sqlalchemy import (
@@ -127,6 +131,7 @@ from app.models.identity import (
     RawSourceSighting,
 )
 from app.models.state import RawHealthData
+from app.parsers.identity import compatible, optional_fields, source_family
 
 CHAIN_GAP = timedelta(minutes=5)
 # Keys with two different readings that establish two distinct devices (from two fetches).
@@ -197,6 +202,22 @@ class Span:
 
     def as_dict(self) -> dict:
         return {"first": self.first.isoformat(), "last": self.last.isoformat()}
+
+    @cached_property
+    def family(self) -> str:
+        """The stable class without the optional device fields (``source_family``)."""
+        return source_family(self.data_source) if self.data_source is not None else self.stable
+
+    @cached_property
+    def optional(self) -> tuple:
+        return optional_fields(self.data_source)
+
+    def kindred(self, other: Span) -> bool:
+        """The two sources may be forms of one device: one stable class, or one family whose
+        optional device fields do not conflict."""
+        return self.stable == other.stable or (
+            self.family == other.family and compatible(self.optional, other.optional)
+        )
 
 
 def precedes(old: Span, new_first: datetime) -> bool:
@@ -608,6 +629,12 @@ class Chains:
     def same_device(self, left: str, right: str) -> bool:
         return left == right or right in self.members(left)
 
+    def kindred(self, left: str, right: str) -> bool:
+        """The two fingerprints may be forms of one device (``Span.kindred``); unknown spans
+        are taken as kindred."""
+        before, after = self.spans.get(left), self.spans.get(right)
+        return before is None or after is None or before.kindred(after)
+
     def in_force(self, old_fingerprint: str, new_fingerprint: str) -> bool:
         """A supersession between rows of these fingerprints hides its old row (readers use
         ``raw_source_devices``, which ``record_devices`` keeps equal to this)."""
@@ -699,7 +726,7 @@ def decide_chains(chains: Chains) -> Decision:
     spans = chains.spans
     classes: dict[str, list[str]] = defaultdict(list)
     for fingerprint, span in spans.items():
-        classes[span.stable].append(fingerprint)
+        classes[span.family].append(fingerprint)
 
     def note(new: str, why: str, candidates: Iterable[str] = ()) -> None:
         decision.ambiguous.append(
@@ -742,10 +769,12 @@ def decide_chains(chains: Chains) -> Decision:
         )
 
     def blocks(other: str, old: str, new: str) -> bool:
-        # A source established distinct from one of them and apart from the other, or one
-        # that retired long before ``old`` did, says nothing about old -> new.
+        # A source established distinct from one of them and apart from the other, one that
+        # retired long before ``old`` did, or one that can be neither (another value of an
+        # optional device field than both: another device) says nothing about old -> new.
         return not (
-            (chains.distinct(other, old) and apart(other, new))
+            not (chains.kindred(other, old) or chains.kindred(other, new))
+            or (chains.distinct(other, old) and apart(other, new))
             or (chains.distinct(other, new) and apart(other, old))
             or retired_before(other, old, new)
         )
@@ -786,6 +815,7 @@ def decide_chains(chains: Chains) -> Decision:
             if (
                 name in chains.following
                 and name not in chains.members(new)
+                and chains.kindred(name, new)
                 and not chains.distinct(name, new)
                 and spans[name].last < spans[new].first
                 and (
@@ -797,6 +827,7 @@ def decide_chains(chains: Chains) -> Decision:
             if (
                 name in chains.preceding
                 and name not in chains.members(old)
+                and chains.kindred(name, old)
                 and not chains.distinct(name, old)
                 and precedes(spans[old], spans[name].first)
                 and not between(old, name, members, links=False)
@@ -829,6 +860,7 @@ def decide_chains(chains: Chains) -> Decision:
                 for name in ordered
                 if name not in chains.members(new)
                 and name not in chains.following
+                and chains.kindred(name, new)
                 and not chains.distinct(name, new)
                 and spans[name].first < spans[new].first
             ]
@@ -877,6 +909,7 @@ def decide_chains(chains: Chains) -> Decision:
                 for name in ordered
                 if name not in chains.members(old)
                 and name not in chains.preceding
+                and chains.kindred(name, old)
                 and not chains.distinct(name, old)
                 and precedes(spans[old], spans[name].first)
                 and not between(old, name, ordered)

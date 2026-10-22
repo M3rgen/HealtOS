@@ -18,22 +18,23 @@ decided. Per data type:
    leaves open are listed in the report (``ambiguous``), every chain not yet reviewed by the
    owner under ``review``, pairs that look like a rename although evidence made them two
    devices under ``review_distinct``.
-2. **Links.** Per v2 key, the rows are grouped by device (one fingerprint, or several joined
-   by live chain links). Rows superseded by a link in force are settled; a row whose links
-   are no longer in force (its chain was rejected or refuted) is settled again like any
-   other. Within one device the row that holds the record (a live row first, one that already
-   holds others first, then the newest) keeps it, and every other row of that device is
-   linked to it in ``raw_health_data_supersessions`` with the reason and both fingerprints,
-   plus an ``identity-merged`` event (once per row) - a row of *another fingerprint* of the
-   device only when it measured the same (``reading``): a value of its own is never hidden
-   (``kept_differing``). The rows a linked row held are linked to the holder too, so two
-   devices joined later end with one holder. Rows of different devices are never linked, nor
-   is a live row linked to a deleted one or a link made that would close a cycle
-   (``conflicts``: both rows count, listed in status). Every row whose own id does not name
-   its key and fingerprint gets an alias (``synthetic:v2s:`` rows need none). A deleted-marked
-   row with no live row of its device stays as it is: a genuine deletion (``deletions_kept``),
-   or a *suspicious* one when another fingerprint not established distinct holds the key live
-   (``deletions_suspicious``: possibly a rename nobody decided, listed for review).
+2. **Links.** Per record (match key: the v2 key without the optional device fields, so a form with
+   ``formFactor`` added is compared with the form without), the rows are grouped by device (one
+   fingerprint, or several joined by live chain links). Rows superseded by a link in force are
+   settled; a row whose links are no longer in force (its chain was rejected or refuted) is
+   settled again like any other. Within one device the row that holds the record (a live row
+   first, one that already holds others first, then the newest) keeps it, and every other row of
+   that device is linked to it in ``raw_health_data_supersessions`` with the reason and both
+   fingerprints, plus an ``identity-merged`` event (once per row) - a row of *another
+   fingerprint* of the device only when it measured the same (``reading``): a value of its own
+   is never hidden (``kept_differing``). The rows a linked row held are linked to the holder
+   too, so two devices joined later end with one holder. Rows of different devices are never
+   linked, nor is a live row linked to a deleted one or a link made that would close a cycle
+   (``conflicts``: both rows count, listed in status). Every row whose own id does not name its
+   key and fingerprint gets an alias (``synthetic:v2s:`` rows need none). A deleted-marked row
+   with no live row of its device stays as it is: a genuine deletion (``deletions_kept``), or a
+   *suspicious* one when another compatible fingerprint not established distinct holds the
+   record live (``deletions_suspicious``: possibly a rename nobody decided, listed for review).
 
 A full run reads all rows in keyset order of ``(source_start_time, id)`` (index
 ``ix_raw_health_data_type_start``): every row of a v2 key has the same start, and a batch
@@ -92,8 +93,10 @@ from app.models.state import RawHealthData
 from app.parsers.common import google_name
 from app.parsers.identity import (
     RecordIdentity,
+    compatible,
     instant,
     new_record_id,
+    pair_key,
     reading,
     record_identity,
     source_label,
@@ -445,7 +448,7 @@ async def _exclusively[T](
 @dataclass
 class _Timeline:
     spans: dict[str, Span] = field(default_factory=dict)
-    # Unordered fingerprint pairs -> v2 keys they share.
+    # Unordered pairs of compatible fingerprints -> records (match keys) they share.
     shared: Counter = field(default_factory=Counter)
     # (parsed start, raw id) of rows whose stored start is stale: settled last, by id.
     stale: list[tuple[datetime, uuid.UUID]] = field(default_factory=list)
@@ -471,20 +474,25 @@ class _Timeline:
 
 
 def _together(
-    found: list[tuple[datetime, datetime, str, str | None]],
-) -> set[tuple[tuple[str, str], datetime]]:
-    """Fingerprint pairs of one key's rows that one page stored or last saw together (the
-    same ``first_seen_at`` or ``last_seen_at``: one transaction's clock) with two readings,
-    with that time."""
-    pairs: set[tuple[tuple[str, str], datetime]] = set()
-    for position, (first, last, source, value) in enumerate(found):
+    found: list[tuple[datetime, datetime, RecordIdentity, str | None]],
+) -> set[tuple[tuple[str, str], str, datetime]]:
+    """Pairs of compatible fingerprints of one record's rows that one page stored or last saw
+    together (the same ``first_seen_at`` or ``last_seen_at``: one transaction's clock) with
+    two readings, with the key they are compared under (``pair_key``) and that time."""
+    pairs: set[tuple[tuple[str, str], str, datetime]] = set()
+    for position, (first, last, identity, value) in enumerate(found):
         for other_first, other_last, other, other_value in found[position + 1 :]:
-            if other == source or other_value == value:
+            if (
+                other.source == identity.source
+                or other_value == value
+                or not identity.compatible(other)
+            ):
                 continue
+            pair = ordered_pair(identity.source, other.source)
             if other_first == first:
-                pairs.add((ordered_pair(source, other), first))
+                pairs.add((pair, pair_key(identity, other), first))
             elif other_last == last:
-                pairs.add((ordered_pair(source, other), last))
+                pairs.add((pair, pair_key(identity, other), last))
     return pairs
 
 
@@ -500,7 +508,8 @@ async def _timeline(
             if not batch:
                 break
             row_keys: dict[uuid.UUID, tuple[str, datetime]] = {}
-            sources: dict[str, set[str]] = defaultdict(set)
+            # Match key -> fingerprint -> its optional device fields.
+            sources: dict[str, dict[str, tuple]] = defaultdict(dict)
             stored: dict[str, list] = defaultdict(list)
             for raw_id, _, raw_json, start, first, last, _, received, _, _ in batch:
                 identity = record_identity(spec, raw_json)
@@ -513,9 +522,9 @@ async def _timeline(
                 # row never changed its source then, so its first sighting is the row's).
                 timeline.sight(identity, data_source, received or first, last)
                 row_keys[raw_id] = (identity.key, first)
-                sources[identity.key].add(identity.source)
-                stored[identity.key].append(
-                    (as_utc(first), as_utc(last), identity.source, reading(spec, raw_json))
+                sources[identity.match][identity.source] = identity.optional
+                stored[identity.match].append(
+                    (as_utc(first), as_utc(last), identity, reading(spec, raw_json))
                 )
             if row_keys:
                 versions = await session.execute(
@@ -533,20 +542,21 @@ async def _timeline(
                     key, first = row_keys[raw_id]
                     timeline.sight(identity, raw_json.get("dataSource"), received or first, last)
                     if identity.key == key:
-                        sources[key].add(identity.source)
-        for key, found in stored.items():
+                        sources[identity.match][identity.source] = identity.optional
+        for found in stored.values():
             if len(found) < 2:
                 continue
-            for pair, seen in sorted(_together(found)):
+            for pair, shared_key, seen in sorted(_together(found)):
                 kept = timeline.evidence.setdefault(pair, [])
-                item = Evidence(key, seen)
+                item = Evidence(shared_key, seen)
                 if useful(kept, item):
                     kept.append(item)
-        for found in sources.values():
-            ordered = sorted(found)
+        for forms in sources.values():
+            ordered = sorted(forms)
             for index, left in enumerate(ordered):
                 for right in ordered[index + 1 :]:
-                    timeline.shared[(left, right)] += 1
+                    if compatible(forms[left], forms[right]):
+                        timeline.shared[(left, right)] += 1
         cursor = (batch[-1][3], batch[-1][0])
     return timeline
 
@@ -607,12 +617,12 @@ def _report(
     stats.ambiguous.extend(ambiguous)
     classes: dict[str, list[str]] = defaultdict(list)
     for fingerprint, span in chains.spans.items():
-        classes[span.stable].append(fingerprint)
+        classes[span.family].append(fingerprint)
     for members in classes.values():
         ordered = sorted(members, key=lambda name: (chains.spans[name].first, name))
         for index, left in enumerate(ordered):
             for right in ordered[index + 1 :]:
-                if chains.same_device(left, right):
+                if chains.same_device(left, right) or not chains.kindred(left, right):
                     continue
                 shared = None
                 if timeline is not None:
@@ -913,7 +923,7 @@ async def _plan_batch(
     plan = _Plan()
     groups: dict[str, list[_Row]] = defaultdict(list)
     for row in rows:
-        groups[row.identity.key].append(row)
+        groups[row.identity.match].append(row)
     alias = await aliases(session, spec.name, {row.identity.specific_key for row in rows})
     links = await _links_of(session, [row.raw_id for row in rows])
     by_id = {row.raw_id: row for row in rows}
@@ -1066,6 +1076,7 @@ async def _plan_batch(
                     for row in members
                     if row not in device
                     and not row.deleted
+                    and row.identity.compatible(holder.identity)
                     and not chains.distinct(row.identity.source, holder.identity.source)
                 ]
                 if others:
@@ -1134,15 +1145,19 @@ def _tally_agreement(
     hold this key: whether some row of each holds the same reading (agree) or not. Noted per
     key (``agreement_keys``), so a key counted again replaces its earlier count."""
     readings: dict[str, set[str | None]] = defaultdict(set)
+    forms: dict[str, RecordIdentity] = {}
     for row in members:
         readings[row.identity.source].add(reading(spec, row.raw_json))
+        forms[row.identity.source] = row.identity
     names = sorted(readings)
-    key = members[0].identity.key
     for position, left in enumerate(names):
         for right in names[position + 1 :]:
             pair = ordered_pair(left, right)
             if pair not in (chains.evidence if pairs is None else pairs):
                 continue
+            if not forms[left].compatible(forms[right]):
+                continue
+            key = pair_key(forms[left], forms[right])
             same = bool(readings[left] & readings[right])
             if (pair, key) not in stats.agreement_keys:
                 counts = stats.agreement.setdefault(pair, [0, 0])
@@ -1247,7 +1262,7 @@ async def _count_shared(
             rows, mismatched = _rows_of(spec, await _rows_at(session, spec, chunk), None)
             groups: dict[str, list[_Row]] = defaultdict(list)
             for row in (*rows, *mismatched):
-                groups[row.identity.key].append(row)
+                groups[row.identity.match].append(row)
             stats = BackfillStats()
             for members in groups.values():
                 _tally_agreement(spec, members, chains, stats, pairs)
@@ -1518,9 +1533,9 @@ async def _settle_starts(
             )
         ).tuples()
         stale, stale_mismatched = _rows_of(spec, by_id.all(), None)
-        keys = {row.identity.key for row in (*stale, *stale_mismatched)}
+        keys = {row.identity.match for row in (*stale, *stale_mismatched)}
         known = {row.raw_id for row in rows}
-        rows = [row for row in rows if row.identity.key in keys]
+        rows = [row for row in rows if row.identity.match in keys]
         rows.extend(row for row in (*stale, *stale_mismatched) if row.raw_id not in known)
     chains = await _batch_chains(session, spec.name, planned)
     plan = await _plan_batch(session, spec, rows, chains, stats, count_groups=count)

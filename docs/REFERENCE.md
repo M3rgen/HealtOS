@@ -497,11 +497,23 @@ Left out (but kept in the record's *fingerprint*): `displayName` and every other
 field, and a growing interval's end. The value never belongs to the identity; a changed value of
 the same identity is a new [version](#raw-record-versions) of the same row.
 
+`device.formFactor` and `device.manufacturer` are **optional device fields**: Google may add one
+to a source's records that it always sent without (it began sending `formFactor:
+"FITNESS_BAND"` for a band known until then by its name alone, for some data types without the
+name, and not for every record). They stay in the key, so no stored key or row id changes, but
+rows of two fingerprints are compared by their **match key** (the key without them; the key
+itself for a source that has none) when the two are *compatible*: every optional field the same
+in both or missing from one. A form with the field added is then a new form of the source, like
+a rename: the deletion marking defers on it, the reconciler chains it and links its rows, the
+owner can decide it. Two sources with two values of such a field (a phone and a watch) are never
+compared.
+
 **Renames are decided per source, by the reconciler or the owner.** Fitbit sends no serial
 number, only `displayName`, and Apple Health sometimes differs only by the package's `.<UUID>`
 suffix, so a renamed device and a second device recording at the same instant look alike in one
-record. The question is therefore asked of the *sources*, per data type and **stable class** (the
-stable source fields above: only fingerprints of one class can share a key).
+record. The question is therefore asked of the *sources*, per data type and **family** (the
+stable source fields above without the optional device fields), between *kindred* fingerprints:
+of one stable class, or compatible (only those can share a record).
 
 *Evidence of two devices* (`raw_source_pairs`): a key that **one Google response** returned under
 two fingerprints **with two different readings**, noted with when its fetch began. One record has

@@ -25,6 +25,15 @@ That is decided per source, never per record, and never by the write path: only 
 reconciler (``health-mirror identity-backfill``, app/services/source_chains.py) links two
 fingerprints into one device's chain, from their whole sighting history.
 
+``device.formFactor`` and ``device.manufacturer`` are *optional device fields*: Google may add one
+to a source's records that it always sent without (it began sending ``formFactor`` for a band
+known until then by its name alone, sometimes without the name). They stay in the key - every
+key and row id stored is kept as it was - but the *match key* (``RecordIdentity.match``: the key
+without them; the key itself when the source has none) is what tells which rows of two
+fingerprints are one record: two forms of a source whose optional fields do not conflict (one has
+a field the other lacks, ``compatible``) are compared like a rename, two with different values
+(a phone and a watch) never are.
+
 ``specific_key`` is the key plus the fingerprint. A record stored for the first time gets the
 id ``new_record_id(specific_key)`` (``synthetic:v2s:<hash>``): every fingerprint has its own
 row, so the payload of one source is never written onto another source's row by accident.
@@ -71,8 +80,14 @@ def _object(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def stable_source(data_source: object) -> object:
-    """The ``dataSource`` fields that identify a source across renames."""
+# Device fields of the stable source that Google may add to (or drop from) a source's records
+# while the source stays the same.
+OPTIONAL_DEVICE_FIELDS = ("formFactor", "manufacturer")
+
+
+def stable_source(data_source: object, *, optional: bool = True) -> object:
+    """The ``dataSource`` fields that identify a source across renames; ``optional=False``:
+    without the optional device fields (as ``None``, so a source that has none gives the same)."""
     if not isinstance(data_source, dict):
         return data_source
     device = _object(data_source.get("device"))
@@ -80,10 +95,31 @@ def stable_source(data_source: object) -> object:
     return {
         "platform": data_source.get("platform"),
         "recordingMethod": data_source.get("recordingMethod"),
-        "formFactor": device.get("formFactor"),
-        "manufacturer": device.get("manufacturer"),
+        "formFactor": device.get("formFactor") if optional else None,
+        "manufacturer": device.get("manufacturer") if optional else None,
         "package": stable_package(application.get("packageName")),
     }
+
+
+def optional_fields(data_source: object) -> tuple:
+    """The optional device fields of a source (``None`` where it has none)."""
+    device = _object(_object(data_source).get("device"))
+    return tuple(device.get(name) for name in OPTIONAL_DEVICE_FIELDS)
+
+
+def compatible(left: tuple, right: tuple) -> bool:
+    """Two sources' optional device fields (``optional_fields``) do not conflict: each is the
+    same in both, or missing from one. Only such sources can be one device."""
+    return all(
+        one == other or one is None or other is None
+        for one, other in zip(left, right, strict=False)
+    )
+
+
+def source_family(data_source: object) -> str:
+    """Hash of the stable source fields without the optional ones: fingerprints that may share
+    a record (their match key)."""
+    return payload_hash(stable_source(data_source, optional=False))
 
 
 def stable_class(data_source: object) -> str:
@@ -128,6 +164,16 @@ class RecordIdentity:
     start: datetime | None
     # Hash of the stable source fields (the part of ``source`` that is in ``key``).
     stable: str
+    # ``key`` without the optional device fields (``key`` itself when the source has none): the
+    # rows of two compatible fingerprints with one match key hold one record if they are one
+    # device. Never stored or used for an id.
+    match: str = ""
+    # The source's optional device fields (``optional_fields``).
+    optional: tuple = ()
+
+    def compatible(self, other: RecordIdentity) -> bool:
+        """``other`` (of the same match key) may be this record of the same device."""
+        return compatible(self.optional, other.optional)
 
     @property
     def fingerprint(self) -> tuple[str, str | None]:
@@ -155,6 +201,8 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
     data_source = record.get("dataSource")
     parts["source"] = stable_source(data_source)
     digest = payload_hash(parts)
+    loose = stable_source(data_source, optional=False)
+    match = digest if loose == parts["source"] else payload_hash({**parts, "source": loose})
     shape = instant(end) if growing else None
     # The time leads the key only for locality: aliases of one period sit together in the
     # index, so the backfill (in time order) and each page's lookups touch few index pages.
@@ -170,7 +218,23 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
         shape=shape,
         start=start,
         stable=payload_hash(parts["source"]),
+        match=f"{KEY_PREFIX}:{stamp}:{match}",
+        optional=optional_fields(data_source),
     )
+
+
+def pair_key(left: RecordIdentity, right: RecordIdentity) -> str:
+    """The key two fingerprints' rows of one record are compared under (evidence of two
+    devices, agreement): their v2 key when they share it (as before optional device fields
+    were compared), else their match key."""
+    return left.key if left.key == right.key else left.match
+
+
+def key_under(spec: DataTypeSpec, record: dict, data_source: object) -> str | None:
+    """The v2 key of ``record`` as the source ``data_source`` would send it (another form of
+    its device: the key differs when their optional device fields do)."""
+    identity = record_identity(spec, {**record, "dataSource": data_source})
+    return identity.key if identity is not None else None
 
 
 def specific_key(key: str, source: str) -> str:
