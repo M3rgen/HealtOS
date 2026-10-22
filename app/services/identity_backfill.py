@@ -955,26 +955,10 @@ async def _plan_batch(
         existing.add((row.raw_id, holder.raw_id))
         dependents[holder.raw_id].append(row.raw_id)
         hidden.add(row.raw_id)
-        # What the row held, the holder holds now (one step for readers): rows of the
-        # holder's fingerprint, and rows of others that measured the same.
-        for dependent in list(dependents.get(row.raw_id, ())):
-            held = by_id.get(dependent)
-            if (
-                held is not None
-                and not held.deleted
-                and (
-                    held.identity.source == holder.identity.source
-                    or measured(held) == measured(holder)
-                )
-                and (dependent, holder.raw_id) not in existing
-                and not reaches(holder.raw_id, dependent)
-            ):
-                plan.links.append(
-                    (held, holder, supersession_reason(spec, held.raw_json, holder.raw_json))
-                )
-                edges[dependent].add(holder.raw_id)
-                existing.add((dependent, holder.raw_id))
-                dependents[holder.raw_id].append(dependent)
+        # The rows ``row`` holds stay linked to it alone (readers skip a row whose holder is
+        # live, hidden or not): no link fans out to every row of a record. If ``row`` is later
+        # marked deleted while its holder lives, those rows count again and a later run links
+        # them to the holder (counted twice meanwhile, never hidden).
 
     def join(row: _Row, holder: _Row) -> bool:
         if (row.raw_id, holder.raw_id) in existing:

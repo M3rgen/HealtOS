@@ -651,9 +651,11 @@ holder's payload hash, created_at)` with the reason `display-name-change`, `pack
 `identity-merged` event for the superseded row (once per row, ever). A root of **another
 fingerprint** is linked only when it measured the same (its reading equals the holder's);
 otherwise both stay (`kept_differing`). Only roots are linked across fingerprints, so when a chain
-is rejected or refuted each fingerprint still counts each record once. The live rows a newly
-linked row held are linked to the holder too (rows of the holder's fingerprint, and rows that
-measured the same), so two devices joined later end with one holder. Rows whose links are no
+is rejected or refuted each fingerprint still counts each record once. The rows a newly linked
+row held stay linked to it alone (readers skip a row whose holder is live, hidden or not), so
+links never fan out to every row of a record; if that row is later marked deleted while its own
+holder lives, the rows it held count again until the next run links them to the holder (counted
+twice meanwhile, never hidden). Rows whose links are no
 longer in force are settled like any other and linked again within each device that remains.
 
 **Agreement.** Per pair of fingerprints with evidence of two devices it also notes, **per key both
