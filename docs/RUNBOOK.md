@@ -186,8 +186,9 @@ The partial index of source-deleted rows is built first, `CONCURRENTLY` and outs
 transaction: writers are never blocked by it, however large the table. A concurrent build that
 fails (a timeout, a cancel) leaves an invalid index behind, so the upgrade starts it only while no
 other session of the database holds a transaction or snapshot open (however briefly: a `pg_dump`
-just begun counts) or a lock on `raw_health_data` beyond reading it, and gives it no timeout (a
-dump started during the build is waited for; writers are not). Otherwise it prints
+just begun counts) or a lock on `raw_health_data` beyond reading it, and gives it no timeout (no
+lock or statement timeout, whatever the role or database sets: a dump started during the build is
+waited for; writers are not). Otherwise it prints
 `ix_raw_health_data_source_deleted is left for later` with the statement that builds it, and goes
 on without it (the `analytics_*` views are only slower); `health-mirror verify` notes it until you
 run that statement (`CREATE INDEX CONCURRENTLY IF NOT EXISTS ...`, also with the app running, when
@@ -367,7 +368,8 @@ suggested, `confirm` after `reject` restores what is counted but marks the chain
 refused naming that chain (reject it first). A decision waits up to a minute while a reconciler
 batch run holds the single-run lock, then is refused naming it; run it again after
 `health-mirror status` shows the run finished. If a decision or a nightly run fails after devices
-changed, the rows still to settle are kept (`pending_settle`) and the next run settles them.
+changed, the rows still to settle are kept (`pending_settle`) and the next run settles them (a
+`--dry-run` shows them among what it would settle).
 
 The next morning, `health-mirror status` shows `last_mode: incremental` with a fresh
 `last_finished_at` per data type, its `last_result` with the counts and an `open` section

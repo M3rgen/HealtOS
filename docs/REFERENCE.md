@@ -450,7 +450,8 @@ never marked.
   holder's record, and it is not read again on every complete fetch. Candidates are read, decided
   and marked in chunks of 2,000, so a long window is never held in memory; a row another
   transaction holds (a page writing it, so it is being seen) is skipped (`SKIP LOCKED`), never
-  waited for, so marking and a page never wait for each other in a circle. Marking records
+  waited for, so marking and a page never wait for each other in a circle; a deferral of a
+  skipped row stays open, since nothing was decided about it. Marking records
   nothing else (no evidence of two devices: that comes only from Google responses). A deletion
   deferred between two sources is decided by the next complete fetch of its window after the
   owner's or the reconciler's decision (the decision fetches nothing itself).
@@ -535,11 +536,13 @@ rename, whose evidence against the new name may come from one re-fetch of old re
 out of rules 3 and 4: it is known to be another device, so it says nothing about *A* → *B* (a
 chain merges equal readings only, and no deletion is marked on that weaker evidence). One established distinct from *B* is never *B*'s
 candidate. Nor is one that **retired before** *A*: established distinct from *A* and with no record
-newer than five minutes before *A*'s newest record (the sightings keep the physical time of each
-fingerprint's newest record, `newest_record_at`, which a re-fetch of old records does not move):
-it stopped recording while *A* went on, so it is neither *B*'s earlier form beside *A* nor seen
-alongside *B* when Google returns its old records again (a second watch retired before the band
-was renamed). A device that kept recording until the rename still blocks it.
+newer than seven days before *A*'s newest record and *B*'s first sighting (the sightings keep the
+physical time of each fingerprint's newest record, `newest_record_at`, which a re-fetch of old
+records does not move): it stopped recording while *A* went on for days, so it is neither *B*'s
+earlier form beside *A* nor seen alongside *B* when Google returns its old records again (a
+second watch retired before the band was renamed). A device that kept recording until the rename,
+or was only left unworn for hours or a few days (a watch on its charger), still blocks it: *B*
+may be that device renamed.
 
 A three-step rename *A* → *B* → *C* chains step by step even when *B* only ever returned new
 instants and never met *A*'s rows. Everything else is **ambiguous**: nothing is linked, both
@@ -684,7 +687,8 @@ no snapshot is held while they are settled). Which pairs of fingerprints are no 
 one device is written to `identity_reconcile_state.pending_settle` in the transaction that
 changes them (a refutation, a new chain, an owner decision) and cleared only when their rows were
 settled: a run or decision that fails in between leaves it, and the next run (or decision)
-settles it too. A data type that
+settles it too; a dry run shows it among what it would settle (and writes nothing). A data type
+that
 never had a full run gets its first full pass instead and says so (`skipped`). A data type that
 fails (its lock stays busy, a statement times out) is reported with its `error` and saved in
 `identity_reconcile_state`; the run goes on with the others (the CLI then exits 1). Both report
