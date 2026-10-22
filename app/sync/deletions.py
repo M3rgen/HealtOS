@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute, aliased
 
 from app.core.logging import event
+from app.core.timeutil import as_utc
 from app.google_health.data_types import (
     CIVIL_AFTER,
     CIVIL_BEFORE,
@@ -132,23 +133,44 @@ async def _note_deferred(
         for offset in range(0, len(values), 1000):
             await session.execute(statement, values[offset : offset + 1000])
     lower, upper = window
-    in_window = select(RawHealthData.id).where(
-        RawHealthData.data_type == data_type, column >= lower, column < upper
-    )
-    conditions = [
-        Deferral.data_type == data_type,
-        Deferral.resolved_at.is_(None),
-        Deferral.raw_id.in_(in_window),
-    ]
     undecided = set(deferred) | set(skipped)
-    if undecided:
-        conditions.append(~among(session, Deferral.raw_id, sorted(undecided, key=str)))
-    await session.execute(
-        update(Deferral)
-        .where(*conditions)
-        .values(resolved_at=now)
-        .execution_options(synchronize_session=False)
+    # The open deferrals of the data type (few), then their rows looked up by primary key for
+    # each chunk and placed in the window here, never a join of the window with the deferrals:
+    # the planner estimated both at one row and rescanned the whole window for every open
+    # deferral (seconds to a minute, with the sync state locked).
+    open_ids = sorted(
+        raw_id
+        for raw_id in (
+            await session.scalars(
+                select(Deferral.raw_id).where(
+                    Deferral.data_type == data_type, Deferral.resolved_at.is_(None)
+                )
+            )
+        ).all()
+        if raw_id not in undecided
     )
+    for offset in range(0, len(open_ids), CHUNK):
+        rows = await session.execute(
+            select(RawHealthData.id, RawHealthData.data_type, column).where(
+                among(session, RawHealthData.id, open_ids[offset : offset + CHUNK])
+            )
+        )
+        decided = [
+            raw_id
+            for raw_id, name, value in rows.tuples()
+            if name == data_type and value is not None and lower <= as_utc(value) < upper
+        ]
+        if decided:
+            await session.execute(
+                update(Deferral)
+                .where(
+                    Deferral.data_type == data_type,
+                    Deferral.resolved_at.is_(None),
+                    among(session, Deferral.raw_id, decided),
+                )
+                .values(resolved_at=now)
+                .execution_options(synchronize_session=False)
+            )
     if chains is None:
         return
     pairs = (

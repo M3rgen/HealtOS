@@ -1,6 +1,6 @@
 """PostgreSQL side of review 8 (lane AD): deletion marking after a decided chain stays linear in
-the window (AD2), and a complete fetch never waits for another one's deferrals (AD3). Synthetic
-data only."""
+the window (AD2), a complete fetch never waits for another one's deferrals (AD3), and resolving
+the deferrals of a window compares no deferral with every row of it (AE). Synthetic data only."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from datetime import timedelta
 
 import pytest
 from identity_records import HEART, T0, heart, legacy, mark, store
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 
+from app.models.identity import IdentityDeferredDeletion
 from app.models.state import RawHealthData
 from app.parsers.common import payload_hash, source_id, temporal
 from app.services.identity_backfill import identity_backfill
@@ -121,3 +122,118 @@ async def test_a_complete_fetch_never_waits_for_another_ones_deferrals(pg_sessio
         assert second == 0
     async with pg_sessions() as session:
         assert [entry["deferred"] for entry in await deferred_deletions(session)] == [3]
+
+
+async def test_resolving_a_windows_deferrals_compares_no_deferral_with_the_window(
+    pg_sessions, clock
+) -> None:
+    """Review 8 AE: the deferrals of a window were resolved with ``raw_id IN (the window's
+    rows)``; the planner estimated both at one row and rescanned the window for every open
+    deferral (4-47 s with the sync state locked). Each deferral's row is looked up now, and
+    exactly the same deferrals are resolved: those of rows in the window this fetch decided
+    (returned, or marked); not those it deferred again, nor a row a writer held, nor those of
+    another window."""
+    # More open deferrals than one chunk of lookups (app/sync/deletions.py CHUNK).
+    third = 700
+    times = [T0 + index * SECOND for index in range(3 * third)]
+    late = [T0 + 3 * HOUR + index * MINUTE for index in range(5)]
+    async with pg_sessions.begin() as session:
+        # Statistics as stale as between two autovacuum runs: nothing estimates the window.
+        for table in ("raw_health_data", "identity_deferred_deletions"):
+            await session.execute(text(f"ALTER TABLE {table} SET (autovacuum_enabled = false)"))
+    await archive(pg_sessions, [heart(60, at=at, name=A1) for at in (*times, *late)], T0 + HOUR)
+    await identity_backfill(pg_sessions)
+    async with pg_sessions() as session:
+        rows = dict(
+            (await session.execute(select(RawHealthData.source_start_time, RawHealthData.id)))
+            .tuples()
+            .all()
+        )
+    again, returned, gone = times[:third], times[third : 2 * third], times[2 * third :]
+    # The watch returns the band's readings: every band row is deferred, in two windows.
+    clock.now = since = T0 + 6 * HOUR
+    watch = [heart(60, at=at, name=WATCH) for at in (*times, *late)]
+    for offset in range(0, len(watch), 1000):
+        await store(pg_sessions, HEART, *watch[offset : offset + 1000])
+    assert await mark(pg_sessions, HEART, T0, T0 + HOUR, since) == 0
+    assert await mark(pg_sessions, HEART, T0 + 3 * HOUR, T0 + 4 * HOUR, since) == 0
+    async with pg_sessions() as session:
+        deferred = set(await session.scalars(select(IdentityDeferredDeletion.raw_id)))
+    assert deferred == {rows[at] for at in (*times, *late)}
+    # The next complete fetch of the first window: the watch returns ``again`` (deferred again),
+    # the band ``returned`` (the watch's rows of them are deferred now), nobody ``gone`` (marked;
+    # but a writer holds one of the band's rows: skipped, its deferral stays open).
+    clock.now = since = T0 + 7 * HOUR
+    await store(pg_sessions, HEART, *(heart(60, at=at, name=WATCH) for at in again))
+    await store(pg_sessions, HEART, *(heart(60, at=at, name=A1) for at in returned))
+    held = rows[gone[0]]
+
+    async def fetch(replay: bool) -> tuple[int, int]:
+        """Mark the window: committed, or (``replay``) every statement of it explained and
+        analyzed in order, then rolled back. Returns (marked, rows its joins discarded)."""
+        statements: list[tuple[str, tuple, bool]] = []
+        async with pg_sessions.begin() as session:
+            connection = await session.connection()
+
+            def seen(_connection, _cursor, statement, parameters, _context, many) -> None:
+                statements.append((statement, parameters, many))
+
+            event.listen(connection.sync_connection, "before_cursor_execute", seen)
+            try:
+                marked = await mark_source_deletions(session, HEART, T0, T0 + HOUR, since)
+            finally:
+                event.remove(connection.sync_connection, "before_cursor_execute", seen)
+            if not replay:
+                return marked, 0
+            await session.rollback()
+        async with pg_sessions.begin() as session:
+            # Through the session first: the driver's statements run in its transaction.
+            await session.execute(text("SELECT 1"))
+            connection = await session.connection()
+            driver = (await connection.get_raw_connection()).driver_connection
+            assert driver is not None
+            discarded = 0
+            for statement, parameters, many in statements:
+                if many:
+                    await driver.executemany(statement, parameters)
+                    continue
+                if not statement.lstrip().upper().startswith(("SELECT", "UPDATE", "INSERT")):
+                    await driver.execute(statement, *(parameters or ()))
+                    continue
+                found = await driver.fetchval(
+                    f"EXPLAIN (ANALYZE, FORMAT JSON) {statement}", *(parameters or ())
+                )
+                plan = (json.loads(found) if isinstance(found, str) else found)[0]["Plan"]
+                discarded += removed_by_join_filters(plan)
+            await session.rollback()
+        return marked, discarded
+
+    async with pg_sessions() as writer:
+        await writer.execute(
+            select(RawHealthData.id).where(RawHealthData.id == held).with_for_update()
+        )
+        marked, discarded = await fetch(replay=True)
+        assert discarded <= 2 * len(times), discarded
+        assert await fetch(replay=False) == (marked, 0)
+        await writer.rollback()
+    async with pg_sessions() as session:
+        resolved = {
+            raw_id: at
+            for raw_id, at in (
+                await session.execute(
+                    select(IdentityDeferredDeletion.raw_id, IdentityDeferredDeletion.resolved_at)
+                )
+            ).tuples()
+        }
+        watch_rows = set(await session.scalars(select(RawHealthData.id))) - set(rows.values())
+    band = {at: rows[at] for at in times}
+    assert marked == 2 * third - 1
+    assert {raw_id for raw_id, at in resolved.items() if at is not None} == {
+        band[at] for at in (*returned, *gone[1:])
+    }
+    assert len(set(resolved.values()) - {None}) == 1
+    still_open = {raw_id for raw_id, at in resolved.items() if at is None}
+    assert {raw_id for raw_id in still_open if raw_id not in watch_rows} == {
+        band[at] for at in again
+    } | {held} | {rows[at] for at in late}
+    assert len(still_open & watch_rows) == third
