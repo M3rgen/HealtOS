@@ -1430,35 +1430,18 @@ async def _verify_agreement(session: AsyncSession) -> list[str]:
     """The agreement counts per pair (identity_reconcile_state.pair_agreement, which decide
     whether a pair is taken for two devices) are the latest rows of raw_source_agreements
     summed."""
-    from app.models.identity import IdentityReconcileState, RawSourceAgreement
+    from app.models.identity import IdentityReconcileState
+    from app.services.identity_backfill import summed_agreement
     from app.services.source_chains import parse_agreement
 
-    table = RawSourceAgreement
-    latest: dict[tuple[str, str, str, str], bool] = {}
-    result = await session.stream(
-        select(
-            table.data_type,
-            table.first_fingerprint,
-            table.second_fingerprint,
-            table.identity_key,
-            table.same_reading,
-        )
-        .order_by(table.id)
-        .execution_options(yield_per=10_000)
-    )
-    async for data_type, first, second, key, same in result:
-        latest[(data_type, first, second, key)] = same
-    summed: dict[str, dict[tuple[str, str], list[int]]] = defaultdict(dict)
-    for (data_type, first, second, _), same in latest.items():
-        counts = summed[data_type].setdefault((first, second), [0, 0])
-        counts[0 if same else 1] += 1
+    summed = await summed_agreement(session)
     stored = {
         state.data_type: parse_agreement(state.pair_agreement)
         for state in (await session.scalars(select(IdentityReconcileState))).all()
     }
     errors = []
     for data_type in sorted(set(summed) | set(stored)):
-        expected = {pair: tuple(counts) for pair, counts in summed.get(data_type, {}).items()}
+        expected = summed.get(data_type, {})
         actual = {
             pair: (agree, disagree)
             for pair, (agree, disagree, _) in stored.get(data_type, {}).items()

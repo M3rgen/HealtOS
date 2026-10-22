@@ -46,6 +46,7 @@ from app.sync.deletions import deferred_deletions
 
 HOUR = timedelta(hours=1)
 MINUTE = timedelta(minutes=1)
+DAY = timedelta(days=1)
 A1, A2, WATCH = "Band A1", "Band A2", "Example Watch"
 
 
@@ -459,7 +460,9 @@ async def test_a_retired_watch_fetched_again_does_not_block_the_rename(sessions,
     fetches, the second for newer records) was retired before the band was renamed; a later
     re-fetch of its old records sighted it again, after the new name appeared. The rename was
     left open ('more than one source ended before it', then 'seen alongside'): counted twice
-    until decided by hand. It is chained."""
+    until decided by hand. It is chained. Review 7 S1: retired means its newest record is more
+    than ``RETIRED_AFTER`` (days) older than the band's and the new name's first sighting, so
+    the band records on for ten days after the watch's last record here."""
     worn = [T0 + index * MINUTE for index in range(3)]
     for at in worn:
         await legacy(sessions, HEART, heart(60, at=at, name=A1), T0 + 5 * MINUTE)
@@ -468,15 +471,15 @@ async def test_a_retired_watch_fetched_again_does_not_block_the_rename(sessions,
     for at in later:
         await legacy(sessions, HEART, heart(61, at=at, name=A1), T0 + 2 * HOUR + 5 * MINUTE)
         await legacy(sessions, HEART, heart(91, at=at, name=WATCH), T0 + 2 * HOUR + 5 * MINUTE)
-    # The watch is retired; the band records on, then is renamed.
-    band = [T0 + 10 * HOUR + index * MINUTE for index in range(3)]
+    # The watch is retired; the band records on for days, then is renamed.
+    band = [T0 + 10 * DAY + index * MINUTE for index in range(3)]
     for at in band:
-        await legacy(sessions, HEART, heart(62, at=at, name=A1), T0 + 10 * HOUR + 5 * MINUTE)
+        await legacy(sessions, HEART, heart(62, at=at, name=A1), T0 + 10 * DAY + 5 * MINUTE)
     await identity_backfill(sessions)
-    clock.now = T0 + 20 * HOUR
+    clock.now = T0 + 10 * DAY + 10 * HOUR
     await store(sessions, HEART, *(heart(62, at=at, name=A2) for at in band))
     # A re-fetch of the watch's old records sights it again after the new name appeared.
-    clock.now = T0 + 22 * HOUR
+    clock.now = T0 + 10 * DAY + 12 * HOUR
     await store(sessions, HEART, *(heart(91, at=at, name=WATCH) for at in later))
     report = await nightly(sessions)
     assert [(chain["from"], chain["to"]) for chain in report.chains] == [

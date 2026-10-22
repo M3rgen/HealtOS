@@ -48,8 +48,10 @@ be another device, so it says nothing about ``A -> B`` (a chain only ever merges
 readings; deletions are never marked on that weaker evidence). A fingerprint established
 distinct from ``B`` is never ``B``'s candidate; nor is one that *retired before* ``A``
 (established distinct from ``A``, its newest record - ``Span.newest``, the physical time a
-re-fetch of old records does not move - more than ``CHAIN_GAP`` older than ``A``'s): it stopped
-recording while ``A`` went on, and its later sightings are re-fetches of old records.
+re-fetch of old records does not move - more than ``RETIRED_AFTER`` (seven days) older than
+``A``'s and than ``B``'s first sighting): it stopped recording while ``A`` went on for days, and
+its later sightings are re-fetches of old records. A device unworn for less than that (a watch
+on its charger while the band records on) still competes as ``B``'s earlier form.
 
 Everything else is *ambiguous*: nothing is linked, both keep their rows (visible; at worst
 counted twice), and every run's report and ``health-mirror status`` list the case with why, for
@@ -133,6 +135,10 @@ PAIR_KEYS = 3
 # much look like a rename: listed for review, and never a reason to mark a deletion. Forms of
 # two devices that were seen side by side for longer than this are worn together, not renamed.
 RENAME_OVERLAP = timedelta(days=1)
+# A device established distinct from another *retired before* it only when its newest record is
+# this much older than the other's newest and than the candidate rename's first sighting: a
+# watch left on its charger for hours or a few days while the band records on is not retired.
+RETIRED_AFTER = timedelta(days=7)
 # A chain is followed at most this far.
 MAX_CHAIN = 64
 # pg_advisory locks: (namespace, key). Per data type: (DATA_TYPE_LOCK, crc32(name)).
@@ -718,26 +724,28 @@ def decide_chains(chains: Chains) -> Decision:
             and len({item.key for item in chains.evidence.get(pair, ())}) >= PAIR_KEYS
         )
 
-    def retired_before(name: str, other: str) -> bool:
-        # Another device than ``other`` (established distinct) whose newest record is older
-        # than ``other``'s: it stopped recording first, so it is neither ``other``'s rival as a
-        # predecessor nor seen alongside a successor of ``other`` (its later sightings are
-        # re-fetches of its old records).
+    def retired_before(name: str, other: str, new: str) -> bool:
+        # Another device than ``other`` (established distinct) whose newest record is more than
+        # ``RETIRED_AFTER`` older than ``other``'s and than ``new``'s first sighting: it stopped
+        # recording long before, so it is neither ``other``'s rival as a predecessor of ``new``
+        # nor seen alongside ``new`` (its later sightings are re-fetches of its old records).
+        # A device unworn for less than that (a watch on its charger) may be what ``new`` is.
         mine, theirs = spans[name].newest, spans[other].newest
         return (
             mine is not None
             and theirs is not None
-            and mine + CHAIN_GAP < theirs
+            and mine + RETIRED_AFTER < theirs
+            and mine + RETIRED_AFTER < spans[new].first
             and chains.distinct(name, other)
         )
 
     def blocks(other: str, old: str, new: str) -> bool:
         # A source established distinct from one of them and apart from the other, or one
-        # that retired before ``old`` did, says nothing about old -> new.
+        # that retired long before ``old`` did, says nothing about old -> new.
         return not (
             (chains.distinct(other, old) and apart(other, new))
             or (chains.distinct(other, new) and apart(other, old))
-            or retired_before(other, old)
+            or retired_before(other, old, new)
         )
 
     def kin(name: str, old: str, new: str) -> bool:
@@ -822,13 +830,16 @@ def decide_chains(chains: Chains) -> Decision:
                 and not chains.distinct(name, new)
                 and spans[name].first < spans[new].first
             ]
-            # A candidate that retired before another one that ended before this one appeared
-            # (two devices, the other kept recording after it) is not this one's earlier form.
+            # A candidate that retired long before another one that ended before this one
+            # appeared (two devices, the other kept recording for days after it) is not this
+            # one's earlier form.
             ended_before = [name for name in earlier if spans[name].last < spans[new].first]
             earlier = [
                 name
                 for name in earlier
-                if not any(retired_before(name, other) for other in ended_before if other != name)
+                if not any(
+                    retired_before(name, other, new) for other in ended_before if other != name
+                )
             ]
             if not earlier:
                 continue

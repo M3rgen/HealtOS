@@ -770,10 +770,9 @@ async def _settle_chains(
             after = chains.members(name)
             change.lapsed.update(ordered_pair(name, other) for other in before - after)
             change.joined.update(ordered_pair(name, other) for other in after - before)
-        if not dry_run:
-            # Kept with the change itself, so a re-settlement that fails is resumed by the
-            # next run (cleared once it finished).
-            change = await _owe_settlement(session, spec.name, change)
+        # Kept with the change itself, so a re-settlement that fails is resumed by the next run
+        # (cleared once it finished); a dry run shows what is still owed too, writing nothing.
+        change = await _owe_settlement(session, spec.name, change, dry_run=dry_run)
         return chains, change
 
     return await _exclusively(sessions, spec.name, work, statement_timeout, notice, dry_run=dry_run)
@@ -821,10 +820,17 @@ async def _reconcile_row(session: AsyncSession, data_type: str) -> IdentityRecon
 
 
 async def _owe_settlement(
-    session: AsyncSession, data_type: str, change: DeviceChange
+    session: AsyncSession, data_type: str, change: DeviceChange, *, dry_run: bool = False
 ) -> DeviceChange:
     """Add ``change`` to the re-settlement the data type still owes (a run that failed after
-    devices changed) and return all of it: settled by this run, cleared once it finished."""
+    devices changed) and return all of it: settled by this run, cleared once it finished. A
+    dry run only reads what is owed (no lock, nothing written)."""
+    if dry_run:
+        found = await session.get(IdentityReconcileState, data_type)
+        owed = DeviceChange.load(found.pending_settle if found is not None else None)
+        owed.lapsed |= change.lapsed
+        owed.joined |= change.joined
+        return owed
     state = await _reconcile_row(session, data_type)
     owed = DeviceChange.load(state.pending_settle)
     owed.lapsed |= change.lapsed
@@ -1250,27 +1256,43 @@ async def _count_shared(
     return pairs
 
 
+async def summed_agreement(
+    session: AsyncSession, data_type: str | None = None
+) -> dict[str, dict[tuple[str, str], tuple[int, int]]]:
+    """The latest per-key agreement of each pair (of ``data_type``, or of every data type),
+    summed in the database: per data type and pair, (keys with one reading, keys with two).
+    Only the sums are read, however many keys there are."""
+    table, newer = RawSourceAgreement, aliased(RawSourceAgreement)
+    latest = ~(
+        select(newer.id)
+        .where(
+            newer.data_type == table.data_type,
+            newer.identity_key == table.identity_key,
+            newer.first_fingerprint == table.first_fingerprint,
+            newer.second_fingerprint == table.second_fingerprint,
+            newer.id > table.id,
+        )
+        .exists()
+    )
+    query = select(
+        table.data_type,
+        table.first_fingerprint,
+        table.second_fingerprint,
+        func.count().filter(table.same_reading.is_(True)),
+        func.count().filter(table.same_reading.is_(False)),
+    ).where(latest)
+    if data_type is not None:
+        query = query.where(table.data_type == data_type)
+    query = query.group_by(table.data_type, table.first_fingerprint, table.second_fingerprint)
+    found: dict[str, dict[tuple[str, str], tuple[int, int]]] = defaultdict(dict)
+    for name, first, second, agree, disagree in (await session.execute(query)).tuples():
+        found[name][(first, second)] = (agree, disagree)
+    return found
+
+
 async def _summed(session: AsyncSession, data_type: str) -> dict[tuple[str, str], tuple[int, int]]:
     """The latest per-key agreement of each pair of the data type, summed."""
-    table = RawSourceAgreement
-    latest: dict[tuple[str, str, str], bool] = {}
-    result = await session.stream(
-        select(
-            table.first_fingerprint,
-            table.second_fingerprint,
-            table.identity_key,
-            table.same_reading,
-        )
-        .where(table.data_type == data_type)
-        .order_by(table.id)
-        .execution_options(yield_per=10_000)
-    )
-    async for first, second, key, same in result:
-        latest[(first, second, key)] = same
-    counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
-    for (first, second, _), same in latest.items():
-        counts[(first, second)][0 if same else 1] += 1
-    return {pair: (agree, disagree) for pair, (agree, disagree) in counts.items()}
+    return (await summed_agreement(session, data_type)).get(data_type, {})
 
 
 async def _rows_at(session: AsyncSession, spec: DataTypeSpec, starts: Sequence[datetime]) -> list:

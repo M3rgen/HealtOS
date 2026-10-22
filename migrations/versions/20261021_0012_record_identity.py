@@ -51,8 +51,9 @@ Fast: empty tables, their indexes and triggers, view definitions, and one partia
 `raw_health_data` (its source-deleted rows, so the views never scan the whole table), built
 `CONCURRENTLY` first, in a step of its own outside the transaction (writers never wait for it).
 It is only started while no other session of the database holds a transaction or snapshot
-open, and it is never given a timeout: a build that fails leaves an invalid index behind, so
-none is started that could, and a dump started meanwhile is waited for. Otherwise (or when an
+open, and it is never given a timeout (no lock or statement timeout, whatever the role or
+database sets): a build that fails leaves an invalid index behind, so none is started that
+could, and a dump started meanwhile is waited for. Otherwise (or when an
 invalid copy exists) the upgrade goes on without it, printing the statement; verify notes it
 (and any invalid index on `raw_health_data`). No ALTER of an existing table, so a running
 pg_dump never blocks it. Filling the tables is `health-mirror identity-backfill`, run after the
@@ -706,8 +707,9 @@ def _deleted_index() -> None:
     A concurrent build that fails (a timeout, a cancel) leaves an invalid index behind, so
     none is started that could: only while no other session of this database holds a
     transaction or a snapshot open (however briefly) or a lock on ``raw_health_data`` beyond
-    reading it, and with no lock timeout (a dump started during the build is waited for: the
-    writers are not). Otherwise, and when an index of that name exists already (valid, or
+    reading it, and with no lock or statement timeout (a dump started during the build is
+    waited for: the writers are not; a role's or database's ``statement_timeout`` does not
+    cancel it). Otherwise, and when an index of that name exists already (valid, or
     invalid from an interrupted build), it is left as it is: the upgrade goes on without it
     (it only makes the ``analytics_*`` views faster) and prints the statement that builds it;
     ``health-mirror verify`` notes it until then, and names any invalid index on
@@ -759,10 +761,14 @@ def _deleted_index() -> None:
             f"20261021_0012: building {DELETED_INDEX} concurrently (writers are not blocked; a "
             "dump started meanwhile is waited for)."
         )
+        # No timeout of any kind (a role's or database's statement_timeout included): a build
+        # cancelled half way leaves an invalid index.
         bind.execute(sa.text("SET lock_timeout = 0"))
+        bind.execute(sa.text("SET statement_timeout = 0"))
         try:
             bind.execute(sa.text(build))
         finally:
+            bind.execute(sa.text("RESET statement_timeout"))
             bind.execute(sa.text("RESET lock_timeout"))
 
 

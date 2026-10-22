@@ -31,7 +31,8 @@ same reading, is the holder's record and is not read again (that would re-read t
 every superseded row on every complete fetch). Candidates are read, decided and marked in
 chunks, so a long window never sits in memory at once; a row another transaction has locked
 (a page writing it: it is being seen) is skipped rather than waited for, so this check never
-waits for a writer, and a writer never waits for it in a circle.
+waits for a writer, and a writer never waits for it in a circle; a deferral of a skipped row
+stays open for the next complete fetch.
 """
 
 from __future__ import annotations
@@ -71,11 +72,13 @@ async def _note_deferred(
     column,
     window: tuple[datetime, datetime],
     now: datetime,
+    skipped: set | frozenset = frozenset(),
 ) -> None:
     """Keep what this complete fetch deferred, row by row (``identity_deferred_deletions``,
     shown by ``health-mirror status`` and every reconciler run), and resolve every open
     deferral of a row in its window that it did not defer again (marked, kept, or returned):
-    a later fetch of another window never hides what an earlier one deferred."""
+    a later fetch of another window never hides what an earlier one deferred. A row it
+    ``skipped`` (a writer held it) was not decided: its deferral stays open."""
     from app.models.identity import IdentityDeferredDeletion as Deferral
     from app.services.identity import identity_tables_missing
     from app.services.storage import dialect_insert
@@ -119,8 +122,9 @@ async def _note_deferred(
         Deferral.resolved_at.is_(None),
         Deferral.raw_id.in_(in_window),
     ]
-    if deferred:
-        conditions.append(~among(session, Deferral.raw_id, sorted(deferred, key=str)))
+    undecided = set(deferred) | set(skipped)
+    if undecided:
+        conditions.append(~among(session, Deferral.raw_id, sorted(undecided, key=str)))
     await session.execute(
         update(Deferral)
         .where(*conditions)
@@ -259,6 +263,8 @@ async def mark_source_deletions(
     marked = kept = deferred = 0
     # Raw id -> (its fingerprint, the source that returned its reading).
     deferrals: dict = {}
+    # Rows a writer held: neither marked nor decided.
+    skipped: set = set()
     now = datetime.now(UTC)
     cursor: tuple | None = None
     chains = await load_chains(session, spec.name)
@@ -294,7 +300,7 @@ async def mark_source_deletions(
         ids = [raw_id for raw_id, _, _, _ in chunk if raw_id not in spared]
         if ids and postgresql:
             # Rows a writer holds are being seen right now: skipped, never waited for.
-            ids = list(
+            locked = list(
                 (
                     await session.scalars(
                         select(RawHealthData.id)
@@ -303,6 +309,8 @@ async def mark_source_deletions(
                     )
                 ).all()
             )
+            skipped.update(set(ids) - set(locked))
+            ids = locked
         if ids:
             result = await session.execute(
                 update(RawHealthData)
@@ -320,7 +328,7 @@ async def mark_source_deletions(
         # Possibly renamed: the reconciler or the owner decides (identity-backfill, nightly;
         # identity-decide).
         event(logger, "SOURCE_DELETIONS_DEFERRED", data_type=spec.name, count=deferred)
-    await _note_deferred(session, spec.name, deferrals, column, (lower, upper), now)
+    await _note_deferred(session, spec.name, deferrals, column, (lower, upper), now, skipped)
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked
