@@ -424,9 +424,14 @@ never marked.
 - "Not returned" is decided per [record identity](#record-identity), not per row. A row is not
   marked while the same fetch returned its v2 key **with the same reading** under **the same
   device** (its own fingerprint, or one joined to it by a live chain: a duplicate of the record
-  under another id; every link in force joins two such rows) - for a growing interval also with
-  the same end (an end its device no longer returns is stale, longer or shorter, and would hide
-  the one it returns). Otherwise a row whose reading the
+  under another id; every link in force joins two such rows) - for a growing interval, either
+  by a row it is hidden behind (a link in force) with the same end or a later one (the period
+  grew, under either form, however the two forms were linked meanwhile: its start is returned,
+  so it is not gone), or with the same end by another fingerprint of its device. A growing row
+  that would otherwise count beside the end returned now is marked: a longer end than the one
+  returned (stale; it would hide the one Google returns), an end its device returned under
+  another form while nothing hides this row, or a copy its own fingerprint holds in another row
+  (written while this one was hidden behind another end). Otherwise a row whose reading the
   fetch returned under a fingerprint that is not *certainly* another device is *deferred*
   (`SOURCE_DELETIONS_DEFERRED` in the log; one row per deferred raw row in
   `identity_deferred_deletions`, kept until a later complete fetch of a window that holds it
@@ -448,13 +453,20 @@ never marked.
   when its holder is marked, so it must be marked itself when its record is gone), except one
   whose holder this fetch saw unchanged since they were linked with the same reading: that is the
   holder's record, and it is not read again on every complete fetch. Candidates are read, decided
-  and marked in chunks of 2,000, so a long window is never held in memory; a row another
+  and marked in chunks of 2,000, so a long window is never held in memory; whether a chunk's rows
+  are held that way is looked up for its ids (by the links' primary key), so the work grows with
+  the window, never with its square. A row another
   transaction holds (a page writing it, so it is being seen) is skipped (`SKIP LOCKED`), never
   waited for, so marking and a page never wait for each other in a circle; a deferral of a
-  skipped row stays open, since nothing was decided about it. Marking records
+  skipped row stays open, since nothing was decided about it. Deferrals are written under a
+  per-data-type transaction lock taken only when free: while another complete fetch of the data
+  type is writing them (until it commits), a fetch writes none (`SOURCE_DELETIONS_DEFERRALS_BUSY`)
+  rather than queue behind it; the next complete fetch of the window records them. Marking records
   nothing else (no evidence of two devices: that comes only from Google responses). A deletion
   deferred between two sources is decided by the next complete fetch of its window after the
-  owner's or the reconciler's decision (the decision fetches nothing itself).
+  owner's or the reconciler's decision (the decision fetches nothing itself); a pair the owner or
+  the reconciler joined into one device is no longer listed at once, and the next complete fetch
+  of the data type, of any window, resolves its deferrals.
 
 ## Record identity
 
@@ -767,7 +779,7 @@ not guarded (a guarded table renamed away), that every `identity-merged` event s
 that the `analytics_*` views are the ones of 0012, and the links and chains themselves: see
 [Integrity verification](#integrity-verification). `identity_reconcile_state`,
 `identity_deferred_deletions` (one row per deferred deletion; never deleted, `resolved_at` set
-when a later complete fetch decides it) and `fetch_rounds` (when a sync round or backfill window
+when a later complete fetch decides it, or finds its two sources one device) and `fetch_rounds` (when a sync round or backfill window
 fetch began at its first page; a resumed fetch keeps it) are bookkeeping.
 
 The dashboard, its history and workouts, and Umay's reads plan every statement with its own

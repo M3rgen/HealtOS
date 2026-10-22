@@ -289,7 +289,8 @@ Review the dry run before writing anything. Per data type:
   when; one row each in `identity_deferred_deletions` until a later complete fetch of their
   window decides them).
   Decide that pair: `distinct` (two devices: the next complete fetch marks them) or `not-distinct`
-  and `link` (one device: they stay, counted once).
+  and `link` (one device: they stay, counted once; the pair leaves this list at once, and the next
+  complete fetch of the data type resolves its rows).
 - `refuted`: chains whose two forms turned out to be two devices (no longer used: the rows they
   linked count on their own again); a chain in state `lapsed` was decided by the reconciler only
   because another chain made a rival source continue elsewhere, and that chain is no longer live
