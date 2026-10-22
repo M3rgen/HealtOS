@@ -18,7 +18,8 @@ same reading* was seen
   owner decides. The mark is deferred, never guessed.
 
 A deferred row is kept in ``identity_deferred_deletions`` until a later complete fetch of a
-window that holds it decides it, whatever other windows are fetched meanwhile.
+window that holds it decides it, whatever other windows are fetched meanwhile (or, once its two
+sources are one device, the next complete fetch of the data type).
 
 A row of a fingerprint established distinct never keeps a candidate: of two devices that
 recorded at one instant, one can be deleted alone. Nor does a row of the device with another
@@ -57,7 +58,7 @@ from app.google_health.data_types import (
 from app.models.identity import RawHealthDataSupersession, in_force
 from app.models.state import RawHealthData
 from app.services.identity import among, present_records
-from app.services.source_chains import load_chains, lock_data_type
+from app.services.source_chains import Chains, load_chains, lock_data_type, try_lock_deferrals
 
 logger = logging.getLogger(__name__)
 
@@ -73,17 +74,34 @@ async def _note_deferred(
     window: tuple[datetime, datetime],
     now: datetime,
     skipped: set | frozenset = frozenset(),
+    chains: Chains | None = None,
 ) -> None:
     """Keep what this complete fetch deferred, row by row (``identity_deferred_deletions``,
     shown by ``health-mirror status`` and every reconciler run), and resolve every open
     deferral of a row in its window that it did not defer again (marked, kept, or returned):
     a later fetch of another window never hides what an earlier one deferred. A row it
-    ``skipped`` (a writer held it) was not decided: its deferral stays open."""
+    ``skipped`` (a writer held it) was not decided: its deferral stays open. Open deferrals
+    of the data type whose two sources are one device now (``chains``: linked since, by the
+    owner or the reconciler) are resolved too, whatever their window: the row's device returns
+    its reading, so nothing is left to decide.
+
+    The rows are written only under ``try_lock_deferrals``: when another complete fetch of the
+    data type is writing them right now, nothing is waited for (a convoy of fetches behind one
+    slow or killed transaction) and nothing is written; the next complete fetch of the window
+    records and resolves them."""
     from app.models.identity import IdentityDeferredDeletion as Deferral
     from app.services.identity import identity_tables_missing
     from app.services.storage import dialect_insert
 
     if await identity_tables_missing(session):
+        return
+    if not await try_lock_deferrals(session, data_type):
+        event(
+            logger,
+            "SOURCE_DELETIONS_DEFERRALS_BUSY",
+            data_type=data_type,
+            count=len(deferred),
+        )
         return
     if deferred:
         table = Deferral.__table__
@@ -131,14 +149,36 @@ async def _note_deferred(
         .values(resolved_at=now)
         .execution_options(synchronize_session=False)
     )
+    if chains is None:
+        return
+    pairs = (
+        await session.execute(
+            select(Deferral.fingerprint, Deferral.returned_by)
+            .where(Deferral.data_type == data_type, Deferral.resolved_at.is_(None))
+            .distinct()
+        )
+    ).tuples()
+    joined = sorted(pair for pair in pairs if chains.same_device(*pair))
+    if joined:
+        await session.execute(
+            update(Deferral)
+            .where(
+                Deferral.data_type == data_type,
+                Deferral.resolved_at.is_(None),
+                tuple_(Deferral.fingerprint, Deferral.returned_by).in_(joined),
+            )
+            .values(resolved_at=now)
+            .execution_options(synchronize_session=False)
+        )
 
 
 async def deferred_deletions(session: AsyncSession, data_type: str | None = None) -> list[dict]:
     """The deletions complete fetches deferred and no later one decided: per data type and
-    pair of sources, how many rows, since when and when last deferred."""
+    pair of sources, how many rows, since when and when last deferred. A pair that is one
+    device now (linked since) is not listed: nothing is left to decide (the next complete
+    fetch of the data type resolves its rows)."""
     from app.models.identity import IdentityDeferredDeletion as Deferral
     from app.services.identity import identity_tables_missing
-    from app.services.source_chains import load_chains
 
     if await identity_tables_missing(session):
         return []
@@ -157,12 +197,15 @@ async def deferred_deletions(session: AsyncSession, data_type: str | None = None
     if data_type is not None:
         query = query.where(Deferral.data_type == data_type)
     rows = (await session.execute(query)).tuples().all()
-    chains = {}
+    sources: dict[str, set[str]] = {}
+    for name, fingerprint, other, *_ in rows:
+        sources.setdefault(name, set()).update((fingerprint, other))
+    chains = {name: await load_chains(session, name, names) for name, names in sources.items()}
     found = []
     rows = sorted(rows, key=lambda row: (row[0], -row[3]))
     for name, fingerprint, other, count, since, last in rows:
-        if name not in chains:
-            chains[name] = await load_chains(session, name, [fingerprint, other])
+        if chains[name].same_device(fingerprint, other):
+            continue
 
         def label(source: str, name=name) -> str:
             span = chains[name].spans.get(source)
@@ -246,19 +289,17 @@ async def mark_source_deletions(
     )
     link, holder = aliased(RawHealthDataSupersession), aliased(RawHealthData)
     # Superseded by a link in force with the same reading, its holder seen by this fetch and
-    # unchanged since: the holder's record, present.
-    held = (
-        select(link.old_raw_id)
-        .join(holder, holder.id == link.new_raw_id)
-        .where(
-            link.old_raw_id == RawHealthData.id,
-            link.same_reading.is_(True),
-            holder.payload_hash == link.new_payload_hash,
-            holder.last_seen_at >= fetched_since,
-            holder.source_deleted_at.is_(None),
-            in_force(link),
-        )
-        .exists()
+    # unchanged since: the holder's record, present. Looked up for each chunk's ids (by the
+    # links' primary key), never as an anti-join over the window: the planner cannot estimate
+    # the links in force, and a nested loop over every candidate and every holder grew with
+    # the square of the window.
+    held = select(link.old_raw_id).join(holder, holder.id == link.new_raw_id)
+    held = held.where(
+        link.same_reading.is_(True),
+        holder.payload_hash == link.new_payload_hash,
+        holder.last_seen_at >= fetched_since,
+        holder.source_deleted_at.is_(None),
+        in_force(link),
     )
     marked = kept = deferred = 0
     # Raw id -> (its fingerprint, the source that returned its reading).
@@ -270,34 +311,47 @@ async def mark_source_deletions(
     chains = await load_chains(session, spec.name)
     postgresql = session.get_bind().dialect.name == "postgresql"
     while True:
-        query = select(
-            RawHealthData.id,
-            RawHealthData.raw_json,
-            RawHealthData.source_start_time,
-            column,
-        ).where(*unseen, ~held)
+        query = select(RawHealthData.id, column).where(*unseen)
         if cursor is not None:
             query = query.where(tuple_(column, RawHealthData.id) > cursor)
-        chunk = (
+        page = (
             (await session.execute(query.order_by(column, RawHealthData.id).limit(CHUNK)))
             .tuples()
             .all()
         )
-        if not chunk:
+        if not page:
             break
-        cursor = (chunk[-1][3], chunk[-1][0])
-        presence = await present_records(
-            session,
-            spec,
-            [(raw_id, raw_json, start) for raw_id, raw_json, start, _ in chunk],
-            fetched_since,
-            chains,
+        cursor = (page[-1][1], page[-1][0])
+        held_ids = set(
+            (
+                await session.scalars(
+                    held.where(among(session, link.old_raw_id, [raw_id for raw_id, _ in page]))
+                )
+            ).all()
         )
+        # The rest's raw JSON, read now (none of a held row's).
+        rest = [raw_id for raw_id, _ in page if raw_id not in held_ids]
+        read = {}
+        if rest:
+            read = {
+                raw_id: (raw_json, start)
+                for raw_id, raw_json, start in (
+                    await session.execute(
+                        select(
+                            RawHealthData.id,
+                            RawHealthData.raw_json,
+                            RawHealthData.source_start_time,
+                        ).where(*unseen, among(session, RawHealthData.id, rest))
+                    )
+                ).tuples()
+            }
+        chunk = [(raw_id, *read[raw_id]) for raw_id in rest if raw_id in read]
+        presence = await present_records(session, spec, chunk, fetched_since, chains)
         kept += len(presence.present)
         deferred += len(presence.deferred)
         deferrals.update(presence.deferred_by)
         spared = presence.present | presence.deferred
-        ids = [raw_id for raw_id, _, _, _ in chunk if raw_id not in spared]
+        ids = [raw_id for raw_id, _, _ in chunk if raw_id not in spared]
         if ids and postgresql:
             # Rows a writer holds are being seen right now: skipped, never waited for.
             locked = list(
@@ -320,7 +374,7 @@ async def mark_source_deletions(
             )
             # An UPDATE always yields a CursorResult; AsyncSession.execute is typed as Result.
             marked += cast(CursorResult[Any], result).rowcount or 0
-        if len(chunk) < CHUNK:
+        if len(page) < CHUNK:
             break
     if kept:
         event(logger, "SOURCE_DELETIONS_KEPT_BY_IDENTITY", data_type=spec.name, count=kept)
@@ -328,7 +382,9 @@ async def mark_source_deletions(
         # Possibly renamed: the reconciler or the owner decides (identity-backfill, nightly;
         # identity-decide).
         event(logger, "SOURCE_DELETIONS_DEFERRED", data_type=spec.name, count=deferred)
-    await _note_deferred(session, spec.name, deferrals, column, (lower, upper), now, skipped)
+    await _note_deferred(
+        session, spec.name, deferrals, column, (lower, upper), now, skipped, chains
+    )
     if marked:
         event(logger, "SOURCE_DELETIONS_MARKED", data_type=spec.name, count=marked)
     return marked

@@ -924,7 +924,10 @@ async def present_records(
 
     * one *with the same reading* of its *device* (the same fingerprint, or one joined to it
       by live chain links; every link in force is one of these) - a duplicate of the record
-      under another id - and, for a growing interval, the same end: present;
+      under another id - and, for a growing interval, either a row it is hidden behind (a link
+      in force) with the same end or a later one (the period grew, under either form, however
+      the two were linked meanwhile), or a row of another fingerprint with the same end:
+      present;
     * else one with the same reading of a fingerprint that is not *certainly* another device
       - decided distinct by the owner (``Chains.owner_decided_distinct``: a form of each,
       through links the owner reviewed), or established distinct by evidence between these
@@ -992,6 +995,12 @@ async def present_records(
     values = {raw_id: reading(spec, raw_json) for raw_id, raw_json in relevant}
     if chains is None:
         chains = await load_chains(session, spec.name)
+    # Growing intervals: the rows each candidate is hidden behind (links in force to a row
+    # neither marked nor quarantined).
+    holders = await _holders(
+        session,
+        [raw_id for raw_id, identity in identities.items() if identity and identity.shape],
+    )
     # Per (candidate fingerprint, other fingerprint): keys the other returned with the
     # candidate's reading, and with another one.
     tally: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
@@ -1008,20 +1017,22 @@ async def present_records(
         if identity is None:
             continue
         same_value = [
-            (source, shape)
+            (other_id, source, shape)
             for other_id, source, value, shape in seen_rows.get(identity.key, [])
             if other_id != raw_id and value == values[raw_id]
         ]
-        # Its device returned it as it is: for a growing interval, with this end too (a row
-        # of the device with another end returned now shows the record as Google has it; this
-        # end is gone, and it would hide that one).
         if any(
-            chains.same_device(identity.source, source) and shape == identity.shape
-            for source, shape in same_value
+            chains.same_device(identity.source, source)
+            and (
+                shape == identity.shape
+                if identity.shape is None
+                else _keeps(identity, source, shape, other_id in holders.get(raw_id, ()))
+            )
+            for other_id, source, shape in same_value
         ):
             presence.present.add(raw_id)
             continue
-        same_value_sources = [source for source, _ in same_value]
+        same_value_sources = [source for _, source, _ in same_value]
         undecided = sorted(
             {
                 source
@@ -1039,6 +1050,48 @@ async def present_records(
             presence.deferred_pairs[(identity.source, undecided[0])] += 1
             presence.deferred_by[raw_id] = (identity.source, undecided[0])
     return presence
+
+
+async def _holders(
+    session: AsyncSession, raw_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Raw id -> the rows it is hidden behind: its links in force to a row that is neither
+    marked deleted nor quarantined (``held_elsewhere``)."""
+    from app.models.identity import in_force
+
+    found: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    link, holder = aliased(RawHealthDataSupersession), aliased(RawHealthData)
+    for chunk in _chunks(sorted(set(raw_ids), key=str)):
+        rows = await session.execute(
+            select(link.old_raw_id, link.new_raw_id)
+            .join(holder, holder.id == link.new_raw_id)
+            .where(
+                among(session, link.old_raw_id, chunk),
+                holder.source_deleted_at.is_(None),
+                holder.is_quarantined.is_(False),
+                in_force(link),
+            )
+        )
+        for old, new in rows.tuples():
+            found[old].add(new)
+    return found
+
+
+def _keeps(identity: RecordIdentity, source: str, shape: str | None, holds: bool) -> bool:
+    """A growing interval returned by its device (``source``, end ``shape``) keeps the unseen
+    row of ``identity``: the row stays hidden behind the returned row (``holds``: a link in
+    force to it) and the period grew or kept its end, under either form - however the two were
+    linked meanwhile; or another fingerprint of its device returned this very end. Otherwise
+    the row would count beside the end returned now: an end no longer returned (a longer one,
+    or a row whose holder is not returned), or a copy its own fingerprint holds in another row
+    (written while this row was hidden behind another end)."""
+    if holds:
+        return (
+            shape is not None
+            and identity.shape is not None
+            and (datetime.fromisoformat(shape) >= datetime.fromisoformat(identity.shape))
+        )
+    return source != identity.source and shape == identity.shape
 
 
 def deferred_summary(chains: Chains, pairs: Counter) -> list[dict]:

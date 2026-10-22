@@ -144,6 +144,8 @@ MAX_CHAIN = 64
 # pg_advisory locks: (namespace, key). Per data type: (DATA_TYPE_LOCK, crc32(name)).
 DATA_TYPE_LOCK = 0x48454931  # "HEI1"
 BACKFILL_LOCK = (0x48454932, 1)
+# Per data type: its deferred-deletion bookkeeping (app/sync/deletions.py).
+DEFERRAL_LOCK = 0x48454933  # "HEI3"
 # How long a reconciler batch tries for the exclusive lock without queueing (writers never
 # wait behind it meanwhile), then how long it waits in the lock queue (every new writer of the
 # data type waits behind it then), before it backs off and retries; once it holds the lock, how
@@ -1466,6 +1468,18 @@ def seconds(value: str) -> float:
         raise ValueError(f"not a duration: {value!r}")
     number, unit = int(found.group(1)), found.group(2) or "ms"
     return number * {"ms": 0.001, "s": 1, "min": 60}[unit]
+
+
+async def try_lock_deferrals(session: AsyncSession, data_type: str) -> bool:
+    """Transaction lock on ``data_type``'s deferred-deletion rows, taken only when free (always
+    granted off PostgreSQL). Every writer of those rows holds it, so its holder never waits for
+    a row lock there; ``False``: another transaction is writing them right now."""
+    if session.get_bind().dialect.name != "postgresql":
+        return True
+    arguments = {"namespace": DEFERRAL_LOCK, "key": _key(data_type)}
+    return bool(
+        await session.scalar(text("SELECT pg_try_advisory_xact_lock(:namespace, :key)"), arguments)
+    )
 
 
 async def lock_data_type(
