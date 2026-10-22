@@ -288,7 +288,9 @@ Review the dry run before writing anything. Per data type:
   sent until then by its name alone, now with `formFactor: "FITNESS_BAND"`, sometimes without the
   name) makes a new form of that source, like a rename: it appears under `chains`/`review` (or
   `ambiguous` when Google sends both forms side by side), and is decided the same way. Two
-  different values of such a field (a phone and a watch) are never one device.
+  different values of such a field (a phone and a watch) are never one device, through whatever
+  forms: `identity-decide` refuses a link that would make them one (`ambiguous` says so: "its
+  earlier form belongs to a device with another value of a device field").
 - `deferred_deletions`: rows complete fetches did not mark because another source, that may be
   their device renamed, returned the same reading (`rows_of`, `returned_by`, how many, since
   when; one row each in `identity_deferred_deletions` until a later complete fetch of their
@@ -307,8 +309,9 @@ Review the dry run before writing anything. Per data type:
   data type), `deletions_suspicious` deleted records whose instant another, undecided source still
   holds live (possibly a rename nobody decided: look at `ambiguous`); `kept_differing` rows of a
   chained source that measured something else than the row holding the record (kept, both
-  count); `distinct_sources` the keys held by two devices; `conflicts` (rows of one device left
-  double because linking them would close a cycle of links; listed in `status`) should be 0;
+  count); `distinct_sources` the records (match keys) held by two devices; `conflicts` (rows of
+  one device left double because linking them would close a cycle of links, or would join two
+  values of a device field; listed in `status`) should be 0;
   `start_mismatches` rows with a stale stored start (settled last); `agreement` per pair of
   sources with evidence of two devices, how many records this run settled that both hold with
   the same reading and how many with two (the counts over every record both hold, kept per

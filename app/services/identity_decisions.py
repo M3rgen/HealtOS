@@ -112,11 +112,19 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
         raise DecisionRefused(f"unknown decision {decision!r} (one of {', '.join(DECISIONS)})")
     if first == second:
         raise DecisionRefused("the two fingerprints are the same")
-    if not chains.kindred(first, second):
+    one, other = chains.spans[first], chains.spans[second]
+    # Two devices or not: also asked of a form of one device and a source kindred to another
+    # form of it (a deletion deferred between them names them).
+    pair_question = (
+        decision not in CHAIN_DECISIONS
+        and one.family == other.family
+        and chains.compatible(first, second)
+    )
+    if not chains.kindred(first, second) and not pair_question:
         raise DecisionRefused(
             "the two sources differ in their stable fields (platform, recording method, package "
-            "without suffix, or two values of the device form factor or manufacturer): they "
-            "never share a record"
+            "without suffix, or a device form factor or manufacturer with two values or added "
+            "while other fields changed): they never share a record"
         )
     recorded = (first, second) in chains.links
     if decision in ("reject", "confirm") and not recorded:
@@ -171,6 +179,18 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
         planned.decide(decision, first, second)
         if decision == "link" and not recorded:
             planned.add(first, second)
+        mixed = [
+            pair
+            for pair in planned.conflicting_devices()
+            if first in planned.members(pair[0]) or second in planned.members(pair[0])
+        ]
+        if mixed:
+            one, other = mixed[0]
+            raise DecisionRefused(
+                f"this would make {one[:12]} and {other[:12]} one device, and they have two "
+                "values of a device field (form factor or manufacturer): a device is never "
+                "both; reject the chain that joins the wrong form first"
+            )
         problems = planned.problems()
         if problems:
             following, preceding = chains.following, chains.preceding

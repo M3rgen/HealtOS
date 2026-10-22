@@ -11,11 +11,17 @@ two different ``dataSource`` fingerprints are either
 The write path never decides which (app/services/identity.py): an unknown fingerprint always
 gets rows of its own, so at worst a renamed device is counted twice until the reconciler has
 run. Only the reconciler (``health-mirror identity-backfill``, nightly as an incremental run)
-and the owner (``health-mirror identity-decide``) decide, per data type and *family* (the source
-fields a rename keeps, without the optional device fields ``formFactor`` and ``manufacturer``),
-between fingerprints that are *kindred*: of one stable class, or whose optional device fields do
-not conflict (one has a field the other lacks: Google added ``formFactor`` to a band's records).
-Two fingerprints with two values of such a field (a phone and a watch) are never one device.
+and the owner (``health-mirror identity-decide``) decide, per data type, between fingerprints
+that are *kindred* (app/parsers/identity.py ``kindred``): of one stable class (the source fields
+a rename keeps), or the same ``dataSource`` but for an optional device field (``formFactor``,
+``manufacturer``) - perhaps with the ``displayName`` - one has and the other lacks (Google added
+``formFactor`` to a band's records). The rule runs per *group*: fingerprints connected by kindred
+pairs; in data without optional device fields a group is exactly a stable class. Kindred is not
+transitive (a source without ``formFactor`` is kindred to a phone and to a watch of its name), so
+a link is only ever made, by the reconciler or the owner, between two devices whose fingerprints
+are *compatible* two by two (``Chains.joinable``: no optional device field with two values): a
+phone and a watch are never one device, through whatever forms. A fingerprint kindred to neither
+form of a link says nothing about it.
 
 **Evidence of two devices** (``raw_source_pairs``): a key that one Google response returned
 under two fingerprints *with two different readings*. A renamed device never returns two values
@@ -131,7 +137,7 @@ from app.models.identity import (
     RawSourceSighting,
 )
 from app.models.state import RawHealthData
-from app.parsers.identity import compatible, optional_fields, source_family
+from app.parsers.identity import compatible, kindred, source_family
 
 CHAIN_GAP = timedelta(minutes=5)
 # Keys with two different readings that establish two distinct devices (from two fetches).
@@ -208,16 +214,14 @@ class Span:
         """The stable class without the optional device fields (``source_family``)."""
         return source_family(self.data_source) if self.data_source is not None else self.stable
 
-    @cached_property
-    def optional(self) -> tuple:
-        return optional_fields(self.data_source)
-
     def kindred(self, other: Span) -> bool:
-        """The two sources may be forms of one device: one stable class, or one family whose
-        optional device fields do not conflict."""
-        return self.stable == other.stable or (
-            self.family == other.family and compatible(self.optional, other.optional)
-        )
+        """The two sources may be forms of one device (app/parsers/identity.py ``kindred``):
+        one stable class, or one ``dataSource`` but for an optional device field one lacks."""
+        if self.stable == other.stable:
+            return True
+        if self.data_source is None or other.data_source is None or self.family != other.family:
+            return False
+        return kindred(self.data_source, other.data_source)
 
 
 def precedes(old: Span, new_first: datetime) -> bool:
@@ -635,6 +639,38 @@ class Chains:
         before, after = self.spans.get(left), self.spans.get(right)
         return before is None or after is None or before.kindred(after)
 
+    def compatible(self, left: str, right: str) -> bool:
+        """No optional device field with two values in the two fingerprints (unknown spans are
+        taken as compatible)."""
+        before, after = self.spans.get(left), self.spans.get(right)
+        if before is None or after is None:
+            return True
+        return compatible(before.data_source, after.data_source)
+
+    def joinable(self, left: str, right: str) -> bool:
+        """Every fingerprint of one device is compatible with every one of the other's: only
+        then may a link make them one device (kindred is not transitive: a phone and a watch
+        are never one device through a form without ``formFactor``)."""
+        return all(
+            self.compatible(one, other)
+            for one in self.members(left)
+            for other in self.members(right)
+        )
+
+    def conflicting_devices(self) -> list[tuple[str, str]]:
+        """Pairs of fingerprints of one device (as the live links make it) with two values of
+        an optional device field; there must be none."""
+        found = []
+        for members in {frozenset(self.members(name)) for name in self.spans}:
+            ordered = sorted(members)
+            for index, one in enumerate(ordered):
+                found.extend(
+                    (one, other)
+                    for other in ordered[index + 1 :]
+                    if not self.compatible(one, other)
+                )
+        return found
+
     def in_force(self, old_fingerprint: str, new_fingerprint: str) -> bool:
         """A supersession between rows of these fingerprints hides its old row (readers use
         ``raw_source_devices``, which ``record_devices`` keeps equal to this)."""
@@ -724,9 +760,7 @@ def decide_chains(chains: Chains) -> Decision:
     fingerprint the rule leaves open is listed in ``ambiguous`` with why."""
     decision = Decision()
     spans = chains.spans
-    classes: dict[str, list[str]] = defaultdict(list)
-    for fingerprint, span in spans.items():
-        classes[span.family].append(fingerprint)
+    classes = kindred_groups(chains)
 
     def note(new: str, why: str, candidates: Iterable[str] = ()) -> None:
         decision.ambiguous.append(
@@ -747,10 +781,15 @@ def decide_chains(chains: Chains) -> Decision:
         # Established distinct, or (only to stop blocking a chain, which merges equal readings
         # alone) ``PAIR_KEYS`` keys with two values in any responses, the owner not saying
         # otherwise: a second device whose evidence against one form comes from one re-fetch.
+        # Two fingerprints that are not kindred are two devices.
         pair = ordered_pair(left, right)
-        return chains.distinct(left, right) or (
-            chains.pair_decisions.get(pair) != "not-distinct"
-            and len({item.key for item in chains.evidence.get(pair, ())}) >= PAIR_KEYS
+        return (
+            not chains.kindred(left, right)
+            or chains.distinct(left, right)
+            or (
+                chains.pair_decisions.get(pair) != "not-distinct"
+                and len({item.key for item in chains.evidence.get(pair, ())}) >= PAIR_KEYS
+            )
         )
 
     def retired_before(name: str, other: str, new: str) -> bool:
@@ -816,6 +855,7 @@ def decide_chains(chains: Chains) -> Decision:
                 name in chains.following
                 and name not in chains.members(new)
                 and chains.kindred(name, new)
+                and chains.joinable(name, new)
                 and not chains.distinct(name, new)
                 and spans[name].last < spans[new].first
                 and (
@@ -828,6 +868,7 @@ def decide_chains(chains: Chains) -> Decision:
                 name in chains.preceding
                 and name not in chains.members(old)
                 and chains.kindred(name, old)
+                and chains.joinable(name, old)
                 and not chains.distinct(name, old)
                 and precedes(spans[old], spans[name].first)
                 and not between(old, name, members, links=False)
@@ -841,7 +882,7 @@ def decide_chains(chains: Chains) -> Decision:
         found.discard((old, new))
         return frozenset(found)
 
-    for members in classes.values():
+    for members in classes:
         if len(members) < 2:
             continue
         ordered = sorted(members, key=lambda name: (spans[name].first, name))
@@ -864,6 +905,10 @@ def decide_chains(chains: Chains) -> Decision:
                 and not chains.distinct(name, new)
                 and spans[name].first < spans[new].first
             ]
+            # A form of a device with another value of a device field than a form of this one's
+            # can never be joined to it: listed, never linked.
+            unjoinable = [name for name in earlier if not chains.joinable(name, new)]
+            earlier = [name for name in earlier if name not in unjoinable]
             # A candidate that retired long before another one that ended before this one
             # appeared (two devices, the other kept recording for days after it) is not this
             # one's earlier form.
@@ -876,6 +921,13 @@ def decide_chains(chains: Chains) -> Decision:
                 )
             ]
             if not earlier:
+                if unjoinable:
+                    note(
+                        new,
+                        "its earlier form belongs to a device with another value of a device "
+                        "field (form factor or manufacturer): never linked",
+                        unjoinable,
+                    )
                 continue
             ended = [name for name in earlier if spans[name].last < spans[new].first]
             if not ended:
@@ -910,6 +962,7 @@ def decide_chains(chains: Chains) -> Decision:
                 if name not in chains.members(old)
                 and name not in chains.preceding
                 and chains.kindred(name, old)
+                and chains.joinable(name, old)
                 and not chains.distinct(name, old)
                 and precedes(spans[old], spans[name].first)
                 and not between(old, name, ordered)
@@ -937,6 +990,30 @@ def decide_chains(chains: Chains) -> Decision:
                 decision.premises[(old, new)] = premise
             decision.links.append((old, new))
     return decision
+
+
+def kindred_groups(chains: Chains) -> list[list[str]]:
+    """The fingerprints connected by kindred pairs, per source family (the rule runs per group:
+    without optional device fields a group is exactly a stable class)."""
+    families: dict[str, list[str]] = defaultdict(list)
+    for fingerprint, span in chains.spans.items():
+        families[span.family].append(fingerprint)
+    groups: list[list[str]] = []
+    for members in families.values():
+        left = set(members)
+        while left:
+            start = min(left)
+            left.discard(start)
+            group, frontier = [start], [start]
+            while frontier:
+                current = frontier.pop()
+                joined = sorted(name for name in left if chains.kindred(current, name))
+                for name in joined:
+                    left.discard(name)
+                group.extend(joined)
+                frontier.extend(joined)
+            groups.append(sorted(group))
+    return groups
 
 
 def evidence(

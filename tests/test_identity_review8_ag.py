@@ -321,3 +321,75 @@ async def test_an_interval_type_with_the_field_added_marks_nothing(sessions, clo
     clock.now = T0 + 9 * HOUR
     await identity_backfill(sessions)
     assert len(await counted_rows(sessions, STEPS)) == 4
+
+
+@pytest.mark.parametrize("new_source", NEW_FORMS.values(), ids=NEW_FORMS.keys())
+async def test_a_renamed_band_that_gets_the_field_is_chained_on(
+    sessions, clock, new_source
+) -> None:
+    """The production shape: the band was renamed before (a chain old name -> name), then
+    Google added the form factor to the new name's records. The old name is not kindred to the
+    new form (another name *and* the field), yet its device may continue as the new form (no
+    device field with two values): chained on, nothing marked, each reading once."""
+    first, old = band("Example Band Pro"), band()
+    for record in readings(first):
+        await legacy(sessions, HEART, record, T0 + HOUR, last=T0 + HOUR)
+    clock.now = T0 + 2 * HOUR
+    await identity_backfill(sessions)
+    clock.now = since = T0 + 3 * HOUR
+    await store(sessions, HEART, *readings(old))
+    await mark(sessions, HEART, T0 - HOUR, T0 + 2 * HOUR, since)
+    clock.now = T0 + 4 * HOUR
+    await identity_backfill(sessions, incremental=True)
+    clock.now = since = T0 + 9 * HOUR
+    await store(sessions, HEART, *readings(new_source))
+    await mark(sessions, HEART, T0 - HOUR, T0 + 2 * HOUR, since)
+    assert await marked(sessions) == []
+    clock.now = T0 + 10 * HOUR
+    stats = (await identity_backfill(sessions))[HEART.name]
+    assert sorted(entry["fingerprints"] for entry in stats.chains) == sorted(
+        [[fp(first)[:12], fp(old)[:12]], [fp(old)[:12], fp(new_source)[:12]]]
+    )
+    assert stats.deletions_kept == 0 and stats.ambiguous == []
+    assert values(await counted_rows(sessions)) == sorted(VALUES)
+    clock.now = since = T0 + 11 * HOUR
+    await store(sessions, HEART, *readings(new_source))
+    await mark(sessions, HEART, T0 - HOUR, T0 + 2 * HOUR, since)
+    assert await marked(sessions) == []
+    async with sessions() as session:
+        _, errors, _ = await verify_identities(session)
+    assert errors == []
+
+
+async def test_every_deferral_of_a_renamed_band_can_be_decided(sessions, clock) -> None:
+    """The renamed band's both forms and the new form with the field seen side by side (no
+    chain): the rows of both names are deferred, never marked, and the owner can answer each
+    deferred pair - also the old name and the new form, which are not kindred themselves."""
+    first, old, new = band("Example Band Pro"), band(), band(form=FORM)
+    for record in readings(first):
+        await legacy(sessions, HEART, record, T0 + HOUR, last=T0 + HOUR)
+    clock.now = T0 + 2 * HOUR
+    await identity_backfill(sessions)
+    clock.now = T0 + 3 * HOUR
+    await store(sessions, HEART, sample(66, T0 + 2 * HOUR, old))
+    clock.now = T0 + 4 * HOUR
+    await identity_backfill(sessions, incremental=True)
+    clock.now = since = T0 + 9 * HOUR
+    await store(sessions, HEART, *readings(new), sample(67, T0 + 8 * HOUR, old))
+    await mark(sessions, HEART, T0 - HOUR, T0 + HOUR + 30 * MINUTE, since)
+    assert await marked(sessions) == []
+    async with sessions() as session:
+        listed = await deferred_deletions(session)
+    assert listed and {tuple(entry["fingerprints"]) for entry in listed} <= {
+        (fp(first)[:12], fp(new)[:12]),
+        (fp(old)[:12], fp(new)[:12]),
+    }
+    for entry in listed:
+        left, right = entry["fingerprints"]
+        await decide_sources(sessions, HEART.name, "distinct", left, right)
+    clock.now = since = T0 + 10 * HOUR
+    await store(sessions, HEART, *readings(new), sample(67, T0 + 8 * HOUR, old))
+    await mark(sessions, HEART, T0 - HOUR, T0 + HOUR + 30 * MINUTE, since)
+    async with sessions() as session:
+        assert await deferred_deletions(session) == []
+    assert values(await marked(sessions)) == sorted(VALUES)

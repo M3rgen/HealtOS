@@ -502,18 +502,25 @@ to a source's records that it always sent without (it began sending `formFactor:
 "FITNESS_BAND"` for a band known until then by its name alone, for some data types without the
 name, and not for every record). They stay in the key, so no stored key or row id changes, but
 rows of two fingerprints are compared by their **match key** (the key without them; the key
-itself for a source that has none) when the two are *compatible*: every optional field the same
-in both or missing from one. A form with the field added is then a new form of the source, like
-a rename: the deletion marking defers on it, the reconciler chains it and links its rows, the
-owner can decide it. Two sources with two values of such a field (a phone and a watch) are never
-compared.
+itself for a source that has none). Two fingerprints are **kindred** when they are of one stable
+class (a rename, as always), or when their `dataSource` is the same but for device fields one has
+and the other lacks: an optional device field, perhaps with the `displayName`. A form with the
+field added is then a new form of the source, like a rename: the deletion marking defers on it,
+the reconciler chains it and links its rows, the owner can decide it. A source with another
+name *and* the field, or a phone and a watch, is not kindred: never compared, never in the way of
+a chain, exactly as before. Kindred is not transitive (a source without `formFactor` is kindred
+to a phone and to a watch of its name), so a chain or an owner's link is only ever made between
+two devices whose forms are **compatible** two by two (no optional device field with two
+values), and no supersession ever joins two incompatible rows: a device is never a phone and a
+watch. In data without optional device fields nothing of this changes anything; the
+reconciler's `identities` and `distinct_sources` count per match key (equal to the key there).
 
 **Renames are decided per source, by the reconciler or the owner.** Fitbit sends no serial
 number, only `displayName`, and Apple Health sometimes differs only by the package's `.<UUID>`
 suffix, so a renamed device and a second device recording at the same instant look alike in one
-record. The question is therefore asked of the *sources*, per data type and **family** (the
-stable source fields above without the optional device fields), between *kindred* fingerprints:
-of one stable class, or compatible (only those can share a record).
+record. The question is therefore asked of the *sources*, per data type and group of kindred
+fingerprints (without optional device fields: exactly one stable class, whose fingerprints are
+the only ones that can share a key).
 
 *Evidence of two devices* (`raw_source_pairs`): a key that **one Google response** returned under
 two fingerprints **with two different readings**, noted with when its fetch began. One record has

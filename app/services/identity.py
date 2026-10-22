@@ -30,8 +30,8 @@ writes onto, every row that could hide them, the rows it links) and re-resolves 
 changed, was revived or linked meanwhile.
 
 Rows of two fingerprints are compared by their *match key* (app/parsers/identity.py: the v2 key
-without the optional device fields), when the two are compatible: Google adding ``formFactor``
-to a band's records changes their key, not the record.
+without the optional device fields), when the two are kindred (app/parsers/identity.py): Google
+adding ``formFactor`` to a band's records changes their key, not the record.
 
 ``present_records`` decides, for deletion marking, whether an unseen row's record is still
 returned: with the same reading under its own device (present); with the same reading under a
@@ -558,14 +558,14 @@ async def resolve_ids(
     by_match: dict[str, list[_Group]] = defaultdict(list)
     for group in groups.values():
         by_match[group.identity.match].append(group)
-    # One response returned this record under two compatible fingerprints with two values:
+    # One response returned this record under two kindred fingerprints with two values:
     # evidence of two devices (one record has one value).
     resolution.evidence = [
         (left.source, right.source, pair_key(left.identity, right.identity))
         for found in by_match.values()
         for position, left in enumerate(found)
         for right in found[position + 1 :]
-        if left.reading != right.reading and left.identity.compatible(right.identity)
+        if left.reading != right.reading and left.identity.kindred(right.identity)
     ]
 
     # The record's own rows: by id (its v1 ids, its v2s id), then by alias for the records
@@ -678,7 +678,10 @@ async def resolve_ids(
                 # Its key for this record: another one when their optional device fields differ.
                 key = group.key
                 if source in forms and stable_class(forms[source]) != group.identity.stable:
-                    assert isinstance(group.record, dict)
+                    if not isinstance(group.record, dict):
+                        raise TypeError(
+                            f"a record of {spec.name} with a v2 identity is not an object"
+                        )
                     key = key_under(spec, group.record, forms[source]) or key
                 other = specific_key(key, source)
                 others |= {new_record_id(other), other}
@@ -959,7 +962,7 @@ async def present_records(
 ) -> Presence:
     """Candidates (raw id, raw_json, stored start) that must not be marked deleted.
 
-    For each candidate, the rows with its match key and a compatible source (its v2 key, or
+    For each candidate, the rows with its match key and a kindred source (its v2 key, or
     the key of a form of its source with an optional device field added or dropped) seen at or
     after ``seen_since`` decide:
 
@@ -987,7 +990,6 @@ async def present_records(
     """
     from app.core.timeutil import as_utc
     from app.parsers.common import temporal
-    from app.parsers.identity import compatible
 
     presence = Presence()
     # Each candidate's instants: its parsed start and (a stale one, written by an older
@@ -1007,8 +1009,8 @@ async def present_records(
     starts = set().union(*instants.values()) if instants else set()
     if not starts:
         return presence
-    seen_rows: dict[str, list[tuple[uuid.UUID, str, str | None, str | None, tuple]]] = defaultdict(
-        list
+    seen_rows: dict[str, list[tuple[uuid.UUID, str, str | None, str | None, RecordIdentity]]] = (
+        defaultdict(list)
     )
     seen_at: set[datetime] = set()
     for chunk in _chunks(sorted(starts)):
@@ -1032,7 +1034,7 @@ async def present_records(
                         identity.source,
                         reading(spec, raw_json),
                         identity.shape,
-                        identity.optional,
+                        identity,
                     )
                 )
     if not seen_rows:
@@ -1056,11 +1058,21 @@ async def present_records(
     tally: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
 
     def seen_of(identity: RecordIdentity) -> list[tuple[uuid.UUID, str, str | None, str | None]]:
-        # The rows seen of its record under its source or a compatible one.
+        # The rows seen of its record under a form of its device, or a source kindred to its
+        # own or to another form of its device (never one with another value of a device field).
         return [
             (other_id, source, value, shape)
-            for other_id, source, value, shape, optional in seen_rows.get(identity.match, [])
-            if compatible(identity.optional, optional)
+            for other_id, source, value, shape, other in seen_rows.get(identity.match, [])
+            if identity.compatible(other)
+            and (
+                chains.same_device(identity.source, source)
+                or identity.kindred(other)
+                or any(
+                    chains.kindred(member, source)
+                    for member in chains.members(identity.source)
+                    if member in chains.spans and source in chains.spans
+                )
+            )
         ]
 
     for raw_id, identity in identities.items():

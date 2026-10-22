@@ -30,9 +30,15 @@ to a source's records that it always sent without (it began sending ``formFactor
 known until then by its name alone, sometimes without the name). They stay in the key - every
 key and row id stored is kept as it was - but the *match key* (``RecordIdentity.match``: the key
 without them; the key itself when the source has none) is what tells which rows of two
-fingerprints are one record: two forms of a source whose optional fields do not conflict (one has
-a field the other lacks, ``compatible``) are compared like a rename, two with different values
-(a phone and a watch) never are.
+fingerprints are one record. Two fingerprints are *kindred* (``kindred``: may be forms of one
+device) when they are of one stable class (a rename, as always), or when their ``dataSource`` is
+the same but for device fields one has and the other lacks - an optional device field, and with
+it perhaps the ``displayName`` - so a form with ``formFactor`` added is compared like a rename,
+while a phone and a watch, or two devices with two names, never are. Kindred is not transitive
+(a source without ``formFactor`` is kindred to a phone and to a watch of its name): one device
+only ever joins fingerprints whose optional device fields are *compatible* two by two
+(``compatible``: none with two values), so a phone and a watch are never one device, through
+whatever forms (app/services/source_chains.py).
 
 ``specific_key`` is the key plus the fingerprint. A record stored for the first time gets the
 id ``new_record_id(specific_key)`` (``synthetic:v2s:<hash>``): every fingerprint has its own
@@ -42,7 +48,7 @@ row, so the payload of one source is never written onto another source's row by 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -107,13 +113,40 @@ def optional_fields(data_source: object) -> tuple:
     return tuple(device.get(name) for name in OPTIONAL_DEVICE_FIELDS)
 
 
-def compatible(left: tuple, right: tuple) -> bool:
-    """Two sources' optional device fields (``optional_fields``) do not conflict: each is the
-    same in both, or missing from one. Only such sources can be one device."""
+def compatible(left: object, right: object) -> bool:
+    """Two ``dataSource`` values have no optional device field with two values: they may be
+    forms of one device (a device is never a phone and a watch)."""
     return all(
         one == other or one is None or other is None
-        for one, other in zip(left, right, strict=False)
+        for one, other in zip(optional_fields(left), optional_fields(right), strict=True)
     )
+
+
+# Device fields a form of a source may have and another form of it lack.
+_ADDED_FIELDS = frozenset({*OPTIONAL_DEVICE_FIELDS, "displayName"})
+
+
+def kindred(left: object, right: object) -> bool:
+    """Two ``dataSource`` values may be forms of one device: one stable class (a rename, a
+    dropped package suffix), or the same ``dataSource`` but for device fields one has and the
+    other lacks, among the optional device fields and ``displayName`` (Google added
+    ``formFactor``, perhaps dropping the name). Two values of one field never are."""
+    if stable_source(left) == stable_source(right):
+        return True
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if {name: value for name, value in left.items() if name != "device"} != {
+        name: value for name, value in right.items() if name != "device"
+    }:
+        return False
+    one, other = _object(left.get("device")), _object(right.get("device"))
+    for name in one.keys() | other.keys():
+        if name in one and name in other:
+            if one[name] != other[name]:
+                return False
+        elif name not in _ADDED_FIELDS:
+            return False
+    return True
 
 
 def source_family(data_source: object) -> str:
@@ -165,15 +198,20 @@ class RecordIdentity:
     # Hash of the stable source fields (the part of ``source`` that is in ``key``).
     stable: str
     # ``key`` without the optional device fields (``key`` itself when the source has none): the
-    # rows of two compatible fingerprints with one match key hold one record if they are one
+    # rows of two kindred fingerprints with one match key hold one record if they are one
     # device. Never stored or used for an id.
     match: str = ""
-    # The source's optional device fields (``optional_fields``).
-    optional: tuple = ()
+    # The record's dataSource (for ``kindred``; not part of the identity's value).
+    data_source: object = field(default=None, compare=False, repr=False)
+
+    def kindred(self, other: RecordIdentity) -> bool:
+        """``other`` (of the same match key) may be this record of a form of its source."""
+        return kindred(self.data_source, other.data_source)
 
     def compatible(self, other: RecordIdentity) -> bool:
-        """``other`` (of the same match key) may be this record of the same device."""
-        return compatible(self.optional, other.optional)
+        """``other`` (of the same match key) may be this record of the same device (no optional
+        device field with two values)."""
+        return compatible(self.data_source, other.data_source)
 
     @property
     def fingerprint(self) -> tuple[str, str | None]:
@@ -219,7 +257,7 @@ def record_identity(spec: DataTypeSpec, record: object) -> RecordIdentity | None
         start=start,
         stable=payload_hash(parts["source"]),
         match=f"{KEY_PREFIX}:{stamp}:{match}",
-        optional=optional_fields(data_source),
+        data_source=data_source,
     )
 
 
