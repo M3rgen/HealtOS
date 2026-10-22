@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -10,7 +11,7 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY
-from app.models.state import JobStatus, RawHealthData, SyncState
+from app.models.state import FetchRound, JobStatus, RawHealthData, SyncState, fetch_round_start
 from app.sync.incremental import INTERRUPTED_ERROR, STALE_RUNNING_AFTER, IncrementalSync
 
 pytestmark = pytest.mark.integration
@@ -142,3 +143,30 @@ async def test_startup_recovery_fails_running_sync_states(pg_sessions) -> None:
     assert states["sleep"].status == JobStatus.completed
     assert states["weight"].status == JobStatus.abandoned
     assert states["heart-rate"].status == JobStatus.running
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+async def test_two_workers_starting_the_same_fetch_both_get_its_round(pg_sessions, fresh) -> None:
+    """Review 8 AF: two workers beginning the same fetch while ``fetch_rounds`` has no row for
+    it (right after migration 0012) both inserted one, and the later commit failed on the
+    primary key. The second insert now waits for the first and does nothing; the worker reads
+    the one row: its start when resuming, its own ``now`` when it begins at the first page."""
+    first_now = datetime(2026, 8, 1, tzinfo=UTC)
+    second_now = first_now + timedelta(minutes=5)
+
+    async def second() -> datetime:
+        async with pg_sessions.begin() as session:
+            return await fetch_round_start(session, "sync", "steps", fresh=fresh, now=second_now)
+
+    async with pg_sessions.begin() as session:
+        first = await fetch_round_start(session, "sync", "steps", fresh=True, now=first_now)
+        # The other worker starts while this transaction is still open.
+        other = asyncio.create_task(second())
+        await asyncio.sleep(0.5)
+    assert first == first_now
+    assert await other == (second_now if fresh else first_now)
+
+    async with pg_sessions() as session:
+        rows = (await session.scalars(select(FetchRound))).all()
+    assert [(row.kind, row.key) for row in rows] == [("sync", "steps")]
+    assert rows[0].started_at == (second_now if fresh else first_now)

@@ -140,11 +140,19 @@ class FetchRound(Base):
 async def fetch_round_start(session, kind: str, key: str, *, fresh: bool, now: datetime):
     """The start of the fetch ``kind``/``key``: ``now`` when it begins at its first page
     (``fresh``), else the stored start of the fetch it resumes."""
+    from app.services.storage import dialect_insert
+
     row = await session.get(FetchRound, (kind, key))
     if row is None:
-        row = FetchRound(kind=kind, key=key, started_at=now)
-        session.add(row)
-    elif fresh:
+        # Two workers may begin the same fetch while it has no row yet: the later insert
+        # waits for the earlier one and does nothing, and both read the one row.
+        await session.execute(
+            dialect_insert(session, FetchRound.__table__)
+            .values(kind=kind, key=key, started_at=now)
+            .on_conflict_do_nothing(index_elements=["kind", "key"])
+        )
+        row = await session.get(FetchRound, (kind, key))
+    if fresh:
         row.started_at = now
     return row.started_at
 
