@@ -291,6 +291,15 @@ Review the dry run before writing anything. Per data type:
   different values of such a field (a phone and a watch) are never one device, through whatever
   forms: `identity-decide` refuses a link that would make them one (`ambiguous` says so: "its
   earlier form belongs to a device with another value of a device field").
+  Two forms are only taken for one source when every other `dataSource` field is byte for byte
+  the same (platform, recording method, the whole `application`, any field Google adds outside
+  `device`). If a dry run (`identity-backfill --dry-run`) after Google added a device field shows
+  the old form's rows under `deletions_kept` instead of a chain, `ambiguous` or
+  `deletions_suspicious`, Google changed another field as well, and the two forms are treated
+  as two sources (`identity-decide` refuses to link them, and their deletions are marked like
+  any other's): compare the two forms' `dataSource` in what Google sent
+  ([Audit what Google sent](#audit-what-google-sent)) and report the difference (its shape, no
+  values) so the rule can be extended.
 - `deferred_deletions`: rows complete fetches did not mark because another source, that may be
   their device renamed, returned the same reading (`rows_of`, `returned_by`, how many, since
   when; one row each in `identity_deferred_deletions` until a later complete fetch of their

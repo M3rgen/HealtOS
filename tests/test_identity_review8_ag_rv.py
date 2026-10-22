@@ -342,3 +342,94 @@ async def test_healthkit_rename_with_bare_source_alongside(sessions, clock):
     print("chains", [e["fingerprints"] for e in stats.chains])
     print("ambiguous", [(e["fingerprint"], e["why"]) for e in stats.ambiguous])
     assert [e["fingerprints"] for e in stats.chains] == [[fp(old), fp(new)]]
+
+
+# --- round 3 (F1) -----------------------------------------------------------------------------
+
+
+def test_a_decision_never_revives_a_link_into_a_phone_and_watch_device() -> None:
+    """Q (phone) -> R (no form factor) was decided only while F -> S was live (its premise), and
+    lapsed when the owner rejected F -> S; R -> W (watch) was linked since. Linking F -> S again
+    would revive Q -> R and make the phone and the watch one device: refused, although the
+    decision names neither of them."""
+    from app.parsers.identity import stable_class
+    from app.services.identity_decisions import check
+    from app.services.source_chains import Chains, Span
+
+    def span(source, first, last):
+        return Span(
+            T0 + first * HOUR,
+            T0 + last * HOUR,
+            stable_class(source),
+            str(source),
+            True,
+            source,
+            T0 + last * HOUR,
+        )
+
+    f, s_ = src("F"), src("S")
+    q, r, w = src("Q", form="PHONE"), src("Q"), src("Q", form="WATCH")
+    F, S, Q, R, W = (source_fingerprint(x) for x in (f, s_, q, r, w))
+    chains = Chains(
+        links={(F, S), (Q, R), (R, W)},
+        spans={
+            F: span(f, 0, 1),
+            S: span(s_, 2, 3),
+            Q: span(q, 0, 1),
+            R: span(r, 2, 3),
+            W: span(w, 4, 5),
+        },
+        chain_decisions={(F, S): "reject"},
+        premises={(Q, R): frozenset({(F, S)})},
+    )
+    assert not chains.live(Q, R) and chains.live(R, W)
+    assert chains.conflicting_devices() == []
+    with pytest.raises(DecisionRefused, match="two values of a device field"):
+        check(chains, "link", F, S)
+    with pytest.raises(DecisionRefused, match="two values of a device field"):
+        check(chains, "confirm", F, S)
+    # Deciding about an unrelated pair stays possible.
+    check(chains, "reject", R, W)
+
+
+async def test_a_phone_and_a_watch_of_one_device_never_supersede_each_other(
+    sessions, clock, monkeypatch
+) -> None:
+    """Should a phone and a watch ever be one device (chains decided before this guard), a page
+    holding the same reading under both links neither to the other, and verify only notes the
+    device (links are append-only: an error could never be cleared)."""
+    from sqlalchemy import select
+
+    from app.models.identity import RawHealthDataSupersession
+    from app.services import identity_decisions
+
+    phone, bare, watch = src("X", form="PHONE"), src("X"), src("X", form="WATCH")
+    clock.now = T0 + 3 * HOUR
+    await store(sessions, HEART, *readings(bare))
+    clock.now = T0 + 4 * HOUR
+    await identity_backfill(sessions)
+    clock.now = T0 + 5 * HOUR
+    await store(sessions, HEART, sample(70, T0 + 5 * HOUR, phone), sample(71, T0 + 5 * HOUR, watch))
+    monkeypatch.setattr(identity_decisions, "check", lambda *args: None)
+    await decide_sources(sessions, HEART.name, "link", fp(phone), fp(bare))
+    await decide_sources(sessions, HEART.name, "link", fp(bare), fp(watch))
+    monkeypatch.undo()
+    clock.now = T0 + 6 * HOUR
+    later = T0 + 6 * HOUR
+    await store(sessions, HEART, sample(80, later, phone), sample(80, later, watch))
+    await identity_backfill(sessions)
+    pairs = {fp(phone), fp(watch)}
+    async with sessions() as session:
+        links = (
+            await session.execute(
+                select(
+                    RawHealthDataSupersession.old_fingerprint,
+                    RawHealthDataSupersession.new_fingerprint,
+                )
+            )
+        ).tuples()
+        assert all({old[:12], new[:12]} != pairs for old, new in links)
+        _, errors, notes = await verify_identities(session)
+    assert errors == []
+    assert any("two values of a device field" in note for note in notes)
+    assert vals(await counted_rows(sessions)).count(80) == 2

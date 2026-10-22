@@ -75,6 +75,7 @@ from app.models.state import RawHealthData
 from app.parsers.common import google_name, source_id
 from app.parsers.identity import (
     RecordIdentity,
+    compatible,
     key_under,
     new_record_id,
     pair_key,
@@ -790,6 +791,9 @@ def _link_written(
                 assert row is not None
                 payload = stored.payload(row)
             assert isinstance(payload, dict) and isinstance(record, dict)
+            if not compatible(payload.get("dataSource"), record.get("dataSource")):
+                # Two values of a device field are never one record, whatever the chains say.
+                continue
             resolution.links.append(
                 PlannedLink(
                     google_id,
@@ -1444,6 +1448,16 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
         )
 
     for data_type, current in sorted(chains.items()):
+        conflicting = current.conflicting_devices()
+        if conflicting:
+            one, other = conflicting[0]
+            # A note, never an error: links are append-only, so an error could never be cleared.
+            notes.append(
+                f"source chains of {data_type}: {len(conflicting)} pair(s) of sources with two "
+                f"values of a device field are one device (e.g. {one[:12]} and {other[:12]}): "
+                "no supersession joins their rows; reject the chain that joined the wrong form "
+                "(identity-sources lists them)"
+            )
         for problem in current.problems():
             errors.append(f"source chains of {data_type}: {problem} (a chain never forks)")
         wrong = current.devices_to_log()

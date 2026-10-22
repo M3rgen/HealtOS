@@ -174,23 +174,23 @@ def check(chains: Chains, decision: str, first: str, second: str) -> None:
                 "these two sources are one device through other chains: reject the wrong "
                 "chain between them instead"
             )
+    # Any decision (a reject or distinct too: a link whose premise it changes may revive
+    # elsewhere) that would make one device of two fingerprints with two values of a device
+    # field, anywhere in the data type, is refused.
+    planned = chains.copy()
+    planned.decide(decision, first, second)
+    if decision == "link" and not recorded:
+        planned.add(first, second)
+    before = set(chains.conflicting_devices())
+    mixed = [pair for pair in planned.conflicting_devices() if pair not in before]
+    if mixed:
+        one, other = mixed[0]
+        raise DecisionRefused(
+            f"this would make {one[:12]} and {other[:12]} one device, and they have two "
+            "values of a device field (form factor or manufacturer): a device is never "
+            "both; reject the chain that joins the wrong form first"
+        )
     if decision in ("link", "confirm", "not-distinct"):
-        planned = chains.copy()
-        planned.decide(decision, first, second)
-        if decision == "link" and not recorded:
-            planned.add(first, second)
-        mixed = [
-            pair
-            for pair in planned.conflicting_devices()
-            if first in planned.members(pair[0]) or second in planned.members(pair[0])
-        ]
-        if mixed:
-            one, other = mixed[0]
-            raise DecisionRefused(
-                f"this would make {one[:12]} and {other[:12]} one device, and they have two "
-                "values of a device field (form factor or manufacturer): a device is never "
-                "both; reject the chain that joins the wrong form first"
-            )
         problems = planned.problems()
         if problems:
             following, preceding = chains.following, chains.preceding
