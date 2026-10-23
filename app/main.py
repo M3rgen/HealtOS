@@ -105,7 +105,7 @@ def create_app() -> FastAPI:
     docs = not settings.production
     application = FastAPI(
         title="Personal Health Data Mirror",
-        version="0.5.0",
+        version="0.2.0",
         description="Read-only, raw-first archive of Google Health API data",
         lifespan=lifespan,
         docs_url="/docs" if docs else None,
