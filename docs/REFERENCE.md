@@ -1293,6 +1293,8 @@ Defaults:
   the 03:30 (local) backup; it waits for no sync longer than 10 s at a time.
 
 These use normal idempotent UPSERTs. Disable in `.env` when another scheduler instance owns the jobs.
+The derived-day refresh (every five minutes) has no switch, so the scheduler keeps running and
+`/health` reports `scheduler: running` even with all three jobs above disabled.
 Run either depth manually with `health-mirror reconcile --days 7` or
 `health-mirror reconcile --days 90`.
 

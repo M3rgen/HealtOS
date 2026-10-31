@@ -28,9 +28,7 @@ async def live() -> dict:
 async def health(request: Request) -> dict | JSONResponse:
     runtime = request.app.state.runtime
     settings = request.app.state.settings
-    scheduler_expected = settings.app_env != "test" and (
-        settings.reconciliation_enabled or settings.watchdog_enabled
-    )
+    scheduler_expected = runtime.scheduler_needed(settings)
     scheduler_status = (
         "running"
         if runtime.scheduler_running

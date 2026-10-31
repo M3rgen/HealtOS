@@ -69,13 +69,7 @@ def create_app() -> FastAPI:
         if settings.app_env != "test":
             runtime.spawn(recover_stale_running(runtime, delay=STALE_RUNNING_AFTER))
         scheduler = None
-        scheduler_needed = (
-            settings.reconciliation_enabled
-            or settings.watchdog_enabled
-            or settings.identity_reconcile_enabled
-            or runtime.derived is not None
-        )
-        if scheduler_needed and settings.app_env != "test":
+        if runtime.scheduler_needed(settings):
             scheduler = build_scheduler(
                 settings,
                 runtime.reconciliation,

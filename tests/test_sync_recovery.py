@@ -8,6 +8,7 @@ from app.core.timeutil import as_utc
 from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY
 from app.models.state import JobStatus, SyncState, WebhookNotification
+from app.services.runtime import Runtime
 from app.services.webhook_processing import INTERRUPTED_ERROR, WebhookBatchProcessor
 from app.services.webhook_status import WebhookStatusService
 from app.sync.incremental import STALE_RUNNING_AFTER, IncrementalSync
@@ -23,7 +24,9 @@ def start_app(sessions, monkeypatch, settings, incremental):
         webhook_processor=WebhookBatchProcessor(sessions, incremental, set(incremental.specs)),
         shutdown=AsyncMock(),
         scheduler=None,
+        derived=None,
     )
+    runtime.scheduler_needed = lambda settings: Runtime.scheduler_needed(runtime, settings)
     monkeypatch.setattr(main, "get_settings", lambda: settings)
     monkeypatch.setattr(main, "build_runtime", lambda *_: runtime)
     monkeypatch.setattr(main, "SessionLocal", sessions)

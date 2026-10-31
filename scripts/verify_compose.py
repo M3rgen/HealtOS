@@ -42,7 +42,9 @@ HEALTH_SMOKE_SCRIPT = "\n".join(
         "result = json.load(urllib.request.urlopen(request, timeout=5))",
         "assert result['database'] == 'healthy', result",
         "assert result['service'] == 'personal-health-mirror', result",
-        "assert result['scheduler'] == 'disabled', result",
+        # The flags below switch off reconciliation, the watchdog and the identity reconciler,
+        # but the derived-day refresh always runs, so the scheduler must be up.
+        "assert result['scheduler'] == 'running', result",
     ]
 )
 

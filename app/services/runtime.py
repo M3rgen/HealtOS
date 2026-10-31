@@ -51,6 +51,19 @@ class Runtime:
     def scheduler_running(self) -> bool:
         return bool(self.scheduler and getattr(self.scheduler, "running", False))
 
+    def scheduler_needed(self, settings: Settings) -> bool:
+        """Whether the app starts APScheduler, so /health can tell `stopped` from `disabled`.
+
+        The derived-day refresh is always wired, so outside tests the scheduler runs even when
+        reconciliation, the watchdog and the identity reconciler are all switched off.
+        """
+        return settings.app_env != "test" and (
+            settings.reconciliation_enabled
+            or settings.watchdog_enabled
+            or settings.identity_reconcile_enabled
+            or self.derived is not None
+        )
+
     def spawn(self, coroutine) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
         self.tasks.add(task)

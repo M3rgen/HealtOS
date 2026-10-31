@@ -103,3 +103,22 @@ def test_cli_reconcile_uses_persistent_service_without_new_options(tmp_path, mon
         asyncio.run(read())
     finally:
         asyncio.run(engine.dispose())
+
+
+@pytest.mark.parametrize(
+    ("app_env", "derived", "needed"),
+    [("development", object(), True), ("development", None, False), ("test", object(), False)],
+)
+def test_scheduler_is_needed_for_the_derived_refresh_even_with_every_flag_off(
+    app_env, derived, needed
+):
+    from app.services.runtime import Runtime
+
+    settings = Settings(
+        _env_file=None,
+        app_env=app_env,
+        reconciliation_enabled=False,
+        watchdog_enabled=False,
+        identity_reconcile_enabled=False,
+    )
+    assert Runtime.scheduler_needed(SimpleNamespace(derived=derived), settings) is needed

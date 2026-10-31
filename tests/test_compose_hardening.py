@@ -120,7 +120,7 @@ def _run_smoke_scripts_against_fake_app(monkeypatch, token: str):
             body = {
                 "database": "healthy",
                 "service": "personal-health-mirror",
-                "scheduler": "disabled",
+                "scheduler": "running",
             }
             return Response(json.dumps(body).encode())
         if path == "/api/dashboard":
