@@ -46,7 +46,7 @@ async function openPage(browser, viewport, scenario) {
 
 const overflow = page => page.evaluate(()=>({x:document.documentElement.scrollWidth>innerWidth,
   y:document.documentElement.scrollHeight>innerHeight}));
-const done = page => page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:STEP_TIMEOUT});
+const done = page => page.waitForFunction(()=>document.querySelector('#sync-button').getAttribute('aria-busy') === 'false',null,{timeout:STEP_TIMEOUT});
 
 run(async () => {
   const browser = await launch();
@@ -63,7 +63,7 @@ run(async () => {
       assert.match(await button.textContent(), /Eşitleniyor…/);
       assert.equal(await button.evaluate(el=>el.classList.contains('syncing')), true);
       assert.notEqual(await button.locator('.button-icon').evaluate(el=>getComputedStyle(el).animationName), 'none');
-      await button.evaluate(el=>{el.disabled=false;el.click();el.disabled=true;});
+      await button.evaluate(el=>{el.click();});
       assert.equal(state.posts, 1, 'a running sync must not be started twice');
       assert.equal(await page.locator('#notice').isVisible(), false);
       const dashboardsBefore = state.dashboards;

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from contextlib import suppress
+from datetime import datetime
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -11,10 +12,12 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from app.core.auth import request_authenticated
 from app.services.codex_chat import EFFORT, MODEL, CodexRPC, JsonObject
 from app.services.codex_health import read_health
+from app.services.health_transfer import HealthTransfer, describe_result, neutral_receipt
 
 router = APIRouter(prefix="/api/codex", tags=["codex"])
 logger = logging.getLogger(__name__)
@@ -51,6 +54,33 @@ class ChatMessage(BaseModel):
     timezone: str = Field(default="UTC", max_length=64)
 
 
+WEEKDAYS_TR = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
+MONTHS_TR = (
+    "Ocak",
+    "Şubat",
+    "Mart",
+    "Nisan",
+    "Mayıs",
+    "Haziran",
+    "Temmuz",
+    "Ağustos",
+    "Eylül",
+    "Ekim",
+    "Kasım",
+    "Aralık",
+)
+
+
+def turn_context(timezone: str, now: datetime | None = None) -> str:
+    """Real local date and time for each turn; replaces scripted opening variants."""
+    local = (now or datetime.now(ZoneInfo(timezone))).astimezone(ZoneInfo(timezone))
+    stamp = (
+        f"{local.day} {MONTHS_TR[local.month - 1]} {local.year} {WEEKDAYS_TR[local.weekday()]}, "
+        f"saat {local:%H:%M}"
+    )
+    return f"Kullanıcının saat dilimi: {timezone}. Yerel tarih ve saat: {stamp}.\n\n"
+
+
 def same_origin(origin: str | None, host: str | None) -> bool:
     if not origin or not host:
         return False
@@ -67,6 +97,8 @@ Source = Literal["browser", "codex"]
 # Seconds without any message before the chat gives up: during a turn / while idle.
 ACTIVE_TURN_TIMEOUT_SECONDS = 600
 IDLE_TIMEOUT_SECONDS = 1800
+CONNECT_TIMEOUT_SECONDS = 10
+START_TIMEOUT_SECONDS = 60
 
 
 async def run_health_tool(params: JsonObject) -> tuple[object, bool]:
@@ -77,13 +109,15 @@ async def run_health_tool(params: JsonObject) -> tuple[object, bool]:
         arguments = params["arguments"]
         if isinstance(arguments, str):
             arguments = json.loads(arguments)
-        return await read_health(arguments), True
+        result = await read_health(arguments)
+        # A structured refusal (the coverage budget) is not a successful read.
+        return result, "error" not in result
     except (ValueError, KeyError):
         return {
             "error": "Sorgu geçersiz. Aracın tarih, saat dilimi ve sayfa sınırlarını kontrol et."
         }, False
     except Exception:
-        logger.exception("Codex health archive query failed")
+        logger.warning("Umay health archive query failed", exc_info=False)
         return {"error": "Sağlık arşivi okunamadı. Veritabanı bağlantısını kontrol et."}, False
 
 
@@ -104,6 +138,19 @@ class ChatRelay:
         self.cancel_requested = False
         self.turn_id: str | None = None
         self.pending: dict[int, PendingAction] = {}
+        self.transfer: HealthTransfer | None = None
+
+    async def publish_transfer(self) -> None:
+        if self.transfer:
+            # Log before browser delivery: a closed browser cannot erase a bridge send.
+            receipt = self.transfer.log()
+            await self.websocket.send_json({"type": "health_transfer", **receipt})
+
+    async def finish_transfer(self, status: str) -> None:
+        if self.transfer and self.transfer.status == "active":
+            self.transfer.status = status
+            with suppress(Exception):
+                await self.publish_transfer()
 
     @property
     def timeout(self) -> float:
@@ -137,7 +184,7 @@ class ChatRelay:
             await self.cancel()
             return
         if self.active:
-            await self.send("notice", "Codex mevcut soruyu yanıtlıyor. Bitmesini bekleyebilirsin.")
+            await self.send("notice", "Umay mevcut soruyu yanıtlıyor. Bitmesini bekleyebilirsin.")
             return
         await self.start_turn(cast(JsonObject, message))
 
@@ -160,6 +207,9 @@ class ChatRelay:
                 "Geçerli bir soru yaz (en fazla 8000 karakter) ve saat dilimini kontrol et.",
             )
             return
+        self.transfer = HealthTransfer()
+        self.turn_id = None
+        await self.publish_transfer()
         request_id = await self.rpc.request(
             "turn/start",
             {
@@ -167,7 +217,7 @@ class ChatRelay:
                 "input": [
                     {
                         "type": "text",
-                        "text": f"Kullanıcının saat dilimi: {body.timezone}\n\n{body.text}",
+                        "text": turn_context(body.timezone) + body.text,
                     }
                 ],
                 "model": MODEL,
@@ -177,7 +227,7 @@ class ChatRelay:
         self.pending[request_id] = "start"
         self.active = True
         self.cancel_requested = False
-        await self.send("working", "Codex düşünüyor…")
+        await self.send("working", "Umay düşünüyor…")
 
     # Codex -> browser
 
@@ -198,7 +248,8 @@ class ChatRelay:
         if "error" in message:
             if action == "start":
                 self.active = False
-            await self.send("error", message["error"].get("message", "Codex isteği tamamlanamadı."))
+                await self.finish_transfer("failed")
+            await self.send("error", message["error"].get("message", "Umay isteği tamamlayamadı."))
         elif action == "start":
             turn_id: str = message["result"]["turn"]["id"]
             self.turn_id = turn_id
@@ -207,22 +258,43 @@ class ChatRelay:
 
     async def on_server_request(self, message: JsonObject, method: str, params: JsonObject) -> None:
         """Codex asks us to do something; only this thread's health tool is allowed."""
-        if method != "item/tool/call" or params.get("threadId") != self.thread_id:
+        if (
+            method != "item/tool/call"
+            or params.get("threadId") != self.thread_id
+            or not self.active
+        ):
             await self.rpc.reject(message)
             return
         await self.send("working", "Sağlık arşivi sorgulanıyor…")
         data, success = await run_health_tool(params)
-        await self.rpc.send(
-            {
-                "id": message["id"],
-                "result": {
-                    "success": success,
-                    "contentItems": [
-                        {"type": "inputText", "text": json.dumps(data, ensure_ascii=False)}
-                    ],
-                },
-            }
-        )
+        serialized = json.dumps(data, ensure_ascii=False)
+        try:
+            receipt = describe_result(params.get("arguments"), json.loads(serialized), success)
+        except Exception as exc:
+            # The receipt must never cost the model its tool answer. Type name only: an
+            # exception message may quote health values.
+            logger.warning("Umay health transfer receipt failed: %s", type(exc).__name__)
+            receipt = neutral_receipt(success)
+        try:
+            await self.rpc.send(
+                {
+                    "id": message["id"],
+                    "result": {
+                        "success": success,
+                        "contentItems": [{"type": "inputText", "text": serialized}],
+                    },
+                }
+            )
+        except Exception as exc:
+            if self.transfer:
+                self.transfer.failed_sends += 1
+            await self.finish_transfer(
+                "disconnected" if isinstance(exc, ConnectionClosed) else "failed"
+            )
+            raise
+        if self.transfer:
+            self.transfer.calls.append(receipt)
+            await self.publish_transfer()
 
     async def on_notification(self, method: str, params: JsonObject) -> None:
         if method == "item/agentMessage/delta":
@@ -239,9 +311,12 @@ class ChatRelay:
             self.cancel_requested = False
             self.turn_id = None
             turn = params["turn"]
+            await self.finish_transfer(
+                turn["status"] if turn["status"] in {"completed", "interrupted"} else "failed"
+            )
             if turn["status"] == "failed":
                 await self.send(
-                    "error", (turn.get("error") or {}).get("message", "Codex yanıt üretemedi.")
+                    "error", (turn.get("error") or {}).get("message", "Umay yanıt üretemedi.")
                 )
             await self.websocket.send_json({"type": "done", "status": turn["status"]})
 
@@ -263,9 +338,10 @@ async def relay(websocket: WebSocket, rpc: CodexRPC, thread_id: str) -> None:
                 readers, timeout=chat.timeout, return_when=asyncio.FIRST_COMPLETED
             )
             if not done:
+                await chat.finish_transfer("timed_out")
                 await chat.send(
                     "error",
-                    "Codex yanıtı zaman aşımına uğradı. Sohbeti yeniden bağlayıp deneyebilirsin.",
+                    "Umay yanıtı zaman aşımına uğradı. Sohbeti yeniden bağlayıp deneyebilirsin.",
                 )
                 return
             for task in done:
@@ -276,11 +352,18 @@ async def relay(websocket: WebSocket, rpc: CodexRPC, thread_id: str) -> None:
                     await chat.on_browser(message)
                 else:
                     await chat.on_codex(message)
+    except (WebSocketDisconnect, ConnectionClosed):
+        await chat.finish_transfer("disconnected")
+        raise
+    except Exception:
+        await chat.finish_transfer("failed")
+        raise
     finally:
         for task in readers:
             task.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
         await chat.interrupt_on_close()
+        await chat.finish_transfer("disconnected")
 
 
 @router.websocket("/chat")
@@ -296,42 +379,50 @@ async def chat(websocket: WebSocket) -> None:
         return
     await websocket.accept()
     settings = websocket.app.state.settings
-    if not settings.codex_bridge_token:
+    if not (settings.codex_bridge_token or "").strip():
         await websocket.send_json(
             {
                 "type": "error",
-                "text": "Codex bağlantısı kurulmamış. "
-                "Bilgisayarında scripts/start_codex_bridge.py çalıştır.",
+                "text": "Umay bağlantısı henüz yapılandırılmamış. Bağlantı ayarlarını kontrol et.",
             }
         )
         await websocket.close()
         return
+    phase = "connect"
     try:
         async with connect(
             settings.codex_bridge_url,
             additional_headers={"Authorization": f"Bearer {settings.codex_bridge_token}"},
-            open_timeout=10,
+            open_timeout=CONNECT_TIMEOUT_SECONDS,
+            close_timeout=2,
             max_size=4 * 1024 * 1024,
         ) as connection:
             rpc = CodexRPC(connection)
-            async with asyncio.timeout(60):
+            phase = "start"
+            async with asyncio.timeout(START_TIMEOUT_SECONDS):
                 thread_id, model = await rpc.start()
+            phase = "ready"
             _log_bridge_available()
             await websocket.send_json({"type": "ready", "model": model, "effort": EFFORT})
             await relay(websocket, rpc, thread_id)
     except WebSocketDisconnect:
         pass
-    except Exception:
+    except Exception as exc:
         _log_bridge_unavailable()
-        with suppress(Exception):
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "text": "Yerel Codex'e bağlanılamadı. "
-                    "Bilgisayarında Codex köprüsünü çalıştırıp "
-                    "ChatGPT oturumunu kontrol et; ardından Yeniden bağlan'a bas.",
-                }
+        if isinstance(exc, TimeoutError):
+            text = (
+                "Umay’ın hazırlanması uzun sürdü. Bağlantı yeniden denenecek."
+                if phase == "start"
+                else "Umay’a bağlanırken zaman aşımı oldu. Bağlantı yeniden denenecek."
             )
+        elif isinstance(exc, ConnectionClosed) or phase == "ready":
+            text = "Umay ile bağlantı kesildi. Bağlantı yeniden denenecek."
+        elif isinstance(exc, OSError):
+            text = "Umay’a şu an ulaşılamıyor. Bağlantı yeniden denenecek."
+        else:
+            text = "Umay bağlantısı kurulamadı. Bağlantı ayarlarını ve oturumu kontrol et."
+        with suppress(Exception):
+            await websocket.send_json({"type": "error", "text": text})
     finally:
         with suppress(Exception):
             await websocket.close()

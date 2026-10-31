@@ -22,6 +22,7 @@ from app.models.raw_versions import RawApiResponse
 from app.models.state import RawHealthData
 from app.parsers import normalize
 from app.parsers.common import payload_hash, temporal
+from app.parsers.text import prepare_optional_text
 from app.services import source_chains
 from app.services.identity import add_aliases, add_links, among, resolve_ids
 from app.services.source_chains import record_evidence, record_sightings
@@ -355,12 +356,15 @@ def _raw_row(
     spec: DataTypeSpec, item: tuple, now: datetime, origin: str, response_id: int | None
 ) -> dict:
     record, google_id, digest, start, end, timezone = item
+    # Validate the optional source index, leaving the received JSON and identity intact.
+    timezone_values = {"source_timezone": timezone}
+    prepare_optional_text(RawHealthData, timezone_values)
     return {
         "google_data_point_id": google_id,
         "data_type": spec.name,
         "source_start_time": start,
         "source_end_time": end,
-        "source_timezone": timezone,
+        **timezone_values,
         "raw_json": record,
         "payload_hash": digest,
         "first_seen_at": now,

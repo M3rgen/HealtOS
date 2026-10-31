@@ -3,10 +3,12 @@
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -25,10 +27,10 @@ echo "$*" >> "$FAKE_DOCKER_LOG"
 case "$*" in
   *"--profile backup run --rm -T backup"*)
     [ -z "${FAKE_DOCKER_FAIL:-}" ] || exit 1
-    printf 'PGDMP-synthetic-dump\\n' ;;
+    printf '%s\\n' "${FAKE_DUMP_TEXT:-PGDMP-synthetic-dump}" ;;
   *pg_restore*) cat > "$FAKE_RESTORE_SINK" ;;
   *alembic_version*) echo 20261017_0007 ;;
-  *psql*) printf 'manual_measurements 1\\nraw_health_data 0\\n' ;;
+  *psql*) printf 'manual_measurements\\t1\\nraw_health_data\\t0\\n' ;;
 esac
 """
 
@@ -60,6 +62,7 @@ def sandbox(tmp_path: Path):
         "HOME": str(tmp_path),
         "GNUPGHOME": str(gnupg),
         "BACKUP_HOST_DIR": str(tmp_path / "backups"),
+        "BACKUP_STATUS_HOST_DIR": str(tmp_path / "metadata"),
         "BACKUP_KEY_FILE": str(tmp_path / "backup.key"),
         "FAKE_DOCKER_LOG": str(tmp_path / "docker.log"),
         "FAKE_RESTORE_SINK": str(tmp_path / "restored.dump"),
@@ -171,6 +174,10 @@ def run_with_env_file(
     tree = tmp_path / "tree"
     (tree / "scripts").mkdir(parents=True)
     shutil.copy(ROOT / "scripts" / "backup.sh", tree / "scripts" / "backup.sh")
+    shutil.copy(ROOT / "scripts" / "write_backup_status.py", tree / "scripts")
+    (tree / "app" / "services").mkdir(parents=True)
+    shutil.copy(ROOT / "app" / "services" / "backup_status.py", tree / "app" / "services")
+    shutil.copy(ROOT / "app" / "services" / "backup_files.py", tree / "app" / "services")
     (tree / ".env").write_text(content, encoding="utf-8")
     return subprocess.run(
         [BASH, str(tree / "scripts" / "backup.sh")],
@@ -378,3 +385,406 @@ def test_systemd_timer_runs_backup_script_daily():
         encoding="utf-8"
     )
     assert "logger" in failure and "user.crit" in failure
+
+
+@pytest.fixture
+def fake_age(sandbox):
+    """Exercise pipeline completion/failure without a gpg-agent or encryption service."""
+    binary = Path(sandbox["PATH"].split(os.pathsep)[0]) / "age"
+    binary.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ " $* " == *" --decrypt "* ]]; then\n'
+        '  tail -n +2 "${@: -1}" | base64 -d; exit $?\n'
+        "fi\n"
+        'printf "ciphertext-header\\n"\n'
+        "base64\n"
+        'if [ -n "${FAKE_ENCRYPT_GATE:-}" ]; then\n'
+        '  touch "$FAKE_ENCRYPT_GATE.ready"\n'
+        '  while [ ! -e "$FAKE_ENCRYPT_GATE.release" ]; do sleep 0.02; done\n'
+        "fi\n"
+        '[ -z "${FAKE_ENCRYPT_FAIL:-}" ] || exit 1\n'
+    )
+    binary.chmod(0o755)
+    return {**sandbox, "BACKUP_AGE_RECIPIENT": "synthetic-public-recipient"}
+
+
+@pytest.fixture
+def fixed_age(fake_age):
+    binary = Path(fake_age["PATH"].split(os.pathsep)[0]) / "date"
+    binary.write_text(
+        '#!/usr/bin/env bash\ncase "$*" in\n'
+        "  *%Y%m%d*) echo 20261025T033000Z ;;\n"
+        "  *) echo 2026-10-25T03:30:00Z ;;\nesac\n"
+    )
+    binary.chmod(0o755)
+    return fake_age
+
+
+def wait_for(path: Path):
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        assert time.monotonic() < deadline, f"timed out waiting for {path.name}"
+        time.sleep(0.02)
+
+
+@contextmanager
+def backup_process(env):
+    process = subprocess.Popen(
+        [BASH, str(ROOT / "scripts" / "backup.sh")],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("method", ["age", "gpg"])
+def test_fixed_second_successes_preserve_existing_targets_and_restore(fixed_age, method):
+    env = dict(fixed_age)
+    binaries = Path(env["PATH"].split(os.pathsep)[0])
+    if method == "gpg":
+        shutil.copy(binaries / "age", binaries / "gpg")
+        env.pop("BACKUP_AGE_RECIPIENT")
+    write_key(env)
+    backups = Path(env["BACKUP_HOST_DIR"])
+    backups.mkdir()
+    original = backups / f"health-20261025T033000Z.dump.{method}"
+    original.write_bytes(b"ciphertext-header\nUEdETVAtc3ludGhldGljLWR1bXAK\n")
+    snapshots = {original: original.read_bytes()}
+    for _ in range(2):
+        result = run("backup.sh", env)
+        assert result.returncode == 0, result.stderr
+        output = Path(result.stdout.strip())
+        assert output not in snapshots
+        assert output in list(backups.glob(f"health-*.dump.{method}"))
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
+        snapshots[output] = output.read_bytes()
+        assert all(path.read_bytes() == data for path, data in snapshots.items())
+    for path in snapshots:
+        restored = run("restore.sh", env, str(path))
+        assert restored.returncode == 0, restored.stderr
+        assert Path(env["FAKE_RESTORE_SINK"]).read_bytes() == DUMP
+    # The default free-space guard discovers new names; opt-in retention also does.
+    for path in snapshots:
+        os.utime(path, (time.time() - 20 * 86400,) * 2)
+    result = run("backup.sh", {**env, "BACKUP_RETENTION_DAYS": "7"})
+    assert result.returncode == 0, result.stderr
+    assert status(env)["pruned_files"] == 3
+    assert not any(path.exists() for path in snapshots)
+    assert not partials(backups)
+
+
+def test_concurrent_backups_and_legacy_status_have_private_temporary_files(fixed_age, tmp_path):
+    write_key(fixed_age)
+    binaries = Path(fixed_age["PATH"].split(os.pathsep)[0])
+    real_mv = shutil.which("mv")
+    (binaries / "mv").write_text(
+        '#!/usr/bin/env bash\nprintf "%s" "$2" > "$FAKE_STATUS_GATE.source"\n'
+        'touch "$FAKE_STATUS_GATE.ready"\n'
+        'while [ ! -e "$FAKE_STATUS_GATE.release" ]; do sleep 0.02; done\n'
+        f'exec "{real_mv}" "$@"\n'
+    )
+    (binaries / "mv").chmod(0o755)
+    envs = [
+        {
+            **fixed_age,
+            "FAKE_ENCRYPT_GATE": str(tmp_path / f"encrypt-{i}"),
+            "FAKE_STATUS_GATE": str(tmp_path / f"status-{i}"),
+            "FAKE_DUMP_TEXT": f"dump-{i}",
+        }
+        for i in range(2)
+    ]
+    backups = Path(fixed_age["BACKUP_HOST_DIR"])
+    with backup_process(envs[0]) as first, backup_process(envs[1]) as second:
+        for env in envs:
+            wait_for(Path(env["FAKE_ENCRYPT_GATE"] + ".ready"))
+        assert len(partials(backups)) == 2
+        assert not list(backups.glob("health-*.dump.age"))
+        for env in envs:
+            Path(env["FAKE_ENCRYPT_GATE"] + ".release").touch()
+        for env in envs:
+            wait_for(Path(env["FAKE_STATUS_GATE"] + ".ready"))
+        status_partials = [Path(env["FAKE_STATUS_GATE"] + ".source").read_text() for env in envs]
+        assert len(set(status_partials)) == 2
+        assert {json.loads(Path(p).read_text())["file"] for p in status_partials} == {
+            str(p) for p in backups.glob("health-*.dump.age")
+        }
+        for env in envs:
+            Path(env["FAKE_STATUS_GATE"] + ".release").touch()
+        outputs = []
+        for process in (first, second):
+            stdout, stderr = process.communicate(timeout=10)
+            assert process.returncode == 0, stderr
+            assert "could not" not in stderr
+            outputs.append(Path(stdout.strip()))
+        assert len(set(outputs)) == 2
+        for i, output in enumerate(outputs):
+            assert run("restore.sh", fixed_age, str(output)).returncode == 0
+            assert Path(fixed_age["FAKE_RESTORE_SINK"]).read_bytes() == f"dump-{i}\n".encode()
+    assert not partials(backups) and not list(backups.glob("*.tmp*"))
+    assert status(fixed_age)["file"] in {str(p) for p in outputs}
+
+
+@pytest.mark.parametrize("failure", ["dump", "encryption", "TERM", "INT"])
+def test_failed_or_cancelled_peer_cannot_remove_another_runs_files(fixed_age, tmp_path, failure):
+    first = run("backup.sh", fixed_age)
+    assert first.returncode == 0, first.stderr
+    original = Path(first.stdout.strip())
+    before = original.read_bytes()
+    env = {**fixed_age, "FAKE_ENCRYPT_GATE": str(tmp_path / "peer")}
+    if failure in ("dump", "encryption"):
+        env["FAKE_DOCKER_FAIL" if failure == "dump" else "FAKE_ENCRYPT_FAIL"] = "1"
+    other = {**fixed_age, "FAKE_ENCRYPT_GATE": str(tmp_path / "survivor")}
+    backups = original.parent
+    with backup_process(env) as peer, backup_process(other) as survivor:
+        wait_for(Path(env["FAKE_ENCRYPT_GATE"] + ".ready"))
+        wait_for(Path(other["FAKE_ENCRYPT_GATE"] + ".ready"))
+        assert len(partials(backups)) == 2
+        if failure in ("TERM", "INT"):
+            os.killpg(peer.pid, getattr(signal, "SIG" + failure))
+        else:
+            Path(env["FAKE_ENCRYPT_GATE"] + ".release").touch()
+        stdout, stderr = peer.communicate(timeout=10)
+        assert peer.returncode == (143 if failure == "TERM" else 130 if failure == "INT" else 1)
+        assert not stdout, stderr
+        assert len(partials(backups)) == 1
+        assert original.read_bytes() == before
+        assert status(fixed_age)["result"] == "failure"
+        metadata = json.loads(
+            (Path(fixed_age["BACKUP_STATUS_HOST_DIR"]) / "status.json").read_text()
+        )
+        assert metadata["last_success_at"] == "2026-10-25T03:30:00Z"
+        Path(other["FAKE_ENCRYPT_GATE"] + ".release").touch()
+        stdout, stderr = survivor.communicate(timeout=10)
+        assert survivor.returncode == 0, stderr
+        assert Path(stdout.strip()).read_bytes() == before
+    assert original.read_bytes() == before and not partials(backups)
+
+
+def test_publication_error_preserves_output_and_success_evidence(fixed_age):
+    first = run("backup.sh", fixed_age)
+    assert first.returncode == 0, first.stderr
+    original = Path(first.stdout.strip())
+    before = original.read_bytes()
+    binary = Path(fixed_age["PATH"].split(os.pathsep)[0]) / "python3"
+    real_python = shutil.which("python3")
+    binary.write_text(
+        f'#!/usr/bin/env bash\n[ "${{3:-}}" != publish ] || exit 1\nexec "{real_python}" "$@"\n'
+    )
+    binary.chmod(0o755)
+    result = run("backup.sh", fixed_age)
+    assert result.returncode == 1 and result.stdout == ""
+    assert "cannot publish" in result.stderr
+    assert original.read_bytes() == before
+    assert list(original.parent.glob("health-*.dump.age")) == [original]
+    assert not partials(original.parent)
+    assert status(fixed_age)["result"] == "failure"
+    metadata = json.loads((Path(fixed_age["BACKUP_STATUS_HOST_DIR"]) / "status.json").read_text())
+    assert metadata["last_success_at"] == "2026-10-25T03:30:00Z"
+
+
+@pytest.mark.parametrize("failure", ["FAKE_DOCKER_FAIL", "FAKE_ENCRYPT_FAIL"])
+def test_shell_success_then_failure_preserves_success_in_separate_metadata(fake_age, failure):
+    first = run("backup.sh", fake_age)
+    assert first.returncode == 0, first.stderr
+    metadata_path = Path(fake_age["BACKUP_STATUS_HOST_DIR"]) / "status.json"
+    initial = json.loads(metadata_path.read_text())
+    assert initial["last_attempt"]["result"] == "success"
+    assert initial["last_success_at"] == status(fake_age)["timestamp"]
+    assert Path(first.stdout.strip()).exists()
+    failed = run("backup.sh", {**fake_age, failure: "1"})
+    assert failed.returncode == 1
+    latest = json.loads(metadata_path.read_text())
+    assert latest["last_attempt"]["result"] == "failure"
+    assert latest["last_success_at"] == initial["last_success_at"]
+    assert status(fake_age)["result"] == "failure"  # legacy consumers still work
+    assert status(fake_age)["file"] is None
+    assert not partials(Path(fake_age["BACKUP_HOST_DIR"]))
+    assert Path(first.stdout.strip()).exists()
+    for value in (fake_age["BACKUP_HOST_DIR"], fake_age["BACKUP_KEY_FILE"], "message", "file"):
+        assert value not in metadata_path.read_text()
+
+
+@pytest.mark.parametrize("failure", ["FAKE_DOCKER_FAIL", "FAKE_ENCRYPT_FAIL"])
+def test_first_incomplete_encrypted_output_cannot_record_success(fake_age, failure):
+    result = run("backup.sh", {**fake_age, failure: "1"})
+    assert result.returncode == 1
+    report = json.loads((Path(fake_age["BACKUP_STATUS_HOST_DIR"]) / "status.json").read_text())
+    assert report["last_success_at"] is None
+    assert report["last_attempt"]["result"] == "failure"
+    assert not list(Path(fake_age["BACKUP_HOST_DIR"]).glob("health-*"))
+
+
+def test_shell_missing_key_records_failure_without_any_success(sandbox):
+    result = run("backup.sh", sandbox)
+    assert result.returncode == 1
+    metadata = json.loads((Path(sandbox["BACKUP_STATUS_HOST_DIR"]) / "status.json").read_text())
+    assert metadata["last_success_at"] is None
+    assert metadata["last_attempt"]["result"] == "failure"
+
+
+def test_shell_legacy_success_is_migrated_before_failure_overwrites_legacy(sandbox):
+    backups = Path(sandbox["BACKUP_HOST_DIR"])
+    backups.mkdir()
+    before = "2026-01-01T00:00:00Z"
+    (backups / "last-backup-status.json").write_text(
+        json.dumps(
+            {
+                "result": "success",
+                "timestamp": before,
+                "file": "/private/archive",
+            }
+        )
+    )
+    result = run("backup.sh", sandbox)  # no key -> failure
+    assert result.returncode == 1
+    metadata = json.loads((Path(sandbox["BACKUP_STATUS_HOST_DIR"]) / "status.json").read_text())
+    assert metadata["last_success_at"] == before
+    assert metadata["last_attempt"]["result"] == "failure"
+    assert status(sandbox)["result"] == "failure"
+    assert "/private" not in json.dumps(metadata)
+
+
+def test_shell_metadata_publication_failure_is_sanitized_and_keeps_legacy(sandbox):
+    directory = Path(sandbox["BACKUP_STATUS_HOST_DIR"])
+    directory.write_text("not a directory")
+    result = run("backup.sh", sandbox)
+    assert result.returncode == 1
+    assert "could not publish status metadata" in result.stderr
+    assert str(directory) not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert status(sandbox)["result"] == "failure"
+
+
+@pytest.fixture
+def count_docker(sandbox, tmp_path):
+    docker = Path(sandbox["PATH"].split(os.pathsep)[0]) / "docker"
+    docker.write_text("""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$*" in
+  *pg_restore*) cat > "$FAKE_RESTORE_SINK" ;;
+  *alembic_version*)
+    [ -z "${FAIL_REVISION_QUERY:-}" ] || exit 1
+    echo 20261025_0020 ;;
+  *psql*)
+    case " $* " in
+      *" -d health "*)
+        [ -z "${FAIL_LIVE_QUERY:-}" ] || { echo "/private/query secret" >&2; exit 1; }
+        printf '%s' "$LIVE_COUNTS" ;;
+      *)
+        [ -z "${FAIL_RESTORED_QUERY:-}" ] || exit 1
+        printf '%s' "$RESTORED_COUNTS" ;;
+    esac ;;
+esac
+""")
+    docker.chmod(0o755)
+    dump = tmp_path / "synthetic.dump"
+    dump.write_bytes(DUMP)
+    return {**sandbox, "RESTORED_COUNTS": "same\t2\n", "LIVE_COUNTS": "same\t2\n"}, dump
+
+
+def comparisons(report):
+    return {
+        fields[0]: fields[1:]
+        for fields in (line.split("\t") for line in report.splitlines())
+        if len(fields) == 4 and fields[0] != "table"
+    }
+
+
+def test_restore_compares_union_of_tables_without_calling_changes_corruption(count_docker):
+    env, dump = count_docker
+    env.update(
+        {
+            "RESTORED_COUNTS": "same\t0\nchanged\t2\nold_table\t3\n",
+            "LIVE_COUNTS": "changed\t9\nnew_table\t4\nsame\t0\n",
+        }
+    )
+    result = run("restore.sh", env, str(dump))
+    assert result.returncode == 0, result.stderr
+    assert comparisons(result.stdout) == {
+        "same": ["0", "0", "equal"],
+        "changed": ["2", "9", "different"],
+        "old_table": ["3", "-", "restored_only"],
+        "new_table": ["-", "4", "live_only"],
+    }
+    assert "differences alone do not imply corruption" in result.stdout
+    log = Path(env["FAKE_DOCKER_LOG"]).read_text()
+    assert "dropdb -U health --if-exists health_restore" in log
+    assert "dropdb -U health --if-exists health\n" not in log
+    assert "pg_restore -U health --dbname=health_restore" in log
+    assert Path(env["FAKE_RESTORE_SINK"]).read_bytes() == DUMP
+
+
+@pytest.mark.parametrize("side", ["LIVE", "RESTORED"])
+@pytest.mark.parametrize("failure", ["query", "malformed", "duplicate", "negative"])
+def test_restore_query_failures_and_invalid_results_never_produce_a_comparison(
+    count_docker,
+    side,
+    failure,
+):
+    env, dump = count_docker
+    if failure == "query":
+        env[f"FAIL_{side}_QUERY"] = "1"
+    else:
+        env[f"{side}_COUNTS"] = {
+            "malformed": "same\toops\n",
+            "duplicate": "same\t1\nsame\t1\n",
+            "negative": "same\t-1\n",
+        }[failure]
+    result = run("restore.sh", env, str(dump))
+    assert result.returncode != 0
+    assert not comparisons(result.stdout)
+    assert "comparison" not in result.stdout
+    assert "/private/query" not in result.stderr
+
+
+@pytest.mark.parametrize("target", ["health", "postgres", "template0", "template1", "bad;name"])
+def test_comparison_changes_keep_scratch_database_guard(count_docker, target):
+    env, dump = count_docker
+    result = run("restore.sh", env, str(dump), target)
+    assert result.returncode != 0
+    assert not Path(env["FAKE_DOCKER_LOG"]).exists()
+
+
+def test_successful_empty_live_query_is_distinct_from_a_query_error(count_docker):
+    env, dump = count_docker
+    env["LIVE_COUNTS"] = ""
+    result = run("restore.sh", env, str(dump))
+    assert result.returncode == 0, result.stderr
+    assert comparisons(result.stdout) == {"same": ["2", "-", "restored_only"]}
+
+
+@pytest.mark.parametrize("live", ["same\t2\n", ""])
+def test_restore_without_tables_fails_explicitly(count_docker, live):
+    env, dump = count_docker
+    env.update({"RESTORED_COUNTS": "", "LIVE_COUNTS": live})
+    result = run("restore.sh", env, str(dump))
+    assert result.returncode != 0
+    assert "restored database health_restore has no tables" in result.stderr
+    assert "row-count query failed" not in result.stderr
+    assert not comparisons(result.stdout) and "comparison" not in result.stdout
+
+
+def test_large_integer_counts_are_compared_exactly(count_docker):
+    env, dump = count_docker
+    env.update(
+        {"LIVE_COUNTS": "same\t9007199254740993\n", "RESTORED_COUNTS": "same\t9007199254740992\n"}
+    )
+    result = run("restore.sh", env, str(dump))
+    assert result.returncode == 0, result.stderr
+    assert comparisons(result.stdout)["same"][2] == "different"
+
+
+def test_revision_query_error_is_not_a_successful_restore_report(count_docker):
+    env, dump = count_docker
+    result = run("restore.sh", {**env, "FAIL_REVISION_QUERY": "1"}, str(dump))
+    assert result.returncode != 0
+    assert "restored revision query failed" in result.stderr
+    assert "Alembic revision:" not in result.stdout

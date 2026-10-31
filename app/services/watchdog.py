@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.logging import event
@@ -20,7 +21,9 @@ from app.services.pipeline_health import (
     PipelineStatus,
     update_reliability_state,
 )
+from app.services.reconciliation_reports import recovery_errors
 from app.sync.incremental import stale_running_cutoff
+from app.sync.ownership import discard_isolated, isolated_engine
 from app.sync.reconciliation import ReconciliationService
 
 logger = logging.getLogger(__name__)
@@ -115,8 +118,10 @@ class PipelineWatchdog:
                     last_recovery_error=None,
                 )
                 event(logger, "WATCHDOG_RECOVERY_STARTED", trigger=trigger, days=days)
+                run_id = uuid.uuid4()
                 try:
-                    results = await self.reconciliation.run(days)
+                    await self.reconciliation.run(days, run_id=run_id)
+                    errors = await recovery_errors(self.sessions, run_id)
                 except Exception as exc:
                     await self._record_failure(now, (type(exc).__name__,))
                     event(
@@ -128,13 +133,6 @@ class PipelineWatchdog:
                     )
                     return RecoveryOutcome("failed", trigger, days, (type(exc).__name__,))
 
-                errors = tuple(
-                    sorted(
-                        type(value).__name__
-                        for value in results.values()
-                        if isinstance(value, Exception)
-                    )
-                )
                 if errors:
                     await self._record_failure(now, errors)
                     event(
@@ -184,24 +182,28 @@ class PipelineWatchdog:
 
     @asynccontextmanager
     async def _global_lock(self):
-        async with self.sessions() as session:
-            if session.get_bind().dialect.name != "postgresql":
-                yield True
-                return
-            acquired = bool(
-                await session.scalar(
-                    text("SELECT pg_try_advisory_lock(:lock_id)"),
-                    {"lock_id": _ADVISORY_LOCK_ID},
-                )
-            )
-            try:
-                yield acquired
-            finally:
-                if acquired:
-                    await session.execute(
-                        text("SELECT pg_advisory_unlock(:lock_id)"),
+        engine = self.sessions.kw["bind"]
+        if not isinstance(engine, AsyncEngine):
+            raise TypeError("watchdog recovery requires an engine-bound session factory")
+        if engine.dialect.name != "postgresql":
+            yield True
+            return
+        # A private pool: never the connection needed by cooldown, OAuth or reports.
+        isolated = isolated_engine(engine)
+        connection = None
+        try:
+            connection = await isolated.connect()
+            async with connection.begin():
+                acquired = bool(
+                    await connection.scalar(
+                        text("SELECT pg_try_advisory_lock(:lock_id)"),
                         {"lock_id": _ADVISORY_LOCK_ID},
                     )
+                )
+            # Session locks survive commit; Google I/O must not hold a transaction.
+            yield acquired
+        finally:
+            await discard_isolated(connection, isolated)
 
     def _log_state_change(self, snapshot: PipelineSnapshot) -> None:
         if snapshot.status == self._last_status:

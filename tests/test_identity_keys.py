@@ -160,14 +160,11 @@ def test_model_and_migration_ddl_are_the_same() -> None:
     assert normalize_sql(migration.SQLITE_DDL) == normalize_sql(identity_models.SQLITE_DDL)
     assert migration.IDENTITY_TABLES == identity_models.IDENTITY_TABLES
     assert migration.FUNCTION_BODIES == identity_models.FUNCTION_BODIES
-    # The analytics views verify compares with are the ones the migration creates.
+    # The analytics views are those of 20261024_0013 now (tests/test_eligibility.py compares
+    # them, and the 0012 views its downgrade restores with these).
     from app.services import analytics_views
 
     assert migration.NORMALIZED_TABLES == analytics_views.NORMALIZED_TABLES
-    for table in analytics_views.NORMALIZED_TABLES:
-        assert migration._view(table, current_only=True) == (
-            f"CREATE OR REPLACE VIEW analytics_{table} AS {analytics_views.view_select(table)}"
-        )
 
 
 async def test_identity_tables_are_append_only_on_sqlite(sessions) -> None:

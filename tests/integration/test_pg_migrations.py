@@ -1,4 +1,6 @@
-"""Alembic history against a real PostgreSQL server (autocommit blocks, enum, index)."""
+"""Alembic history against a real PostgreSQL server (autocommit blocks, enum, index).
+
+``HEAD`` is the one place the current head is named; other integration tests import it."""
 
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ pytestmark = pytest.mark.integration
 
 FRESHNESS_INDEX = "ix_raw_health_data_type_freshness"
 AD_HOC_INDEX = "ix_raw_health_data_type_effective_time"
-HEAD = "20261021_0012"
+HEAD = "20261031_0021"
 
 
 def _sync_url(database_url: str) -> str:

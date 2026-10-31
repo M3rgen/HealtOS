@@ -35,6 +35,129 @@ async function mock(page) {
   });
 }
 
+async function retryScenarios(browser, width, height) {
+  const page = await browser.newPage({viewport: {width, height}});
+  await mock(page);
+  await page.addInitScript(() => {
+    const OriginalSocket = window.WebSocket;
+    window.umayMode = 'down';
+    window.umayConnections = 0;
+    window.umayLiveSockets = 0;
+    window.umayPeakSockets = 0;
+    window.WebSocket = class {
+      static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+      constructor(url) {
+        if (!url.endsWith('/api/codex/chat')) return new OriginalSocket(url);
+        this.readyState = 0;
+        window.umayTestSocket = this;
+        window.umayConnections++;
+        window.umayLiveSockets++;
+        window.umayPeakSockets = Math.max(window.umayPeakSockets, window.umayLiveSockets);
+        setTimeout(() => {
+          if (this.readyState !== 0 || window.umayMode === 'hold') return;
+          if (window.umayMode === 'up') return this.ready();
+          const errors = [
+            'Umay bağlantısı henüz yapılandırılmamış. Bağlantı ayarlarını kontrol et.',
+            'Umay’a şu an ulaşılamıyor. Bağlantı yeniden denenecek.',
+            'Umay’a bağlanırken zaman aşımı oldu. Bağlantı yeniden denenecek.',
+            'Umay’ın hazırlanması uzun sürdü. Bağlantı yeniden denenecek.',
+          ];
+          this.onmessage?.({data: JSON.stringify({type: 'error',
+            text: errors[Math.min(window.umayConnections - 1, errors.length - 1)]})});
+          this.close();
+        }, 20);
+      }
+      ready() {
+        this.readyState = 1;
+        this.onmessage?.({data: JSON.stringify({type: 'ready', model: 'synthetic', effort: 'medium'})});
+      }
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        window.umayLiveSockets--;
+        this.onclose?.();
+      }
+    };
+  });
+  await page.goto(TARGET);
+  await page.waitForFunction(() => document.querySelectorAll('#history-rows tr').length === 7);
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  await page.locator('#assistant-open').click({force: true});
+  await page.clock.runFor(25);
+
+  async function offline(expected) {
+    assert.match(await page.locator('#assistant-error').textContent(), expected);
+    assert.equal(await page.locator('#assistant-error').getAttribute('role'), 'alert');
+    assert.equal(await page.getByRole('button', {name: 'Yeniden bağlan', exact: true}).isVisible(), true);
+    for (const id of ['assistant-input', 'assistant-send']) assert.equal(await page.locator(`#${id}`).isDisabled(), true);
+    assert.equal(await page.evaluate(() => {
+      const fits = ['assistant-dialog', 'assistant-error', 'assistant-reconnect'].every(id => {
+        const r = document.getElementById(id).getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight;
+      });
+      return fits && document.documentElement.scrollWidth <= innerWidth && document.documentElement.scrollHeight <= innerHeight;
+    }), true);
+    assert.doesNotMatch(await page.locator('#assistant-error').textContent(), /codex|token|scripts\//i);
+  }
+
+  await offline(/yapılandırılmamış/);
+  // Five retries after the initial attempt, with the existing 1/2/4/8/16 s backoff.
+  for (const [index, delay] of [1000, 2000, 4000, 8000, 16000].entries()) {
+    await page.clock.runFor(delay - 30);
+    assert.equal(await page.evaluate(() => window.umayConnections), index + 1);
+    await page.clock.runFor(55);
+    assert.equal(await page.evaluate(() => window.umayConnections), index + 2);
+    await offline(index === 0 ? /ulaşılamıyor/ : index === 1 ? /bağlanırken zaman aşımı/ : index === 2 ? /hazırlanması/ : /Umay/);
+  }
+  await page.clock.runFor(60000);
+  assert.equal(await page.evaluate(() => window.umayConnections), 6);
+  await offline(/şu an çevrimdışı/);
+
+  // Manual recovery after budget exhaustion; online/visibility must not duplicate a handshake.
+  await page.evaluate(() => { window.umayMode = 'hold'; });
+  await page.getByRole('button', {name: 'Yeniden bağlan', exact: true}).click({force: true});
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('online'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  assert.equal(await page.evaluate(() => window.umayConnections), 7);
+  assert.equal(await page.locator('#assistant-send').isDisabled(), true);
+  await page.evaluate(() => window.umayTestSocket.ready());
+  assert.equal(await page.locator('#assistant-input').isDisabled(), false);
+  assert.equal(await page.locator('#assistant-error').isVisible(), false);
+
+  // Recovery within the retry budget, with a manual retry cancelling an already scheduled timer.
+  await page.evaluate(() => window.umayTestSocket.close());
+  await page.clock.runFor(1000);
+  await page.clock.runFor(25);
+  assert.equal(await page.evaluate(() => window.umayConnections), 8);
+  await page.evaluate(() => window.umayTestSocket.close());
+  await page.evaluate(() => { window.umayMode = 'up'; });
+  await page.getByRole('button', {name: 'Yeniden bağlan', exact: true}).click({force: true});
+  await page.clock.runFor(25);
+  await page.clock.runFor(30000);
+  assert.equal(await page.evaluate(() => window.umayConnections), 9);
+  assert.equal(await page.evaluate(() => window.umayPeakSockets), 1);
+  assert.equal(await page.locator('#assistant-input').isDisabled(), false);
+  await page.evaluate(() => window.umayTestSocket.close());
+  await page.clock.runFor(1025);
+  assert.equal(await page.evaluate(() => window.umayConnections), 10);
+  assert.equal(await page.locator('#assistant-input').isDisabled(), false);
+  // Leaving while a retry is pending cancels it, including visibility/online events.
+  await page.evaluate(() => {
+    window.umayMode = 'down';
+    window.umayTestSocket.close();
+    window.dispatchEvent(new Event('pagehide'));
+    window.dispatchEvent(new Event('online'));
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await page.clock.runFor(60000);
+  assert.equal(await page.evaluate(() => window.umayConnections), 10);
+  console.log(`PASS ${width}x${height}: safe errors, bounded backoff, manual/automatic recovery, disabled sending, one socket, no page overflow`);
+  await page.close();
+}
+
 run(async () => {
   const problem = await reachable(TARGET);
   if (problem) {
@@ -188,6 +311,9 @@ run(async () => {
       assert.equal(await page.locator('.chat-message').count(), 1);
       console.log(`PASS ${width}px: automatic connection/recovery, synchronized drag, resize, formatting, safe HTML, presence, typing dots, reduced motion, reset, no page overflow`);
       await page.close();
+    }
+    for (const [width, height] of [[1280, 900], [390, 844], [320, 568]]) {
+      await retryScenarios(browser, width, height);
     }
   } finally {
     await browser.close();

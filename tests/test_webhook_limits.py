@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from app.api import webhooks
 from app.core.config import Settings
+from app.core.request_limits import WriteLimits
 
 
 @pytest.fixture
@@ -17,7 +18,8 @@ def application():
         google_health_webhook_authorization="Bearer local-test",
         google_health_webhook_max_body_bytes=1024,
     )
-    application.state.runtime = SimpleNamespace()
+    application.state.runtime = SimpleNamespace(webhook_status=SimpleNamespace(record=AsyncMock()))
+    application.state.write_limits = WriteLimits(application.state.settings)
     application.include_router(webhooks.router)
     return application
 
@@ -109,6 +111,7 @@ async def test_exact_limit_signed_body_preserves_bytes(application):
     verifier = AsyncMock()
     ingest = AsyncMock(return_value=result)
     application.state.runtime = SimpleNamespace(
+        webhook_status=SimpleNamespace(record=AsyncMock()),
         webhook_verifier=SimpleNamespace(verify=verifier),
         webhook_processor=SimpleNamespace(ingest_verified=ingest),
     )

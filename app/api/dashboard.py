@@ -1,26 +1,54 @@
 import csv
 import io
-from datetime import UTC, date, datetime, time, timedelta
+import uuid
+from collections.abc import Callable, Coroutine
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_job_request
+from app.api.deps import ManualWriteRoute, require_job_request
 from app.core.timeutil import as_utc
 from app.db.session import get_session
-from app.models.health import ExerciseSession, SleepSession, Steps
-from app.models.identity import held_elsewhere, plan_each_query
+from app.models.eligibility import raw_counted
+from app.models.health import SleepSession, Steps
+from app.models.identity import plan_each_query
 from app.models.manual import ManualMeasurement, ManualWorkout
+from app.models.manual_flags import REASON_LENGTH, TEST_FLAG
 from app.models.state import RawHealthData
+from app.services.current_workouts import current_workouts
 from app.services.dashboard import dashboard_data
+from app.services.dashboard_window import (
+    DateWindowError,
+    checked_dates,
+    daily_window,
+    monthly_window,
+)
+from app.services.manual_flags import active_flags, record_flag
 
-router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+class DashboardRoute(ManualWriteRoute):
+    """Answer an unrepresentable date window with 422 and only its fixed message."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def window_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except DateWindowError as exc:
+                raise HTTPException(422, str(exc)) from exc
+
+        return window_handler
+
+
+router = APIRouter(prefix="/api/dashboard", tags=["dashboard"], route_class=DashboardRoute)
 
 
 class WorkoutInput(BaseModel):
@@ -83,36 +111,14 @@ async def workouts(
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     zone = check_zone(timezone)
-    await plan_each_query(session)
     current = datetime.now(zone).date()
     first = (month or current).replace(day=1)
     if first > current:
         raise HTTPException(422, "Gelecek ay seçilemez.")
-    following = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
-    start = datetime.combine(first, time.min, zone).astimezone(UTC)
-    stop = datetime.combine(following, time.min, zone).astimezone(UTC)
-    # Source deletion/quarantine must also hide a previously normalized session.
-    valid_source = (
-        select(RawHealthData.id)
-        .where(
-            RawHealthData.data_type == "exercise",
-            RawHealthData.google_data_point_id == ExerciseSession.google_data_point_id,
-            RawHealthData.is_quarantined.is_(False),
-            RawHealthData.source_deleted_at.is_(None),
-            ~held_elsewhere(RawHealthData.id),
-        )
-        .exists()
-    )
-    imported = (
-        await session.scalars(
-            select(ExerciseSession).where(
-                ExerciseSession.start_time >= start,
-                ExerciseSession.start_time < stop,
-                ExerciseSession.is_quarantined.is_(False),
-                valid_source,
-            )
-        )
-    ).all()
+    window = monthly_window(first, zone)
+    start, stop = window.start, window.stop
+    await plan_each_query(session)
+    rows = await current_workouts(session, start, stop)
     manual = (
         await session.scalars(
             select(ManualWorkout).where(
@@ -121,7 +127,6 @@ async def workouts(
             )
         )
     ).all()
-    rows = [workout_dict(row, "Fitbit") for row in imported]
     rows.extend(workout_dict(row, "Manuel") for row in manual)
     return sorted(rows, key=lambda row: row["start_time"], reverse=True)
 
@@ -156,8 +161,11 @@ async def metric_history(
 ) -> dict:
     """Thirty civil days per page, newest first, through the full valid archive."""
     zone = check_zone(timezone)
-    await plan_each_query(session)
     today = datetime.now(zone).date()
+    with checked_dates():
+        end_date = today - timedelta(days=30 * (page - 1))
+    # Even the oldest page is a full thirty-day window, not a clipped archive tail.
+    daily_window(end_date, 30, zone)
     source_type, value_key = {
         "steps": ("steps", "steps"),
         "sleep": ("sleep", "sleep_seconds"),
@@ -169,12 +177,11 @@ async def metric_history(
     source_time = (
         RawHealthData.source_end_time if metric == "sleep" else RawHealthData.source_start_time
     )
-    stop = datetime.combine(today + timedelta(days=1), time.min, date_zone).astimezone(UTC)
+    stop = daily_window(today, 1, date_zone).stop
+    await plan_each_query(session)
     bounds = select(func.min(source_time), func.max(source_time)).where(
         RawHealthData.data_type == source_type,
-        RawHealthData.is_quarantined.is_(False),
-        RawHealthData.source_deleted_at.is_(None),
-        ~held_elsewhere(RawHealthData.id),
+        raw_counted(data_types=(source_type,)),
         source_time < stop,
     )
     if metric != "heart":
@@ -187,14 +194,21 @@ async def metric_history(
             )
             .exists()
         )
+    if metric == "sleep":
+        # Partial corrections cannot establish an archive wake day. These are current
+        # ingestion timestamps, never the retained SleepSession's historical interval.
+        bounds = bounds.where(
+            RawHealthData.source_start_time.is_not(None),
+            RawHealthData.source_end_time > RawHealthData.source_start_time,
+        )
     earliest, latest = (await session.execute(bounds)).one()
-    earliest_date = as_utc(earliest).astimezone(date_zone).date() if earliest else None
-    latest_date = as_utc(latest).astimezone(date_zone).date() if latest else None
+    with checked_dates():
+        earliest_date = as_utc(earliest).astimezone(date_zone).date() if earliest else None
+        latest_date = as_utc(latest).astimezone(date_zone).date() if latest else None
     total_pages = ((today - earliest_date).days // 30 + 1) if earliest_date else 1
     if page > total_pages:
         raise HTTPException(422, "Bu geçmiş sayfası bulunamadı.")
-    end_date = today - timedelta(days=30 * (page - 1))
-    data = await dashboard_data(session, end_date, 30, timezone, valid_sources_only=True)
+    data = await dashboard_data(session, end_date, 30, timezone)
     return {
         "metric": metric,
         "page": page,
@@ -295,6 +309,7 @@ async def measurements(session: AsyncSession = Depends(get_session)) -> list[dic
             select(ManualMeasurement).order_by(ManualMeasurement.measured_at.desc()).limit(100)
         )
     ).all()
+    flags = await active_flags(session, [row.id for row in rows])
     return [
         {
             "id": str(row.id),
@@ -302,6 +317,61 @@ async def measurements(session: AsyncSession = Depends(get_session)) -> list[dic
             "value": row.value,
             "measured_at": row.measured_at,
             "source": "Manuel",
+            # Flags set on it now; a "test" entry is listed but left out of the profile.
+            "flags": flags.get(row.id, []),
         }
         for row in rows
     ]
+
+
+class FlagInput(BaseModel):
+    flag: Literal["test"] = TEST_FLAG
+    reason: str | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def valid_reason(cls, value: str | None) -> str | None:
+        value = value.strip() if value else None
+        if value and len(value) > REASON_LENGTH:
+            raise ValueError(f"Açıklama en fazla {REASON_LENGTH} karakter olmalı.")
+        return value or None
+
+
+async def _flag(
+    session: AsyncSession,
+    measurement_id: uuid.UUID,
+    body: FlagInput | None,
+    flagged: bool,
+    response: Response,
+) -> dict:
+    body = body or FlagInput()
+    if await session.get(ManualMeasurement, measurement_id) is None:
+        raise HTTPException(404, "Ölçüm bulunamadı.")
+    changed = await record_flag(session, measurement_id, body.flag, flagged, body.reason)
+    await session.commit()
+    # Already in that state: nothing was added.
+    response.status_code = 201 if changed else 200
+    flags = await active_flags(session, [measurement_id])
+    return {"id": str(measurement_id), "flags": flags.get(measurement_id, []), "changed": changed}
+
+
+@router.post("/measurements/{measurement_id}/flag", dependencies=[Depends(require_job_request)])
+async def flag_measurement(
+    measurement_id: uuid.UUID,
+    response: Response,
+    body: FlagInput | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Flag a measurement (``test``: a test entry). Appends an event; the entry is unchanged."""
+    return await _flag(session, measurement_id, body, True, response)
+
+
+@router.post("/measurements/{measurement_id}/unflag", dependencies=[Depends(require_job_request)])
+async def unflag_measurement(
+    measurement_id: uuid.UUID,
+    response: Response,
+    body: FlagInput | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Clear a flag. Appends an event too: the earlier decision stays as history."""
+    return await _flag(session, measurement_id, body, False, response)

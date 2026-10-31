@@ -30,6 +30,7 @@ from identity_records import (
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+from test_pg_migrations import HEAD
 from typer.testing import CliRunner
 
 from app.services import identity_backfill as reconciler
@@ -149,9 +150,8 @@ def test_downgrade_refuses_while_only_the_sightings_have_rows(database_url, alem
         with pytest.raises(RuntimeError, match="raw_source_sightings holds 1 row"):
             command.downgrade(alembic_config, "20261020_0011")
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20261021_0012"
-            )
+            # One transaction: the refused downgrade leaves the database at head.
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
     finally:
         engine.dispose()
 

@@ -6,9 +6,15 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.core.logging import event
+from app.services.backup_status import BackupStatus, read_backup_status
 
 router = APIRouter(tags=["health"])
 logger = logging.getLogger(__name__)
+
+
+@router.get("/health/backup")
+def backup(request: Request) -> BackupStatus:
+    return read_backup_status(request.app.state.settings.backup_status_file)
 
 
 @router.get("/health/live")

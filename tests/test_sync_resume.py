@@ -2,12 +2,15 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from numeric_records import BAD_NUMBERS, numeric_point
+from retrieval_records import BAD_TIMES, START, Client, Runner, point
 from sqlalchemy import func, select
 
 from app.api.sync import _serialize
 from app.core.config import Settings
 from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY
+from app.models.retrieval import RetrievalEvent
 from app.models.state import (
     BackfillJob,
     JobStatus,
@@ -31,16 +34,21 @@ class FakeClient:
         return next(self.pages)
 
 
-async def test_incremental_sync_commits_checkpoint(sessions):
-    client = FakeClient([Page([], "p2"), Page([], None)])
-    service = IncrementalSync(Settings(), sessions, client, {"steps": REGISTRY["steps"]})
-    await service.run("steps")
+@pytest.mark.parametrize("kind, bad", BAD_TIMES)
+@pytest.mark.parametrize("named", [False, True])
+async def test_incremental_sync_commits_checkpoint(sessions, kind, bad, named):
+    records = [point(bad, kind, named=named), point(kind=kind, named=named)]
+    client = FakeClient([Page(records, "p2"), Page([], None)])
+    service = IncrementalSync(Settings(), sessions, client, {kind: REGISTRY[kind]})
+    await service.run(kind)
     async with sessions() as session:
-        state = await session.get(SyncState, "steps")
+        state = await session.get(SyncState, kind)
+        assert sorted(await session.scalars(select(RetrievalEvent.unplaced_count))) == [0, 0, 1]
     assert client.tokens == [None, "p2"]
     assert state.status == JobStatus.completed
     assert state.last_page_token is None
     assert state.last_successful_sync is not None
+    assert state.records_downloaded == len(records)
 
 
 async def test_targeted_historical_sync_does_not_regress_checkpoint(sessions):
@@ -91,10 +99,22 @@ async def test_backfill_resumes_saved_page_token(sessions):
     assert job.status == JobStatus.completed
 
 
-async def test_backfill_failure_does_not_block_other_data_types(sessions):
+@pytest.mark.parametrize("paused", [False, True])
+async def test_backfill_failure_does_not_block_other_data_types(sessions, monkeypatch, paused):
+    from app.google_health import pagination
+
+    monkeypatch.setattr(pagination, "MAX_PAGES_PER_CALL", 2)
+    tokens = []
+    terminal = False
+
     class IsolatedClient:
         async def list_data_points(self, spec, start, end, page_token=None):
             if spec.name == "steps":
+                tokens.append(page_token)
+                if terminal:
+                    return Page([], None)
+                if paused:
+                    return Page([], f"p{len(tokens)}")
                 raise RuntimeError("unavailable scope")
             return Page([], None)
 
@@ -109,7 +129,15 @@ async def test_backfill_failure_does_not_block_other_data_types(sessions):
     async with sessions() as session:
         jobs = (await session.scalars(select(BackfillJob))).all()
     statuses = {job.data_type: job.status for job in jobs}
-    assert statuses == {"steps": JobStatus.failed, "sleep": JobStatus.completed}
+    assert statuses == {
+        "steps": JobStatus.pending if paused else JobStatus.failed,
+        "sleep": JobStatus.completed,
+    }
+    if paused:
+        assert tokens == [None, "p1"]
+        terminal = True
+        assert await service.run(["steps"]) == 1
+        assert tokens == [None, "p1", "p2"]
 
 
 async def test_unfiltered_reference_backfill_creates_only_one_snapshot_job(sessions):
@@ -121,8 +149,10 @@ async def test_unfiltered_reference_backfill_creates_only_one_snapshot_job(sessi
         {"food": REGISTRY["food"]},
     )
 
-    assert await service.ensure_jobs(["food"]) == 1
-    assert await service.ensure_jobs(["food"]) == 0
+    assert await service.run(["food"]) == 1
+    assert await service.run(["food"]) == 0
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(BackfillJob)) == 1
 
 
 def heart_rate(bpm=60):
@@ -224,7 +254,14 @@ async def interrupted_state(sessions, last_success=None):
         )
 
 
-async def test_resume_finishes_old_window_then_fetches_requested_window(sessions):
+@pytest.mark.parametrize("limit", [1, 1000])
+async def test_resume_finishes_old_window_then_fetches_requested_window(
+    sessions, monkeypatch, limit
+):
+    from app.google_health import pagination
+    from app.google_health.pagination import PaginationPaused
+
+    monkeypatch.setattr(pagination, "MAX_PAGES_PER_CALL", limit)
     current = datetime(2026, 8, 18, tzinfo=UTC)
     await interrupted_state(sessions, last_success=current)
     client = RecordingClient(
@@ -235,10 +272,14 @@ async def test_resume_finishes_old_window_then_fetches_requested_window(sessions
     )
     service = IncrementalSync(Settings(), sessions, client, {"heart-rate": REGISTRY["heart-rate"]})
 
+    if limit == 1:
+        with pytest.raises(PaginationPaused):
+            await service.run("heart-rate", NEW_START, NEW_END)
+        assert client.calls == [(OLD_START, OLD_END, "old-page-2")]
     stats = await service.run("heart-rate", NEW_START, NEW_END)
 
     assert client.calls == [(OLD_START, OLD_END, "old-page-2"), (NEW_START, NEW_END, None)]
-    assert stats.inserted == 2
+    assert stats.inserted == (1 if limit == 1 else 2)
     async with sessions() as session:
         names = set(await session.scalars(select(RawHealthData.google_data_point_id)))
         state = await session.get(SyncState, "heart-rate")
@@ -250,6 +291,22 @@ async def test_resume_finishes_old_window_then_fetches_requested_window(sessions
     assert state.last_page_token is None
     assert state.last_requested_from.replace(tzinfo=UTC) == NEW_START
     assert state.last_successful_sync.replace(tzinfo=UTC) == current
+
+
+async def test_pending_first_page_precedes_a_different_requested_window(sessions):
+    await interrupted_state(sessions)
+    async with sessions.begin() as session:
+        state = await session.get(SyncState, "heart-rate")
+        state.status, state.last_page_token = JobStatus.pending, None
+    client = RecordingClient(
+        {
+            OLD_START: {None: Page([], None)},
+            NEW_START: {None: Page([], None)},
+        }
+    )
+    service = IncrementalSync(Settings(), sessions, client, {"heart-rate": REGISTRY["heart-rate"]})
+    await service.run("heart-rate", NEW_START, NEW_END)
+    assert client.calls == [(OLD_START, OLD_END, None), (NEW_START, NEW_END, None)]
 
 
 async def test_webhook_element_completes_only_after_its_own_window(sessions):
@@ -351,3 +408,44 @@ async def test_a_resumed_round_keeps_the_start_of_its_first_page(sessions, monke
     async with sessions() as session:
         row = await session.get(FetchRound, ("sync", "steps"))
     assert row is not None and row.started_at.replace(tzinfo=UTC) == now[0]
+
+
+@pytest.mark.parametrize("lane", ["sync", "backfill"])
+async def test_numeric_failures_commit_receipts_and_advance_pages(sessions, lane, monkeypatch):
+    from app.google_health.capture import CapturedResponse
+    from app.models.health import Weight
+    from app.models.raw_versions import RawApiResponse
+    from app.models.retrieval import RetrievalReceipt
+    from app.parsers.common import canonical_json
+    from app.services import storage
+    from app.sync import backfill, incremental
+
+    records = [numeric_point(value=value) for value in (*BAD_NUMBERS, "9999999999.995", "71000")]
+    body = canonical_json({"dataPoints": records}).encode()
+    response = CapturedResponse(
+        START, lane, None, "weight", "GET", "/synthetic", None, None, 1, 200, {}, body
+    )
+    client = Client(Page(records, "p2", responses=[response]), Page([], None))
+    results = []
+
+    async def storing(*args, **kwargs):
+        stats = await storage.store_page(*args, **kwargs)
+        results.append(stats)
+        return stats
+
+    monkeypatch.setattr(incremental if lane == "sync" else backfill, "store_page", storing)
+    await Runner(sessions, lane, "weight").run(client)
+    assert client.tokens == [None, "p2"]
+    assert sum(s.normalization_skipped for s in results) == len(records) - 1
+    assert sum(s.normalized for s in results) == 1
+    async with sessions() as session:
+        raw = list(await session.scalars(select(RawHealthData)))
+        assert len(raw) == len(records) and all(row.raw_json in records for row in raw)
+        archived = (await session.scalars(select(RawApiResponse))).one()
+        assert archived.body == body and all(row.response_id == archived.id for row in raw)
+        assert len(list(await session.scalars(select(Weight)))) == 1
+        receipt = (await session.scalars(select(RetrievalReceipt))).one()
+        events = list(await session.scalars(select(RetrievalEvent).order_by(RetrievalEvent.id)))
+        assert receipt.lane == lane and [e.kind for e in events] == ["page", "page", "completed"]
+        assert [e.returned_count for e in events] == [len(records), 0, 0]
+        assert all(e.unplaced_count == 0 for e in events)

@@ -6,9 +6,12 @@ const fx = require(path.join(__dirname, '../../frontend/preview/fixtures.cjs'));
 run(async () => {
  const browser = await launch();
  try {
-  for(const width of [1280,390]) {
-   const page=await browser.newPage({viewport:{width,height:900},hasTouch:width===390});
+  for(const [width,height] of [[1280,800],[390,844],[360,640]]) {
+   const page=await browser.newPage({viewport:{width,height},hasTouch:width<=390});
    const errors=[];page.on('pageerror',e=>errors.push(e.message));
+   const noPageScroll=async()=>assert(await page.evaluate(()=>{
+    const root=document.scrollingElement;return root.scrollHeight<=innerHeight&&root.scrollWidth<=innerWidth;
+   }), `${width}x${height}: main page must fit`);
    let saved;
    // Collapsing animates the panel (380 ms); measure the handle only once it has settled.
    const settled=()=>page.waitForFunction(()=>!document.querySelector('#history-panel').getAnimations().length);
@@ -21,6 +24,7 @@ run(async () => {
    });
    await page.goto(BASE);
    await page.waitForFunction(()=>document.querySelectorAll('#history-rows tr').length===7);
+   await noPageScroll();
    const steps=await page.locator('#steps-value').textContent();
    await page.locator('#history-toggle').click();
    await page.waitForFunction(()=>document.querySelector('#history-panel').classList.contains('expanded')&&document.querySelector('#history-status').hidden);
@@ -34,8 +38,15 @@ run(async () => {
    await page.keyboard.press('Escape');await page.waitForFunction(()=>document.querySelectorAll('#history-rows tr').length===7);
    await settled();
    await page.locator('#history-toggle').scrollIntoViewIfNeeded();
+   const initial=await page.locator('#history-panel').boundingBox();
    const box=await page.locator('#history-toggle').boundingBox();
-   await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width/2,box.y+box.height/2-70,{steps:8});await page.mouse.up();
+   await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width/2,box.y+box.height/2-70,{steps:8});
+   const moving=await page.locator('#history-panel').boundingBox();
+   await page.mouse.up();
+   const released=await page.locator('#history-panel').boundingBox();
+   assert(Math.abs(initial.y-70-moving.y)<2, 'History height follows drag distance');
+   assert(Math.abs(moving.height-released.height)<2, 'History retains released height');
+   await noPageScroll();
    await page.waitForFunction(()=>document.querySelector('#history-panel').classList.contains('expanded'));
    await page.keyboard.press('Escape');
    if(width===390){
@@ -50,15 +61,17 @@ run(async () => {
     await page.keyboard.press('Escape');await cdp.detach();
    }
    await page.locator('[data-page="sports"]').click();
-   await page.waitForFunction(()=>document.querySelectorAll('#workout-rows tr').length===1);
+   await page.waitForFunction(()=>document.querySelectorAll('.workout-entry').length===1);
+   await noPageScroll();
    await page.locator('#workout-add').click();
+   await noPageScroll();
    await page.locator('[name="exercise_type"]').fill('Bisiklet');
    await page.locator('[name="start_time"]').fill('2026-09-29T10:00');await page.locator('[name="end_time"]').fill('2026-09-29T11:00');
    await page.locator('[name="distance_km"]').fill('5');await page.locator('#workout-save').click();
    await page.waitForFunction(()=>!document.querySelector('#workout-editor').open);
    assert.equal(saved.distance_meters,5000);assert.equal(saved.exercise_type,'Bisiklet');
    await page.screenshot({path:shot(`workouts-${width}.png`),fullPage:true});
-   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+   await noPageScroll();
    assert.deepEqual(errors,[]);console.log(`PASS ${width}: weekly/month, month selector/CSV, drag/Escape, sports/manual form`);
    await page.close();
   }

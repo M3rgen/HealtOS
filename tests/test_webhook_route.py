@@ -1,17 +1,22 @@
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from sqlalchemy import func, select
 
 from app.api import webhooks
 from app.core.config import Settings
+from app.core.request_limits import WriteLimits
 from app.google_health.data_types import REGISTRY
-from app.models.state import OAuthToken, WebhookEvent, WebhookNotification
+from app.models.state import OAuthToken, WebhookBatchItem, WebhookEvent, WebhookNotification
+from app.parsers.common import payload_hash
 from app.services.webhook_processing import WebhookBatchProcessor
+from app.services.webhook_status import WebhookStatusService
 
 
 class Verifier:
@@ -30,7 +35,7 @@ class Incremental:
         self.calls = []
         self.fail_once = set(fail_once)
 
-    async def run(self, data_type, start=None, end=None):
+    async def run(self, data_type, start=None, end=None, *, check_owner=None):
         self.calls.append((data_type, start, end))
         if data_type in self.fail_once:
             self.fail_once.remove(data_type)
@@ -80,7 +85,9 @@ async def make_client(sessions, incremental=None):
         webhook_verifier=verifier,
         webhook_processor=processor,
         spawn=spawn,
+        webhook_status=WebhookStatusService(application.state.settings, sessions),
     )
+    application.state.write_limits = WriteLimits(application.state.settings)
     application.include_router(webhooks.router)
     transport = httpx.ASGITransport(app=application)
     client = httpx.AsyncClient(transport=transport, base_url="http://test")
@@ -299,7 +306,7 @@ class GatedIncremental(Incremental):
         self.entered = asyncio.Event()
         self.gate = asyncio.Event()
 
-    async def run(self, data_type, start=None, end=None):
+    async def run(self, data_type, start=None, end=None, *, check_owner=None):
         self.calls.append((data_type, start, end))
         self.entered.set()
         await self.gate.wait()
@@ -332,3 +339,113 @@ async def test_element_locks_serialize_work_and_are_dropped_when_idle(sessions):
     # The queued call saw the completed element instead of syncing it again.
     assert len(incremental.calls) == 1
     assert processor._element_locks == {}
+
+
+@pytest.mark.parametrize(
+    "field,column,limit",
+    [
+        ("dataType", "data_type", 128),
+        ("healthUserId", "health_user_id", 128),
+        ("operation", "operation", 32),
+    ],
+)
+@pytest.mark.parametrize("bad", [{}, [], 42, False, None, "", "ğ" * 129])
+@pytest.mark.parametrize("shape", ["object", "array", "mixed"])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_unusable_metadata_is_rejected_without_rolling_back_batch(
+    sessions, field, column, limit, bad, shape, legacy
+):
+    client, verifier, incremental, processor, tasks = await make_client(sessions)
+    invalid = notification()
+    # Exercise exactly one character past each destination's limit.
+    bad = bad[: limit + 1] if isinstance(bad, str) and bad else bad
+    invalid["data"][field] = bad
+    payload = invalid if shape == "object" else [invalid]
+    if shape == "mixed":
+        payload.append(notification(minute=2))
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode() + b"\n"
+    async with client:
+        if legacy:
+            digest = hashlib.sha256(raw).hexdigest()
+            verified = datetime(2026, 10, 1, tzinfo=UTC)
+            async with sessions.begin() as session:
+                session.add(
+                    WebhookEvent(
+                        payload_hash=digest,
+                        raw_json=payload,
+                        raw_body=raw,
+                        signature_verified_at=verified,
+                        last_error="preserved legacy error",
+                    )
+                )
+            result = await processor.prepare_existing_batch(digest)
+            async with sessions() as session:
+                stored = await session.get(WebhookEvent, digest)
+                assert stored.last_error == "preserved legacy error"
+                assert stored.signature_verified_at.replace(tzinfo=UTC) == verified
+            await processor.process_batch(result.batch_hash)
+            await processor.prepare_existing_batch(digest)
+            await processor.process_batch(digest)
+        else:
+            for _ in range(2):
+                response = await client.post(
+                    "/webhooks/google-health",
+                    content=raw,
+                    headers={
+                        "Authorization": "Bearer local-test",
+                        "GOOGLE-HEALTH-API-SIGNATURE": "signed",
+                    },
+                )
+                assert response.status_code == 204
+                await finish(tasks)
+            assert verifier.bodies == [raw, raw]
+    async with sessions() as session:
+        batch = await session.scalar(select(WebhookEvent))
+        element = await session.get(WebhookNotification, payload_hash(invalid))
+        members = (
+            await session.scalars(select(WebhookBatchItem).order_by(WebhookBatchItem.ordinal))
+        ).all()
+    assert batch.raw_json == payload and batch.raw_body == raw
+    assert batch.element_count == len(members) == (2 if shape == "mixed" else 1)
+    items = payload if isinstance(payload, list) else [payload]
+    assert [(m.batch_hash, m.ordinal, m.element_hash) for m in members] == [
+        (batch.payload_hash, n, payload_hash(item)) for n, item in enumerate(items, 1)
+    ]
+    assert batch.failure_count == 1 and batch.processed_at is not None
+    assert getattr(batch, column) is None and getattr(element, column) is None
+    assert element.raw_json == invalid and element.raw_json["data"][field] == bad
+    assert element.status == "rejected" and not element.is_valid
+    reason = (
+        f"must be at most {limit} characters"
+        if isinstance(bad, str) and bad
+        else "must be a non-empty string"
+    )
+    assert element.validation_error == f"notification {field} {reason}"
+    assert element.attempt_count == element.sync_attempt_count == element.sync_success_count == 0
+    assert len(incremental.calls) == (1 if shape == "mixed" else 0)
+
+
+async def test_metadata_column_boundaries_are_accepted(sessions):
+    client, _, incremental, processor, tasks = await make_client(sessions)
+    data_type, user, operation = "ğ" * 128, "ü" * 128, "İ" * 32
+    incremental.specs = {data_type: REGISTRY["steps"]}
+    processor.supported_data_types = {data_type}
+    async with sessions.begin() as session:
+        token = await session.get(OAuthToken, "me")
+        token.health_user_id = user
+    item = notification(data_type, user)
+    item["data"]["operation"] = operation
+    async with client:
+        response, _ = await post_signed(client, item)
+        await finish(tasks)
+    assert response.status_code == 204
+    async with sessions() as session:
+        for model in (WebhookEvent, WebhookNotification):
+            row = await session.scalar(select(model))
+            assert (row.data_type, row.health_user_id, row.operation) == (
+                data_type,
+                user,
+                operation,
+            )
+        assert row.is_valid and row.status == "completed"
+    assert [call[0] for call in incremental.calls] == [data_type]

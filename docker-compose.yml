@@ -9,6 +9,11 @@ services:
   postgres:
     image: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      # The root entrypoint fixes ownership before switching to postgres.
+      - /var/run/postgresql:rw,nosuid,nodev,noexec,mode=3775
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
     environment:
       POSTGRES_DB: health
       POSTGRES_USER: health
@@ -27,8 +32,6 @@ services:
       - SETUID
     security_opt:
       - no-new-privileges:true
-    # read_only is not enabled yet: the image writes /var/run/postgresql and /tmp
-    # and has not been verified here with a read-only root plus tmpfs mounts.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U health -d health"]
       interval: 5s
@@ -60,6 +63,19 @@ services:
       RECONCILIATION_ENABLED: ${RECONCILIATION_ENABLED:-true}
       WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
       IDENTITY_RECONCILE_ENABLED: ${IDENTITY_RECONCILE_ENABLED:-true}
+      BACKUP_STATUS_FILE: /run/healthos-backup/status.json
+    volumes:
+      # Mount the directory, not an inode replaced atomically by backup.sh.
+      # Never mount BACKUP_HOST_DIR or encryption keys into the app.
+      # Long syntax does not create a missing source; without create_host_path an
+      # updated VM without the directory would fail `up`. Docker then creates it
+      # root-owned, which the root backup timer can still write (docs/RUNBOOK.md).
+      - type: bind
+        source: ${BACKUP_STATUS_HOST_DIR:-./backup-status}
+        target: /run/healthos-backup
+        read_only: true
+        bind:
+          create_host_path: true
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     extra_hosts:

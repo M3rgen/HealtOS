@@ -1,16 +1,68 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import date, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_job_request
 from app.api.deps import runtime as runtime_dep
+from app.api.deps import settings as settings_dep
+from app.core.config import Settings
 from app.db.session import get_session
+from app.google_health.data_types import supported_data_types
 from app.models.state import SyncState
+from app.services.reconciliation_reports import list_runs
+from app.services.retrieval_coverage import MAX_DAYS, CoverageLimit, coverage_report
 from app.services.runtime import Runtime
 
 router = APIRouter(prefix="/sync", tags=["sync"])
+coverage_router = APIRouter(tags=["sync"])
+
+
+@coverage_router.get("/api/sync/reconciliation")
+async def reconciliation_history(
+    offset: int = Query(0, ge=0, le=10000),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    return await list_runs(session, offset, limit)
+
+
+@coverage_router.get("/api/sync/coverage")
+async def coverage(
+    start_date: date,
+    end_date: date,
+    timezone: str = Query(..., min_length=1, max_length=100),
+    data_type: str | None = Query(None, max_length=100),
+    offset: int = Query(0, ge=0, le=1000),
+    limit: int = Query(4, ge=1, le=4),
+    session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    specs = supported_data_types(settings.extra_data_types)
+    if (
+        not 1 <= (end_date - start_date).days + 1 <= MAX_DAYS
+        or start_date < date.min + timedelta(days=3)
+        or end_date > date.max - timedelta(days=3)
+    ):
+        raise HTTPException(422, {"code": "coverage_invalid_range", "max_days": MAX_DAYS})
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(422, {"code": "coverage_invalid_timezone"}) from None
+    if data_type is not None and data_type not in specs:
+        raise HTTPException(422, {"code": "coverage_unknown_data_type", "accepted": sorted(specs)})
+    try:
+        return await coverage_report(
+            session, specs, start_date, end_date, timezone, data_type, offset, limit
+        )
+    except CoverageLimit as exc:
+        raise HTTPException(
+            413, {"code": str(exc), "hint": "Tarih aralığını veya limit değerini azalt."}
+        ) from None
 
 
 def _serialize(item: SyncState, runtime: Runtime) -> dict:

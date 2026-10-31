@@ -37,6 +37,27 @@ Nothing listens publicly: the router needs no port forwarding, and the VM's fire
 allow SSH from your management network plus outbound HTTPS/DNS. The `caddy` service in the `webhook`
 profile is an alternative that needs inbound ports 80/443; this guide does not use it.
 
+The `app` and `postgres` root filesystems are read-only and both enable
+`no-new-privileges`. The app writes temporary files only to its `/tmp` tmpfs.
+PostgreSQL persists data at the unchanged `postgres_data:/var/lib/postgresql/data`
+named volume; `/tmp` (mode `1777`) and `/var/run/postgresql` (mode `3775`) are
+writable tmpfs mounts. Its root entrypoint still fixes ownership and switches to
+the postgres user; no fixed `user` override is needed. Temporary files and sockets
+disappear when the container is recreated; database data remains in the volume.
+
+**Docker verification remains with the maintainer.** Run `make compose-smoke` on a
+Docker host with bash and age (plus age-keygen) or gpg. The drill pins the production
+Compose file to a randomly named isolated project with synthetic credentials and
+data. It checks empty-volume startup, both services' runtime protections and tmpfs
+write permissions, persistence after PostgreSQL restart and container recreation
+using the existing volume, then the existing encrypted backup/restore and migration
+checks. During backup/comparison the app is stopped so synthetic data cannot change;
+every public base table must have equal row counts. The drill also checks protected
+backup health, atomic metadata updates and success → failure → app recreation.
+It removes only its own project volumes and throwaway backup/status artifacts.
+It must not be redirected to the production project or database. The server runner
+cannot run `docker compose config`, `scripts/verify_compose.py` or `tests/integration`.
+
 ## 1. Prepare the VM
 
 A current Debian release with a few GB of disk beyond the archive itself is enough. Install Docker
@@ -44,7 +65,7 @@ Engine and the Compose plugin with [Docker's Debian instructions](https://docs.d
 then the tools the scripts use:
 
 ```sh
-sudo apt install git age        # age encrypts backups; gpg works as a fallback
+sudo apt install git age python3  # Python 3.11+ publishes backup metadata; age encrypts
 sudo systemctl enable --now docker
 docker compose version
 ```
@@ -100,6 +121,7 @@ restored database is useless for Google access without the same encryption key.
 ## 4. Start the stack
 
 ```sh
+install -d -m 755 backup-status  # host owns metadata; do this before Compose creates the mount
 docker compose up -d --build
 docker compose ps                               # app and postgres become "healthy"
 curl -fsS http://127.0.0.1:8000/health/live     # liveness, no token needed
@@ -108,6 +130,10 @@ curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/health
 ```
 
 The app runs `alembic upgrade head` on every start, so a fresh database is migrated automatically.
+Migration `20261031_0021` cannot run while a `pg_dump` is in progress, so update outside the
+nightly backup window (the backup timer runs daily around 03:30). If they overlap, the start
+fails after about 30 seconds and, through the restart policy, succeeds once the backup has
+finished; no data is changed ([runbook](RUNBOOK.md)).
 Until Google is linked and the webhook prerequisites (including `GOOGLE_CLOUD_PROJECT_NUMBER`)
 are complete, `/health` is not `healthy` and lists reasons such as `configuration_incomplete`; that
 is expected at this point. Logs: `docker compose logs -f app` (JSON lines, rotated
@@ -199,6 +225,16 @@ password manager, not only on the VM: without it no backup can be read.** Withou
 file switches the script to `gpg --symmetric`. Prove a backup with the restore drill in the
 [runbook](RUNBOOK.md#backup-verify-and-restore-drill); details are in the
 [backup reference](REFERENCE.md#database-backup-and-restore).
+
+Backup health uses a separate `BACKUP_STATUS_HOST_DIR` (default `./backup-status`),
+containing only `status.json` and a writer lock. The host needs Python 3.11+ (stdlib
+only). Step 4 creates it before first Compose startup so Docker does not own it as root.
+If customized, use the same absolute directory for Compose and the backup timer;
+keep it separate from keys and `BACKUP_HOST_DIR`. Compose mounts this **directory**
+read-only at `/run/healthos-backup`; `BACKUP_STATUS_FILE` points to its `status.json`.
+Directory mounting makes atomic replacements visible without recreating the app.
+Metadata files are mode 644; private backup artifacts and the legacy detailed status
+remain outside the container. Never put keys or backup contents in the metadata directory.
 
 ## 9. Optional: the Umay bridge
 

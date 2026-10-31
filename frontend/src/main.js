@@ -1,13 +1,20 @@
 import './style.css';
 import { renderIcons, iconMarkup } from './icons.js';
+import { setupMeasurements } from './measurements.js';
+import { setupProfileValues } from './profile-values.js';
+import { focusVisible, replaceWithFocus } from './accessibility.js';
 import { setupChat } from './chat.js';
 import { setupMetricHistory } from './metric-history.js';
 import { setupCalendar } from './calendar.js';
 import { setupHistoryPanel } from './history-panel.js';
 import { setupWorkouts } from './workouts.js';
+import { flagCells, isTest, setupMeasurementFlags } from './measurement-flags.js';
 import { setupAppearance } from './appearance.js';
 import { request, handleUnauthorized } from './api.js';
 import { describeSyncError } from './sync-errors.js';
+import { setupCoverage } from './coverage.js';
+import { setupWebhookStatus } from './webhook-status.js';
+import { setupBodyLoader } from './body-loader.js';
 
 renderIcons();
 setupAppearance();
@@ -77,18 +84,7 @@ if (![...$('timezone').options].some(option => option.value === zoneChoice))
   $('timezone').add(new Option(zoneChoice, zoneChoice));
 $('timezone').value = zoneChoice;
 $('model-motion').checked = motion;
-// three.js and the body viewer load in their own chunk; the static silhouette in #body-model shows meanwhile.
-let body = null,
-  bodyMetrics = null;
-import('./body.js')
-  .then(({ createBody }) => {
-    body = createBody($('body-model'), $('model-motion').checked);
-    if (bodyMetrics) body.setBodyMetrics(bodyMetrics);
-    updateMotion();
-  })
-  .catch(() => {
-    $('body-model').dataset.modelFailed = 'true';
-  });
+const body = setupBodyLoader($('body-model'), { getMotion: () => $('model-motion').checked });
 const shortDate = value =>
   new Intl.DateTimeFormat('tr-TR', { timeZone: zone, day: 'numeric', month: 'short' }).format(new Date(value));
 const fullDate = value =>
@@ -179,12 +175,6 @@ function paintHealth() {
         ? `${shortDate(health.latest_health_write)} ${timeOf(health.latest_health_write)}`
         : '—',
     ],
-    [
-      'Son Google bildirimi',
-      health.last_webhook_received
-        ? `${fullDate(health.last_webhook_received)} ${timeOf(health.last_webhook_received)}`
-        : 'Henüz bildirim alınmadı',
-    ],
     ['Bildirim hataları', num(health.failed_notifications ?? 0)],
     ['Eşitleme hataları', num(health.failed_syncs ?? 0)],
     ['Geciken veri türleri', num(health.stale_streams?.length ?? 0)],
@@ -248,22 +238,17 @@ function line(values) {
       '',
     )}<path d="M${last[0]},${last[1]}h0" ${stroke} stroke-width="11" opacity=".22"/><path d="M${last[0]},${last[1]}h0" ${stroke} stroke-width="5.5"/></svg>`;
 }
+const profileValues = setupProfileValues({ metrics, iconMarkup, num, shortDate });
 function paintData() {
   const first = data.days[0];
-  $('profile-values').innerHTML = Object.entries(metrics)
-    .map(([key, [label, unit]]) => {
-      const item = data.profile[key];
-      return `<div class="measurement"><label><span class="measure-icon">${iconMarkup(key)}</span>${label}</label><button data-metric="${key}" aria-label="${label} için manuel ölçüm ekle">${item ? `${num(item.value, 1)} ${unit}` : '—'}</button><small>${item ? escape(shortDate(item.measured_at)) : key === 'muscle' ? 'Yalnız elle girilir' : 'Henüz ölçüm yok'}</small></div>`;
-    })
-    .join('');
+  profileValues.update(data.profile);
   // Drive the 3D body's morphs from the latest profile measurements (missing values keep the basis).
-  bodyMetrics = {
+  body.setBodyMetrics({
     heightCm: data.profile.height?.value,
     weightKg: data.profile.weight?.value,
     bodyFatPct: data.profile.body_fat?.value,
     musclePct: data.profile.muscle?.value,
-  };
-  body?.setBodyMetrics(bodyMetrics);
+  });
   $('steps-label').textContent = first.partial ? 'Bugünkü adım' : 'O günkü adım';
   $('sleep-label').textContent = first.partial ? 'Dün geceki uyku' : 'O geceki uyku';
   $('steps-value').textContent = num(first.steps);
@@ -361,21 +346,24 @@ async function refresh() {
 async function loadMeasurements() {
   try {
     const rows = await request('/api/dashboard/measurements');
-    $('measurement-rows').innerHTML = rows.length
-      ? rows
-          .map(
-            row => {
-              const [label, unit] = metrics[row.metric] ?? [row.metric ?? '?', ''];
-              return `<tr><td>${escape(fullDate(row.measured_at))} ${escape(timeOf(row.measured_at))}</td><td><span class="cell-icon">${iconMarkup(row.metric)}</span>${escape(label)}</td><td>${num(row.value, 2)} ${escape(unit)}</td><td>Manuel</td></tr>`;
-            },
-          )
-          .join('')
-      : '<tr><td colspan="4">Henüz elle girilmiş ölçüm yok. “Ölçüm ekle” ile başlayabilirsin.</td></tr>';
+    const container = $('measurement-rows');
+    replaceWithFocus(container, () => {
+      container.innerHTML = rows.length
+        ? rows.map(row => {
+            const [label, unit] = metrics[row.metric] ?? [row.metric ?? '?', ''];
+            const when = `${fullDate(row.measured_at)} ${timeOf(row.measured_at)}`;
+            return `<tr${isTest(row) ? ' class="flagged-row"' : ''}><td>${escape(when)}</td><td><span class="cell-icon">${iconMarkup(row.metric)}</span>${escape(label)}</td><td>${num(row.value, 2)} ${escape(unit)}</td>${flagCells(row, label, when, escape)}</tr>`;
+          }).join('')
+        : '<tr><td colspan="5">Henüz elle girilmiş ölçüm yok. “Ölçüm ekle” ile başlayabilirsin.</td></tr>';
+    }, old => container.querySelector(`[data-flag-id="${CSS.escape(old.dataset.flagId)}"]`), $('measurements-add'));
   } catch {
     notice('Ölçüm geçmişi alınamadı. Tekrar dene.', true);
   }
 }
+setupMeasurementFlags({ request, notice, reload: () => refresh().then(loadMeasurements) });
 async function loadSystem() {
+  coveragePanel.refresh();
+  webhookPanel.refresh();
   try {
     const rows = await request('/sync/status');
     $('sync-rows').innerHTML = rows.length
@@ -391,80 +379,30 @@ async function loadSystem() {
   }
 }
 function setPage(page) {
+  $('date-calendar').hidePopover();
   activePage = page;
   document.querySelectorAll('.page').forEach(el => (el.hidden = el.id !== page));
+  body.updateMotion();
   document.querySelectorAll('[data-page]').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
     if (el.dataset.page === page) el.setAttribute('aria-current', 'page');
     else el.removeAttribute('aria-current');
   });
+  focusVisible(document.querySelector(`[data-page="${page}"]`));
   if (page === 'measurements') loadMeasurements();
   if (page === 'system') loadSystem();
   if (page === 'sports') workouts.update();
 }
 document.querySelectorAll('[data-page]').forEach(el => el.addEventListener('click', () => setPage(el.dataset.page)));
-function setBounds() {
-  const key = $('measurement-metric').value;
-  const [min, max] = { height: [30, 260], weight: [1, 500], body_fat: [0, 100], muscle: [0, 100] }[key];
-  $('measurement-value').min = min;
-  $('measurement-value').max = max;
-}
-function openMeasurement(metric = 'weight') {
-  $('measurement-form').reset();
-  $('form-error').textContent = '';
-  $('measurement-metric').value = metric;
-  const local = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-  $('measurement-date').value = local;
-  $('measurement-date').max = local;
-  $('input-timezone').textContent = `Girdiğin saat ${Intl.DateTimeFormat().resolvedOptions().timeZone} saat diliminde kaydedilir.`;
-  if (data?.profile[metric]) $('measurement-value').value = data.profile[metric].value;
-  setBounds();
-  $('measurement-dialog').showModal();
-  $('measurement-value').focus();
-}
-$('add-measurement').addEventListener('click', () => openMeasurement());
-$('measurements-add').addEventListener('click', () => openMeasurement());
-$('profile-values').addEventListener('click', event => {
-  const el = event.target.closest('[data-metric]');
-  if (el) openMeasurement(el.dataset.metric);
-});
-['measurement-close', 'measurement-cancel'].forEach(id =>
-  $(id).addEventListener('click', () => $('measurement-dialog').close()),
-);
-$('measurement-metric').addEventListener('change', () => {
-  setBounds();
-  $('measurement-value').value = data?.profile[$('measurement-metric').value]?.value ?? '';
-});
-$('measurement-form').addEventListener('submit', async event => {
-  event.preventDefault();
-  $('measurement-save').disabled = true;
-  $('form-error').textContent = '';
-  try {
-    await request('/api/dashboard/measurements', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-HealthOS-Request': '1' },
-      body: JSON.stringify({
-        metric: $('measurement-metric').value,
-        value: $('measurement-value').value,
-        measured_at: new Date($('measurement-date').value).toISOString(),
-      }),
-    });
-    $('measurement-dialog').close();
-    notice('Ölçüm kaydedildi.');
-    await refresh();
-    if (activePage === 'measurements') await loadMeasurements();
-  } catch (error) {
-    $('form-error').textContent = error.message;
-  } finally {
-    $('measurement-save').disabled = false;
-  }
+setupMeasurements({ request, getProfile: () => data?.profile, notice,
+  onSaved: async () => { await refresh(); if (activePage === 'measurements') await loadMeasurements(); },
 });
 let syncing = false;
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 function syncBusy(on) {
   syncing = on;
   const button = $('sync-button');
-  button.disabled = on;
+  button.setAttribute('aria-disabled', String(on));
   button.classList.toggle('syncing', on);
   button.setAttribute('aria-busy', String(on));
   button.lastElementChild.textContent = on ? 'Eşitleniyor…' : 'Şimdi eşitle';
@@ -550,15 +488,10 @@ $('timezone').addEventListener('change', async () => {
   if (activePage === 'system') await loadSystem();
   if (activePage === 'sports') await workouts.update();
 });
-function updateMotion() {
-  body?.setMotion($('model-motion').checked);
-}
 $('model-motion').addEventListener('change', () => {
   writePreference('healtos.motion', String($('model-motion').checked));
-  updateMotion();
+  body.updateMotion();
 });
-matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', updateMotion);
-updateMotion();
 setupChat(() => zone);
 setupMetricHistory(() => zone);
 const calendar = setupCalendar({
@@ -580,6 +513,8 @@ const workouts = setupWorkouts({
   fullDate,
   timeOf,
 });
+const coveragePanel = setupCoverage({ request, getZone: () => zone, getToday: today, escape });
+const webhookPanel = setupWebhookStatus({ request, getZone: () => zone });
 await refresh();
 poll = setInterval(async () => {
   if (!document.hidden && !$('measurement-dialog').open) {

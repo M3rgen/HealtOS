@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import Settings
@@ -13,24 +16,25 @@ from app.core.provenance import current_context_id, new_context_id, provenance
 from app.core.timeutil import as_utc
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import DataTypeSpec
-from app.google_health.pagination import iter_pages
+from app.google_health.pagination import PageBudget, PaginationPaused, iter_pages
 from app.models.state import JobStatus, SyncState, fetch_round_start
+from app.services.reconciliation_reports import record_changes, reporting
+from app.services.retrieval import ReceiptWriter
 from app.services.storage import StoreStats, store_page
 from app.sync.checkpoints import incremental_start
 from app.sync.deletions import mark_source_deletions
-from app.sync.errors import error_code, error_summary
+from app.sync.errors import error_code, error_summary, is_transient
+from app.sync.ownership import CheckedSessions, OwnershipLost, run_ownership
 
 logger = logging.getLogger(__name__)
 
 INTERRUPTED_ERROR = "process restarted"
-# A run refreshes SyncState.updated_at on every page, so a `running` row untouched for this
-# long has no live owner. A fresher one may belong to another live process (`healthos sync`
-# in a separate container) and must not be failed underneath it.
+# Heartbeat age selects recovery candidates; ownership decides whether they are abandoned.
 STALE_RUNNING_AFTER = timedelta(minutes=15)
 
 
 def stale_running_cutoff(now: datetime | None = None) -> datetime:
-    """`running` rows last updated before this instant are treated as abandoned."""
+    """`running` rows last updated before this instant are candidates for recovery."""
     return (now or datetime.now(UTC)) - STALE_RUNNING_AFTER
 
 
@@ -46,28 +50,41 @@ class IncrementalSync:
         self.sessions = sessions
         self.client = client
         self.specs = specs
-        self._locks: dict[str, asyncio.Lock] = {}
         # In-memory per-run outcomes so clients can tell when a run they started has finished.
         self.sequence = 0
         self.last_runs: dict[str, dict] = {}
 
     async def recover_interrupted(self, now: datetime | None = None) -> int:
-        """Fail sync states left `running` by a process that died mid-run.
+        """Fail stale states only when no run still owns the data type.
 
-        Only rows without a heartbeat for STALE_RUNNING_AFTER count: a fresher row may be
-        a live run in another process. Called at startup and once more after that grace
-        period. The saved page token is kept, so the next run resumes the window.
+        Recheck the heartbeat under nonblocking run ownership. Keep the durable page
+        token so a later invocation can finish the interrupted window first.
         """
-        async with self.sessions.begin() as session:
-            result = await session.execute(
-                update(SyncState)
-                .where(
-                    SyncState.status == JobStatus.running,
-                    SyncState.updated_at < stale_running_cutoff(now),
+        cutoff = stale_running_cutoff(now)
+        async with self.sessions() as session:
+            candidates = list(
+                await session.scalars(
+                    select(SyncState.data_type).where(
+                        SyncState.status == JobStatus.running, SyncState.updated_at < cutoff
+                    )
                 )
-                .values(status=JobStatus.failed, last_error=INTERRUPTED_ERROR)
             )
-        recovered = result.rowcount or 0
+        recovered = 0
+        for data_type in candidates:
+            async with run_ownership(self.sessions, data_type, wait=False) as sessions:
+                if sessions is None:
+                    continue
+                async with sessions.begin() as session:
+                    result = await session.execute(
+                        update(SyncState)
+                        .where(
+                            SyncState.data_type == data_type,
+                            SyncState.status == JobStatus.running,
+                            SyncState.updated_at < cutoff,
+                        )
+                        .values(status=JobStatus.failed, last_error=INTERRUPTED_ERROR)
+                    )
+                recovered += cast(CursorResult[Any], result).rowcount or 0
         if recovered:
             event(logger, "SYNC_STATE_RECOVERED", count=recovered)
         return recovered
@@ -86,6 +103,8 @@ class IncrementalSync:
         data_type: str,
         requested_start: datetime | None = None,
         requested_end: datetime | None = None,
+        *,
+        check_owner: Callable[[], Awaitable[None]] | None = None,
     ) -> StoreStats:
         """Fetch a window; an interrupted earlier window is finished first.
 
@@ -96,20 +115,24 @@ class IncrementalSync:
         run id (webhook element, reconciliation) or a new ``sync:<uuid>``.
         """
         with provenance(context_id=current_context_id() or new_context_id("sync")):
-            return await self._run(data_type, requested_start, requested_end)
+            return await self._run(data_type, requested_start, requested_end, check_owner)
 
     async def _run(
         self,
         data_type: str,
         requested_start: datetime | None,
         requested_end: datetime | None,
+        check_owner: Callable[[], Awaitable[None]] | None = None,
     ) -> StoreStats:
         if data_type not in self.specs:
             raise ValueError(f"Unsupported data type: {data_type}")
-        async with self._locks.setdefault(data_type, asyncio.Lock()):
+        async with run_ownership(self.sessions, data_type) as sessions:
+            assert sessions is not None  # A waiting acquisition always owns the run.
+            if check_owner is not None:
+                sessions = CheckedSessions(sessions, check_owner)
             spec = self.specs[data_type]
             request_end = requested_end or datetime.now(UTC)
-            async with self.sessions.begin() as session:
+            async with sessions.begin() as session:
                 state = await session.scalar(
                     select(SyncState).where(SyncState.data_type == data_type)
                 )
@@ -117,7 +140,13 @@ class IncrementalSync:
                     state = SyncState(data_type=data_type)
                     session.add(state)
                 rounds: list[tuple[datetime, datetime, str | None]] = []
-                if state.last_page_token and state.last_requested_from and state.last_requested_to:
+                # Finishing a foreign checkpoint can leave no budget for this window's
+                # first page. Its pending range must still precede the next caller's.
+                if (
+                    (state.last_page_token or state.status == JobStatus.pending)
+                    and state.last_requested_from
+                    and state.last_requested_to
+                ):
                     rounds.append(
                         (
                             as_utc(state.last_requested_from),
@@ -143,13 +172,28 @@ class IncrementalSync:
                 resumed=rounds[0][2] is not None,
             )
             total = StoreStats()
+            budget = PageBudget()
             try:
                 for round_start, round_end, page_token in rounds:
-                    await self._fetch_round(
-                        spec, round_start, round_end, page_token, total, data_type
+                    # Finish a foreign checkpoint without attributing its differences to
+                    # this reconciliation's requested range. Keep the public stats contract.
+                    scope = (
+                        nullcontext() if (round_start, round_end) == requested else reporting(None)
                     )
-                async with self.sessions.begin() as session:
+                    with scope:
+                        await self._fetch_round(
+                            spec,
+                            round_start,
+                            round_end,
+                            page_token,
+                            total,
+                            data_type,
+                            sessions,
+                            budget,
+                        )
+                async with sessions.begin() as session:
                     state = await session.get(SyncState, data_type)
+                    assert state is not None
                     state.status = JobStatus.completed
                     state.last_error = None
                 self._finish(data_type, total, failed=False)
@@ -160,11 +204,27 @@ class IncrementalSync:
                     records=total.inserted + total.updated,
                 )
                 return total
-            except Exception as exc:
-                async with self.sessions.begin() as session:
+            except PaginationPaused:
+                async with sessions.begin() as session:
                     state = await session.get(SyncState, data_type)
-                    state.status = JobStatus.failed
-                    state.last_error = error_summary(exc)
+                    assert state is not None
+                    state.status = JobStatus.pending
+                    state.last_error = None
+                # Preserve the existing outcome contract: an incomplete invocation is
+                # never reported as success, even though its pages committed normally.
+                self._finish(data_type, total, failed=True)
+                event(logger, "SYNC_PAUSED", data_type=data_type)
+                raise
+            except Exception as exc:
+                try:
+                    async with sessions.begin() as session:
+                        state = await session.get(SyncState, data_type)
+                        assert state is not None
+                        state.status = JobStatus.failed
+                        state.last_error = error_summary(exc)
+                except OwnershipLost:
+                    # A replacement owner may already be resuming; never fail its state.
+                    pass
                 self._finish(data_type, total, failed=True)
                 event(
                     logger,
@@ -172,6 +232,7 @@ class IncrementalSync:
                     data_type=data_type,
                     error_type=type(exc).__name__,
                     error_code=error_code(exc),
+                    transient=is_transient(exc),
                 )
                 raise
 
@@ -183,37 +244,93 @@ class IncrementalSync:
         page_token: str | None,
         total: StoreStats,
         data_type: str,
+        sessions,
+        budget: PageBudget,
     ) -> None:
-        async with self.sessions.begin() as session:
+        async with sessions.begin() as session:
             state = await session.get(SyncState, data_type)
             state.last_requested_from = start
             state.last_requested_to = end
             state.last_page_token = page_token
-            # A resumed round keeps the time its first page was fetched: "seen in this
-            # fetch" always means since the round's real start.
-            round_started = as_utc(
-                await fetch_round_start(
-                    session, "sync", data_type, fresh=page_token is None, now=datetime.now(UTC)
+            # A spent budget only records this range as pending: no fetch start or
+            # receipt is begun for a round that cannot request its first page.
+            paused = budget.remaining <= 0
+            if not paused:
+                # A resumed round keeps the time its first page was fetched: "seen in
+                # this fetch" always means since the round's real start.
+                round_started = as_utc(
+                    await fetch_round_start(
+                        session, "sync", data_type, fresh=page_token is None, now=datetime.now(UTC)
+                    )
                 )
-            )
+        if paused:
+            raise PaginationPaused("Google Health page budget exhausted")
         # Only a fetch that starts at the first page sees the whole window, so only
         # then can records that stopped appearing be marked as deleted at the source.
         fetched_since = round_started if page_token is None else None
-        async for page in iter_pages(self.client, spec, start, end, page_token):
+        receipt = ReceiptWriter(sessions, spec, start, end, "sync", data_type, page_token)
+        await receipt.begin()
+        try:
+            await self._store_round(
+                spec,
+                start,
+                end,
+                page_token,
+                total,
+                data_type,
+                round_started,
+                fetched_since,
+                receipt,
+                sessions,
+                budget,
+            )
+        except BaseException as failure:
+            await receipt.failure(failure)
+            raise
+
+    async def _store_round(
+        self,
+        spec,
+        start,
+        end,
+        page_token,
+        total,
+        data_type,
+        round_started,
+        fetched_since,
+        receipt,
+        sessions,
+        budget,
+    ) -> None:
+        async def restart() -> None:
+            nonlocal round_started, fetched_since
+            round_started = await receipt.reset()
+            # Even a saved-token continuation now fetches the entire window. Only
+            # sightings since this new attempt can prevent source-deletion marks.
+            fetched_since = round_started
+
+        async for page in iter_pages(
+            self.client, spec, start, end, page_token, on_reset=restart, budget=budget
+        ):
             try:
-                async with self.sessions.begin() as session:
-                    total.add(await store_page(session, spec, page, fetch_started=round_started))
+                async with sessions.begin() as session:
+                    page_stats = await store_page(session, spec, page, fetch_started=round_started)
                     state = await session.get(SyncState, data_type)
                     state.last_page_token = page.next_page_token
                     state.records_downloaded += len(page.data_points)
-                    # Heartbeat per page, so recovery never fails a live run.
+                    # Heartbeat per page; run ownership also protects slow network waits.
                     state.updated_at = datetime.now(UTC)
+                    await receipt.page(session, page)
+                    await record_changes(session, data_type, page_stats, page=True)
+                total.add(page_stats)
+                receipt.committed(page)
             except BaseException as failure:
+                receipt.unstored = page
                 # The page's records rolled back; what Google sent is still kept, also when
                 # the task was cancelled (restart, deploy) between fetching and storing.
                 await self.client.keep_after(page.responses, failure)
                 raise
-        async with self.sessions.begin() as session:
+        async with sessions.begin() as session:
             state = await session.get(SyncState, data_type)
             previous_success = state.last_successful_sync
             # A widened webhook window may end in the future; the watermark never does.
@@ -222,10 +339,12 @@ class IncrementalSync:
                 max(as_utc(previous_success), reached) if previous_success else reached
             )
             state.last_page_token = None
+            deleted = 0
             if fetched_since is not None:
-                total.source_deleted += await mark_source_deletions(
-                    session, spec, start, end, fetched_since
-                )
+                deleted = await mark_source_deletions(session, spec, start, end, fetched_since)
+            await record_changes(session, data_type, StoreStats(source_deleted=deleted))
+            receipt.event(session, "completed")
+        total.source_deleted += deleted
 
     async def run_all(self) -> dict[str, StoreStats | Exception]:
         semaphore = asyncio.Semaphore(self.settings.sync_concurrency)

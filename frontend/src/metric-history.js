@@ -1,4 +1,5 @@
 import { handleUnauthorized } from './api.js';
+import { setupDialog, focusVisible } from './accessibility.js';
 
 const metrics = {
   steps: {title: 'Adım geçmişi', average: 'Günlük ortalama', color: 'var(--step-chart)'},
@@ -70,7 +71,8 @@ function chart(metric, days, width = 1020, height = 236) {
 export function setupMetricHistory(getTimezone) {
   const $ = id => document.getElementById(id);
   const dialog = $('metric-history-dialog');
-  let currentMetric = 'steps', currentPage = 1, totalPages = 1, controller = null, opener = null, plotted = null;
+  const modal = setupDialog(dialog);
+  let currentMetric = 'steps', currentPage = 1, totalPages = 1, controller = null, plotted = null;
   // Redraw at the new pixel size when the dialog or viewport resizes.
   new ResizeObserver(() => {
     const plot = $('metric-history-chart');
@@ -103,6 +105,9 @@ export function setupMetricHistory(getTimezone) {
     controller?.abort();
     const pending = new AbortController(); controller = pending;
     currentMetric = metric; currentPage = page;
+    const focused = document.activeElement;
+    if (['metric-history-content', 'metric-history-status', 'metric-history-pages'].some(id => $(id).contains(focused)))
+      focusVisible(dialog.querySelector(`[data-history-tab="${metric}"]`));
     $('metric-history-title').textContent = metrics[metric].title;
     dialog.style.setProperty('--metric-accent', metrics[metric].color);
     document.querySelectorAll('[data-history-tab]').forEach(el => el.setAttribute('aria-pressed', String(el.dataset.historyTab === metric)));
@@ -155,8 +160,7 @@ export function setupMetricHistory(getTimezone) {
 
   document.querySelectorAll('[data-history-metric]').forEach(button => {
     button.addEventListener('click', () => {
-      opener = button;
-      if (!dialog.open) dialog.showModal();
+      modal.open({ trigger: button });
       document.body.classList.add('metric-history-open');
       load(button.dataset.historyMetric);
     });
@@ -165,6 +169,6 @@ export function setupMetricHistory(getTimezone) {
   $('metric-history-close').addEventListener('click', () => dialog.close());
   dialog.addEventListener('close', () => {
     controller?.abort(); controller = null;
-    document.body.classList.remove('metric-history-open'); opener?.focus();
+    document.body.classList.remove('metric-history-open');
   });
 }

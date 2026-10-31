@@ -9,6 +9,7 @@ from app.google_health.client import Page
 from app.google_health.data_types import REGISTRY
 from app.models.state import JobStatus, SyncState, WebhookNotification
 from app.services.webhook_processing import INTERRUPTED_ERROR, WebhookBatchProcessor
+from app.services.webhook_status import WebhookStatusService
 from app.sync.incremental import STALE_RUNNING_AFTER, IncrementalSync
 
 # Last heartbeat long enough ago that no live process can still own the row.
@@ -17,6 +18,7 @@ STALE = datetime.now(UTC) - STALE_RUNNING_AFTER - timedelta(minutes=1)
 
 def start_app(sessions, monkeypatch, settings, incremental):
     runtime = SimpleNamespace(
+        webhook_status=WebhookStatusService(settings, sessions),
         incremental=incremental,
         webhook_processor=WebhookBatchProcessor(sessions, incremental, set(incremental.specs)),
         shutdown=AsyncMock(),

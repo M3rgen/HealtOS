@@ -1,7 +1,7 @@
-"""Start an authenticated, detached Codex app-server for the local site.
+"""Start an authenticated Codex app-server for the local site.
 
 Uses the installed Codex CLI and ChatGPT login. No API key is required.
-Run again after a restart; an existing healthy bridge is reused.
+Manual mode detaches and reuses a healthy bridge; --foreground supervises it.
 
 The bridge never listens on all interfaces. CODEX_BRIDGE_BIND_HOST picks the
 address; the default is the docker0 gateway on Linux Docker Engine (the address
@@ -10,14 +10,17 @@ address; the default is the docker0 gateway on Linux Docker Engine (the address
 Firewall example for a Linux host: deploy/firewall/.
 """
 
+import argparse
 import asyncio
 import ipaddress
 import json
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -48,9 +51,15 @@ def env_file_value(name):
     path = ROOT / ".env"
     if not path.exists():
         return ""
+    try:
+        text = path.read_text("utf-8")
+    except OSError:
+        # The service user cannot read the operator's chmod 600 .env; its settings
+        # come from EnvironmentFile=/etc/healthos/bridge.env instead.
+        return ""
     values = [
         value.strip().strip("\"'")
-        for key, _, value in (line.partition("=") for line in path.read_text("utf-8").splitlines())
+        for key, _, value in (line.partition("=") for line in text.splitlines())
         if key.strip() == name
     ]
     return values[-1] if values else ""
@@ -75,18 +84,78 @@ def bind_host():
     return f"[{address}]" if address.version == 6 else str(address)
 
 
+def write_private(path, text):
+    """Replace a private file atomically; interrupted writes keep the previous identity."""
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def update_env(token):
     path = ROOT / ".env"
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     replacements = {
         "CODEX_BRIDGE_TOKEN": token,
-        "CODEX_BRIDGE_URL": f"ws://host.docker.internal:{PORT}",
+        "CODEX_BRIDGE_URL": os.environ.get("CODEX_BRIDGE_URL", "").strip()
+        or env_file_value("CODEX_BRIDGE_URL")
+        or f"ws://host.docker.internal:{PORT}",
     }
-    lines = [line for line in lines if line.partition("=")[0] not in replacements]
-    path.write_text(
+    lines = [line for line in lines if line.partition("=")[0].strip() not in replacements]
+    write_private(
+        path,
         "\n".join(lines + [f"{key}={value}" for key, value in replacements.items()]) + "\n",
-        encoding="utf-8",
     )
+
+
+def supervise(command, workspace, child_env):
+    """Own the child until stopped; even a spontaneous exit 0 is a service failure."""
+    stopping = False
+    process = None
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    def signal_group(signum):
+        if process is not None:
+            try:
+                os.killpg(process.pid, signum)
+            except (ProcessLookupError, PermissionError):
+                # macOS answers EPERM for a group whose members are all zombies.
+                pass
+
+    handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        process = subprocess.Popen(
+            command, cwd=workspace, env=child_env, stdin=subprocess.DEVNULL, start_new_session=True
+        )
+        while process.poll() is None and not stopping:
+            time.sleep(0.1)
+        if stopping:
+            return 0
+        print(
+            f"Umay köprüsü beklenmedik biçimde durdu (çıkış {process.returncode}).",
+            file=sys.stderr,
+        )
+        return process.returncode if process.returncode > 0 else 1
+    finally:
+        if process is not None:
+            signal_group(signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                signal_group(signal.SIGKILL)
+                process.wait()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 
 async def healthy(token, host):
@@ -118,13 +187,29 @@ async def healthy(token, host):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--foreground", action="store_true", help="Run under a Linux service manager"
+    )
+    foreground = parser.parse_args().foreground
+    if foreground and os.name != "posix":
+        raise SystemExit("Ön planda servis çalıştırma yalnız POSIX sistemlerde desteklenir.")
+    os.umask(0o077)
     host = bind_host()
     source_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     bridge_home = source_home / "healthos-bridge"
     bridge_home.mkdir(parents=True, exist_ok=True)
+    bridge_home.chmod(0o700)
     token_file = bridge_home / "bridge.token"
-    token = token_file.read_text().strip() if token_file.exists() else secrets.token_urlsafe(48)
-    if asyncio.run(healthy(token, host)):
+    token = (
+        os.environ.get("CODEX_BRIDGE_TOKEN", "").strip()
+        or (token_file.read_text().strip() if token_file.exists() else "")
+        or env_file_value("CODEX_BRIDGE_TOKEN")
+    )
+    if not token and foreground:
+        raise SystemExit("Servis için CODEX_BRIDGE_TOKEN veya mevcut bridge.token gerekli.")
+    token = token or secrets.token_urlsafe(48)
+    if not foreground and asyncio.run(healthy(token, host)):
         update_env(token)
         print(f"healthOS Codex köprüsü zaten çalışıyor ({host}:{PORT}).")
         if host != "127.0.0.1" and asyncio.run(healthy(token, "127.0.0.1")):
@@ -135,11 +220,15 @@ def main():
             )
         return
     source_auth = source_home / "auth.json"
-    if not source_auth.exists():
-        raise SystemExit("Önce codex login ile ChatGPT hesabına giriş yap.")
     # Separate app-server config avoids loading the desktop's plugins and MCP servers.
-    shutil.copy2(source_auth, bridge_home / "auth.json")
-    token_file.write_text(token, encoding="utf-8")
+    bridge_auth = bridge_home / "auth.json"
+    # A service restart must not replace credentials refreshed by the running bridge.
+    if not foreground or not bridge_auth.exists():
+        if not source_auth.exists():
+            raise SystemExit("Önce codex login ile ChatGPT hesabına giriş yap.")
+        write_private(bridge_auth, source_auth.read_text(encoding="utf-8"))
+    bridge_auth.chmod(0o600)
+    write_private(token_file, token)
     bridge_config = 'cli_auth_credentials_store = "file"\nweb_search = "disabled"\n'
     bridge_config += 'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "medium"\n'
     bridge_config += (
@@ -161,7 +250,7 @@ def main():
         )
         + "\n"
     )
-    (bridge_home / "config.toml").write_text(bridge_config, encoding="utf-8")
+    write_private(bridge_home / "config.toml", bridge_config)
     workspace = bridge_home / "workspace"
     workspace.mkdir(exist_ok=True)
     launcher = shutil.which("codex")
@@ -190,6 +279,8 @@ def main():
     ]
     child_env = dict(os.environ, CODEX_HOME=str(bridge_home))
     child_env.pop("OPENAI_API_KEY", None)
+    if foreground:
+        return supervise(command, workspace, child_env)
     with (bridge_home / "bridge.log").open("ab") as log:
         process = subprocess.Popen(
             command,
@@ -213,10 +304,15 @@ def main():
             break
         time.sleep(0.3)
     process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
     raise SystemExit(f"Codex köprüsü başlatılamadı. Günlük: {bridge_home / 'bridge.log'}")
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
-    main()
+    raise SystemExit(main())

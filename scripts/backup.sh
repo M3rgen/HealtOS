@@ -54,11 +54,14 @@ setting() {
 
 backup_dir="$(setting BACKUP_HOST_DIR)"
 backup_dir="${backup_dir:-./backups}"
+status_dir="$(setting BACKUP_STATUS_HOST_DIR)"
+status_dir="${status_dir:-./backup-status}"
 key_file="${BACKUP_KEY_FILE:-/etc/healthos/backup.key}"
 recipient="${BACKUP_AGE_RECIPIENT:-}"
 
 output=""
 partial=""
+status_partial=""
 size_bytes=""
 required_bytes=""
 retention_label="never"
@@ -88,7 +91,13 @@ human() {
 
 write_status() {
   # write_status RESULT MESSAGE; atomic replace, never fatal.
-  local result="$1" message="$2" free tmp file_json
+  local result="$1" message="$2" free tmp file_json timestamp
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Separate directory: only sanitized metadata is mounted into the app. Publish
+  # before replacing the private legacy file, so its old success can be migrated.
+  python3 "$ROOT/scripts/write_backup_status.py" "$status_dir" \
+    "$backup_dir/$STATUS_NAME" "$result" "$timestamp" 2>/dev/null \
+    || echo "backup: could not publish status metadata" >&2
   mkdir -p "$backup_dir" 2>/dev/null || return 0
   free="$(free_bytes_of "$backup_dir" || true)"
   if [ -n "$output" ] && [ "$result" = success ]; then
@@ -96,10 +105,14 @@ write_status() {
   else
     file_json=null
   fi
-  tmp="$backup_dir/.$STATUS_NAME.tmp"
+  tmp="$(mktemp "$backup_dir/.$STATUS_NAME.tmp.XXXXXXXX" 2>/dev/null)" || {
+    echo "backup: could not allocate legacy status metadata" >&2
+    return 0
+  }
+  status_partial="$tmp"
   if ! {
     printf '{\n'
-    printf '  "timestamp": %s,\n' "$(json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    printf '  "timestamp": %s,\n' "$(json_string "$timestamp")"
     printf '  "result": %s,\n' "$(json_string "$result")"
     printf '  "message": %s,\n' "$(json_string "$message")"
     printf '  "file": %s,\n' "$file_json"
@@ -111,15 +124,18 @@ write_status() {
     printf '}\n'
   } >"$tmp" 2>/dev/null || ! mv -f "$tmp" "$backup_dir/$STATUS_NAME" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
+    status_partial=""
     echo "backup: could not write $backup_dir/$STATUS_NAME" >&2
     return 0
   fi
+  status_partial=""
   status_written=1
 }
 
 on_exit() {
   local rc=$?
   [ -z "$partial" ] || rm -f "$partial"
+  [ -z "$status_partial" ] || rm -f "$status_partial"
   if [ "$rc" -ne 0 ] && [ "$status_written" = 0 ]; then
     write_status failure "${failure_reason:-backup.sh exited with status $rc}"
   fi
@@ -222,13 +238,15 @@ fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 output="$backup_dir/health-$stamp.dump.$method"
-partial="$output.partial"
+partial="$(python3 -m app.services.backup_files create "$output")" \
+  || fail "cannot allocate a private encrypted dump file"
 
 if ! docker compose --profile backup run --rm -T backup | "${encrypt[@]}" >"$partial"; then
   fail "pg_dump or encryption failed; no backup was written"
 fi
 [ -s "$partial" ] || fail "encrypted dump is empty; no backup was written"
-mv "$partial" "$output"
+output="$(python3 -m app.services.backup_files publish "$partial" "$output")" \
+  || fail "cannot publish encrypted dump; existing backups were preserved"
 partial=""
 size_bytes="$(wc -c <"$output" | tr -d ' ')"
 

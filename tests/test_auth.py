@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -29,7 +30,11 @@ def build(monkeypatch, token=TOKEN, **overrides):
         **overrides,
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
-    monkeypatch.setattr(main, "build_runtime", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(
+        main,
+        "build_runtime",
+        lambda *_: SimpleNamespace(webhook_status=SimpleNamespace(record=AsyncMock())),
+    )
     application = main.create_app()
 
     @application.get("/api/probe")
@@ -78,7 +83,9 @@ async def test_api_without_token_is_401_json(application):
     assert response.headers["cache-control"] == "no-store"
 
 
-@pytest.mark.parametrize("path", ["/sync/status", "/backfill/status", "/health", "/docs"])
+@pytest.mark.parametrize(
+    "path", ["/sync/status", "/backfill/status", "/health", "/health/backup", "/docs"]
+)
 async def test_other_private_routes_need_token(application, path):
     async with client(application) as http:
         response = await http.get(path)

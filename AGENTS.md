@@ -58,3 +58,36 @@ cd frontend && npx vite build && cd ..   # frontend build check; writes app/stat
 
 Checks that need Docker or a running app (`scripts/verify_compose.py`, some browser tests) are run
 separately; if you could not run one, say so in your report rather than skipping it silently.
+
+## Autonomous Codex lane (server runner)
+
+A headless Codex runner turns issues into pull requests on a private Git mirror of this
+repository. It reads this file and `ROADMAP.md` on every turn. The maintainer merges; the bot
+never merges and never pushes to GitHub (rule 1 holds: the runner pushes only to the private
+mirror).
+
+- **Environment:** Linux server, no Docker, no PostgreSQL, no GPU; `uv`, Node 22 and Playwright
+  Chromium are installed; the Codex sandbox has no network. `make verify` and `make test-browser`
+  run there. `scripts/verify_compose.py`, `docker compose config` and `tests/integration` cannot
+  run: write "not run" in the PR body instead of claiming success.
+- **Priority order when choosing work (no topic limit):** real bugs → data integrity of the raw
+  archive → security → reliability (sync, scheduler, watchdog, webhook) → interface value under the
+  one-screen rule → performance → code health. Within a priority, prefer the smallest change that
+  ships a visible behavior with its tests.
+- **One PR, one topic, finished.** The size of a task follows the depth of the topic: a deep item
+  may take hours in a single PR, and that is preferred over many thin PRs. The goal is continuity,
+  not PR count (maintainer, 2026-10-24). Production code plus tests; no PR that only adds tests,
+  fixtures, docs or ROADMAP edits. Keep Turkish interface text natural (rule 8).
+- **Quality gates** are measured before the PR opens and are written into the task prompt: lint
+  clean, test/source line ratio, no growth of files over the size limit (split first, see
+  ROADMAP 1.1), limited new CLI options and `pytest.skip`s, bounded source and docs growth.
+- **Decisions reserved for the maintainer; do not open tasks for them:** deleting or rewriting any
+  record, backup retention, new external services, persistent memory for Umay, narrowing what Umay
+  sends to OpenAI, dependency or image upgrades, `raw_json` → `jsonb` migration.
+- If a ROADMAP item cannot be finished on this server (needs Docker, a real Google webhook, the
+  VM or a browser on a phone), finish the server-side code and defer the rest (`[~]`).
+
+## Dersler (Burak)
+
+Burak bir PR'ı reddettiğinde ya da elle düzelttiğinde nedeni buraya tek satır olarak yazılır; her
+madde bağlayıcıdır. Biçim: `- YYYY-MM-DD · PR #N · <ders>`.

@@ -92,6 +92,7 @@ async function startServer(dev) {
   }
   const outDir = path.join(OUTPUT, 'dist');
   const started = Date.now();
+  // The config's budget plugin also checks this programmatic build and its custom outDir.
   await vite.build({ ...common, build: { outDir, emptyOutDir: true } });
   console.log(`built ${path.relative(FRONTEND, outDir)} in ${((Date.now() - started) / 1000).toFixed(1)} s`);
   const server = await vite.preview({ ...common, build: { outDir }, preview: listen });

@@ -18,6 +18,7 @@ from app.core.auth import SessionStore, UITokenMiddleware
 from app.core.config import get_settings
 from app.core.host_validation import HostValidationMiddleware
 from app.core.logging import configure_logging, event
+from app.core.request_limits import WriteLimits
 from app.core.security_headers import SecurityHeadersMiddleware
 from app.db.session import SessionLocal
 from app.services.runtime import build_runtime
@@ -59,6 +60,7 @@ def create_app() -> FastAPI:
         async with SessionLocal() as session:
             await session.execute(text("SELECT 1"))
         event(logger, "DATABASE_READY")
+        await runtime.webhook_status.start()
         # A crash leaves SyncState.status=running, which blocks watchdog recovery.
         # Likewise a webhook element left `running` is never claimed again. Rows with a
         # recent heartbeat may be a live CLI run elsewhere, so they are re-checked once
@@ -71,6 +73,7 @@ def create_app() -> FastAPI:
             settings.reconciliation_enabled
             or settings.watchdog_enabled
             or settings.identity_reconcile_enabled
+            or runtime.derived is not None
         )
         if scheduler_needed and settings.app_env != "test":
             scheduler = build_scheduler(
@@ -79,6 +82,7 @@ def create_app() -> FastAPI:
                 runtime.watchdog,
                 runtime.pipeline_health,
                 runtime.identity,
+                runtime.derived,
             )
             scheduler.start()
             runtime.scheduler = scheduler
@@ -105,7 +109,7 @@ def create_app() -> FastAPI:
     docs = not settings.production
     application = FastAPI(
         title="Personal Health Data Mirror",
-        version="0.2.0",
+        version="0.2.1",
         description="Read-only, raw-first archive of Google Health API data",
         lifespan=lifespan,
         docs_url="/docs" if docs else None,
@@ -114,6 +118,7 @@ def create_app() -> FastAPI:
     )
     application.state.settings = settings
     application.state.runtime = runtime
+    application.state.write_limits = WriteLimits(settings)
     # Login sessions (in memory; a restart logs the browser out).
     application.state.ui_sessions = ui_sessions = SessionStore()
     # Starlette runs the last-added middleware first: headers, host check, UI token.
@@ -127,6 +132,7 @@ def create_app() -> FastAPI:
     application.include_router(login.router)
     application.include_router(auth.router)
     application.include_router(sync.router)
+    application.include_router(sync.coverage_router)
     application.include_router(backfill.router)
     application.include_router(google_health.router)
     application.include_router(webhooks.router)

@@ -1,9 +1,13 @@
 import { formatAssistantMessage } from './chat-format.js';
+import { createTransfer } from './chat-transfer.js';
+import { focusVisible, replaceWithFocus } from './accessibility.js';
+import './styles/chat-transfer.css';
 
 export function setupChat(getTimezone) {
   const $ = (id) => document.getElementById(id);
   let socket = null, connected = false, busy = false;
   let waiting = false;
+  let turnContainer = null, transfer = null;
   const items = new Map();
   const rawText = new WeakMap();
   const launcher = $('assistant-open');
@@ -31,12 +35,15 @@ export function setupChat(getTimezone) {
     const above = rect.top - top - edge - gap;
     const below = top + height - edge - rect.bottom - gap;
     const useAbove = above >= 300 || above >= below;
-    const panelHeight = Math.min(width <= 540 ? 700 : 740, Math.max(0, useAbove ? above : below));
+    const available = Math.max(0, useAbove ? above : below);
+    const fillViewport = available < Math.min(220, height - edge * 2);
+    const panelHeight = Math.min(width <= 540 ? 700 : 740, fillViewport ? height - edge * 2 : available);
     const panelWidth = Math.min(560, width - edge * 2);
     dialog.style.width = `${panelWidth}px`;
     dialog.style.height = `${panelHeight}px`;
     dialog.style.left = `${Math.max(left + edge, Math.min(rect.right - panelWidth, left + width - edge - panelWidth))}px`;
-    dialog.style.top = `${useAbove ? rect.top - gap - panelHeight : rect.bottom + gap}px`;
+    dialog.style.top = `${fillViewport ? top + edge : useAbove ? rect.top - gap - panelHeight : rect.bottom + gap}px`;
+    dialog.classList.toggle('is-compact', panelHeight < 400);
     dialog.style.right = 'auto';
     dialog.style.bottom = 'auto';
   }
@@ -93,6 +100,7 @@ export function setupChat(getTimezone) {
   window.visualViewport?.addEventListener('scroll', fitViewport);
 
   function state(text) {
+    const focused = document.activeElement;
     $('assistant-status').textContent = connected ? (busy ? 'Yazıyor' : 'Aktif') : text;
     $('assistant-status').dataset.presence = connected ? 'online' : 'offline';
     $('assistant-typing').hidden = !connected || !busy || !waiting;
@@ -101,14 +109,17 @@ export function setupChat(getTimezone) {
     $('assistant-stop').hidden = !busy;
     $('assistant-new').disabled = busy;
     $('assistant-messages').setAttribute('aria-busy', String(busy));
+    if (dialog.contains(focused) && (focused.disabled || focused.hidden)) focusVisible($('assistant-close'));
   }
 
   function error(text) {
+    if (!text && document.activeElement === $('assistant-error')) focusVisible($('assistant-close'));
     $('assistant-error').textContent = text;
     $('assistant-error').hidden = !text;
   }
 
   function append(role, text, id) {
+    const reading = $('assistant-messages').contains(document.activeElement);
     let content = id && items.get(id);
     if (!content) {
       const message = document.createElement('article');
@@ -119,13 +130,30 @@ export function setupChat(getTimezone) {
       content = document.createElement('div');
       content.className = 'chat-content';
       message.append(label, content);
-      $('assistant-messages').insertBefore(message, $('assistant-typing'));
+      if (turnContainer) turnContainer.append(message);
+      else $('assistant-messages').insertBefore(message, $('assistant-typing'));
       if (id) items.set(id, content);
     }
     rawText.set(content, text);
-    if (role === 'assistant') content.innerHTML = formatAssistantMessage(text);
-    else content.textContent = text;
-    $('assistant-messages').scrollTop = $('assistant-messages').scrollHeight;
+    if (role === 'assistant') {
+      const focused = document.activeElement, selector = 'a[href], pre, table';
+      const index = [...content.querySelectorAll(selector)].indexOf(focused);
+      const scroll = {left: focused?.scrollLeft ?? 0, top: focused?.scrollTop ?? 0};
+      replaceWithFocus(content, () => {
+        content.innerHTML = formatAssistantMessage(text);
+        content.querySelectorAll('pre, table').forEach((block, i) => {
+          block.tabIndex = 0;
+          if (block.tagName === 'PRE') block.setAttribute('role', 'region');
+          block.setAttribute('aria-label', `Umay yanıtındaki ${block.tagName === 'PRE' ? 'kod bloğu' : 'tablo'} ${i + 1}`);
+        });
+      }, old => {
+        const next = content.querySelectorAll(selector)[index];
+        if (next?.tagName !== old.tagName || next.getAttribute('href') !== old.getAttribute('href')) return null;
+        next.scrollLeft = scroll.left; next.scrollTop = scroll.top;
+        return next;
+      }, $('assistant-messages'));
+    } else content.textContent = text;
+    if (!reading) $('assistant-messages').scrollTop = $('assistant-messages').scrollHeight;
     return content;
   }
 
@@ -146,24 +174,37 @@ export function setupChat(getTimezone) {
     connected = false;
     busy = false;
     waiting = false;
+    transfer?.disconnect();
+    turnContainer = null;
+    transfer = null;
+    items.clear();
     error('');
+    if (document.activeElement === $('assistant-reconnect')) focusVisible($('assistant-close'));
     $('assistant-reconnect').hidden = true;
     state('Bağlanıyor…');
     socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/codex/chat`);
     socket.onmessage = ({data}) => {
       const event = JSON.parse(data);
       if (event.type === 'ready') {
+        if (!connected && document.querySelector('.chat-turn')) {
+          const boundary = document.createElement('p');
+          boundary.className = 'chat-boundary';
+          boundary.setAttribute('role', 'status');
+          boundary.textContent = 'Yeni sohbet başladı. Yukarıdaki mesajlar bu ekranda duruyor; Umay bu yeni sohbet içinde onları görmüyor.';
+          $('assistant-messages').insertBefore(boundary, $('assistant-typing'));
+        }
         connected = true;
         retries = 0;
         retryDelay = 1000;
         error('');
         state('');
-        if (!dialog.hidden) $('assistant-input').focus();
       } else if (event.type === 'working') {
         busy = true;
         waiting = true;
         state(event.text);
         $('assistant-messages').scrollTop = $('assistant-messages').scrollHeight;
+      } else if (event.type === 'health_transfer') {
+        transfer?.update(event);
       } else if (event.type === 'delta') {
         waiting = false;
         $('assistant-typing').hidden = true;
@@ -185,9 +226,15 @@ export function setupChat(getTimezone) {
       }
     };
     socket.onclose = () => {
+      clearTimeout(retryTimer);
+      retryTimer = null;
       connected = false;
       busy = false;
       waiting = false;
+      transfer?.disconnect();
+      turnContainer = null;
+      transfer = null;
+      items.clear();
       state('Çevrimdışı');
       $('assistant-reconnect').hidden = false;
       if (pageLeaving) return;
@@ -204,7 +251,7 @@ export function setupChat(getTimezone) {
   }
 
   function reset() {
-    document.querySelectorAll('.chat-message').forEach((message) => message.remove());
+    document.querySelectorAll('.chat-turn, .chat-message, .chat-boundary').forEach((message) => message.remove());
     items.clear();
     $('assistant-input').value = '';
     connect();
@@ -213,6 +260,11 @@ export function setupChat(getTimezone) {
   function send(text) {
     if (!connected || busy || !text.trim()) return;
     error('');
+    items.clear();
+    turnContainer = document.createElement('section');
+    turnContainer.className = 'chat-turn';
+    $('assistant-messages').insertBefore(turnContainer, $('assistant-typing'));
+    transfer = createTransfer(turnContainer);
     append('user', text.trim());
     socket.send(JSON.stringify({text: text.trim(), timezone: getTimezone()}));
     $('assistant-input').value = '';
@@ -230,8 +282,8 @@ export function setupChat(getTimezone) {
     $('assistant-dialog').hidden = false;
     placeDialog();
     $('assistant-open').setAttribute('aria-expanded', 'true');
-    if (connected) $('assistant-input').focus();
-    else if (!socket || socket.readyState >= WebSocket.CLOSING) connect();
+    if (!connected && (!socket || socket.readyState >= WebSocket.CLOSING)) connect();
+    focusVisible(connected ? $('assistant-input') : $('assistant-close'));
   });
   $('assistant-close').addEventListener('click', () => {
     $('assistant-dialog').hidden = true;
@@ -239,7 +291,10 @@ export function setupChat(getTimezone) {
     $('assistant-open').focus();
   });
   $('assistant-dialog').addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') $('assistant-close').click();
+    if (event.key !== 'Escape' || event.defaultPrevented || document.querySelector(':popover-open')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    $('assistant-close').click();
   });
   $('assistant-form').addEventListener('submit', (event) => {
     event.preventDefault();
@@ -256,14 +311,17 @@ export function setupChat(getTimezone) {
   });
   $('assistant-new').addEventListener('click', reset);
   $('assistant-reconnect').addEventListener('click', () => connect());
-  window.addEventListener('online', () => { if (started && !connected) connect(); });
+  window.addEventListener('online', () => {
+    if (started && !connected && !pageLeaving && socket?.readyState >= WebSocket.CLOSING) connect();
+  });
   document.addEventListener('visibilitychange', () => {
     // Coming back to the tab skips the wait of a pending retry; it does not restart a stopped one.
-    if (!document.hidden && started && !connected && retryTimer) connect({ automatic: true });
+    if (!document.hidden && started && !connected && retryTimer && socket?.readyState >= WebSocket.CLOSING) connect({ automatic: true });
   });
   window.addEventListener('pagehide', () => {
     pageLeaving = true;
     clearTimeout(retryTimer);
+    retryTimer = null;
     socket?.close();
   });
   window.addEventListener('pageshow', (event) => {

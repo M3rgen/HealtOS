@@ -9,15 +9,20 @@ export function setupHistoryPanel({request, getZone, getToday, paint}) {
   let expanded = false, weekly, version = 0, pointer, dragged = false, animation, sheet;
   month.value = month.max = getToday().slice(0, 7);
   enhanceMonthInput(month);
+  function hideStatus() {
+    if (document.activeElement === $('history-status')) toggle.focus();
+    $('history-status').hidden = true;
+  }
 
   async function update(data = weekly) {
     weekly = data;
     const token = ++version;
     month.max = getToday().slice(0, 7);
-    if (!expanded) { $('history-status').hidden = true; if (weekly) paint(weekly); return; }
+    if (!expanded) { hideStatus(); if (weekly) paint(weekly); return; }
     $('history-status').hidden = false;
     $('history-status').textContent = 'Aylık veriler yükleniyor…';
     $('history-rows').replaceChildren();
+    if (document.activeElement === $('export-button')) toggle.focus();
     $('export-button').hidden = true;
     const selected = month.value;
     $('history-title').textContent = 'Aylık görünüm';
@@ -33,7 +38,7 @@ export function setupHistoryPanel({request, getZone, getToday, paint}) {
       if (token !== version) return;
       paint(result);
       $('history-title').textContent = new Intl.DateTimeFormat('tr-TR', {month:'long',year:'numeric',timeZone:'UTC'}).format(new Date(`${selected}-01T12:00:00Z`));
-      $('history-status').hidden = true;
+      hideStatus();
       $('export-button').hidden = false;
     } catch (error) {
       if (token === version) $('history-status').textContent = `${error.message} Ayı yeniden seçerek tekrar dene.`;
@@ -42,10 +47,13 @@ export function setupHistoryPanel({request, getZone, getToday, paint}) {
 
   function setExpanded(value, animate = true) {
     if (expanded === value) return;
+    if (!value && $('history-months').contains(document.activeElement)) toggle.focus();
     animation?.cancel();
     const before = panel.getBoundingClientRect();
     if (value) { placeholder.style.height = `${before.height}px`; placeholder.hidden = false; month.value = getToday().slice(0,7); }
     expanded = value;
+    // The sheet covers the summary cards; keep Tab on controls still visible.
+    document.querySelector('.overview-grid').inert = value;
     panel.classList.toggle('expanded', value);
     $('history-months').hidden = !value;
     toggle.setAttribute('aria-expanded', String(value));
@@ -100,7 +108,12 @@ export function setupHistoryPanel({request, getZone, getToday, paint}) {
   toggle.addEventListener('pointerup', finishDrag);
   toggle.addEventListener('pointercancel', finishDrag);
   toggle.addEventListener('click', event => { if (dragged && event.detail !== 0) { dragged = false; return; } setExpanded(!expanded); });
-  document.addEventListener('keydown', event => { if (event.key === 'Escape' && expanded && !document.querySelector('dialog[open]')) { setExpanded(false); toggle.focus(); } });
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || event.defaultPrevented || !expanded || panel.closest('[hidden]') ||
+      document.querySelector('dialog:modal, :popover-open') || event.target.closest('#assistant-dialog')) return;
+    event.preventDefault();
+    setExpanded(false); toggle.focus();
+  });
   month.addEventListener('change', () => update());
   $('history-current').addEventListener('click', () => { month.value = getToday().slice(0,7); update(); });
   return {update};

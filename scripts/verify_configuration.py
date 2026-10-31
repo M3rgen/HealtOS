@@ -80,13 +80,117 @@ def service_environment(service: dict) -> dict[str, str]:
     return {str(name): str(value) for name, value in environment.items()}
 
 
+def compose_boolean(value: object, expected: bool) -> bool:
+    """Compose accepts booleans and their quoted string equivalents."""
+    return value is expected or (isinstance(value, str) and value.lower() == str(expected).lower())
+
+
+def has_no_new_privileges(options: object) -> bool:
+    if not isinstance(options, list):
+        return False
+    values = [
+        re.split("[:=]", option, maxsplit=1)
+        for option in options
+        if isinstance(option, str)
+        and re.split("[:=]", option, maxsplit=1)[0] == "no-new-privileges"
+    ]
+    return bool(values) and all(len(parts) == 1 or parts[1] == "true" for parts in values)
+
+
+def compose_mounts(service: dict) -> list[dict]:
+    """Normalize short/long volumes and scalar/list tmpfs without needing Docker."""
+    mounts: list[dict] = []
+    tmpfs = service.get("tmpfs") or []
+    entries = [tmpfs] if isinstance(tmpfs, str) else tmpfs if isinstance(tmpfs, list) else []
+    for entry in entries:
+        if isinstance(entry, str):
+            target, _, options = entry.partition(":")
+            flags = dict(item.partition("=")[::2] for item in options.split(","))
+            mounts.append(
+                {
+                    "type": "tmpfs",
+                    "target": target,
+                    "read_only": "ro" in flags,
+                    "mode": flags.get("mode", "1777"),
+                }
+            )
+    volumes = service.get("volumes") or []
+    for entry in volumes if isinstance(volumes, list) else []:
+        if isinstance(entry, dict):
+            mount = dict(entry)
+            options = mount.get("tmpfs") or {}
+            mount["mode"] = options.get("mode", 0o1777) if isinstance(options, dict) else 0
+            mounts.append(mount)
+        elif isinstance(entry, str):
+            parts = entry.split(":")
+            source, target = parts[:2] if len(parts) > 1 else (None, parts[0])
+            mounts.append(
+                {
+                    "type": "bind" if source and source.startswith(("/", ".", "~")) else "volume",
+                    "source": source,
+                    "target": target,
+                    "read_only": "ro" in (parts[2].split(",") if len(parts) > 2 else []),
+                }
+            )
+    return mounts
+
+
+def check_service_hardening(name: str, service: dict) -> list[str]:
+    errors: list[str] = []
+    if not compose_boolean(service.get("read_only"), True):
+        errors.append(f"{name} service must set read_only: true")
+    if not has_no_new_privileges(service.get("security_opt")):
+        errors.append(f"{name} service must enable no-new-privileges")
+    if "ALL" not in (service.get("cap_drop") or []):
+        errors.append(f"{name} service must drop all Linux capabilities (cap_drop: [ALL])")
+    mounts = compose_mounts(service)
+    temporary = ["/tmp", "/var/run/postgresql"] if name == "postgres" else ["/tmp"]
+    for target in temporary:
+        matching = [mount for mount in mounts if mount.get("target") == target]
+        if len(matching) != 1 or matching[0].get("type") != "tmpfs":
+            errors.append(f"{name} service requires a writable tmpfs at {target}")
+            continue
+        mount = matching[0]
+        try:
+            mode = mount.get("mode", 0o1777)
+            mode = int(mode, 8) if isinstance(mode, str) else int(mode)
+        except (ValueError, TypeError):
+            mode = 0
+        # /tmp is shared by unprivileged processes. The postgres entrypoint
+        # chowns/chmods its socket directory before switching users.
+        permissions = mode & 0o1777 == 0o1777 if target == "/tmp" else mode & 0o700 == 0o700
+        if not compose_boolean(mount.get("read_only", False), False) or not permissions:
+            errors.append(f"{name} service tmpfs {target} must be writable with usable permissions")
+    data_target = "/var/lib/postgresql/data"
+    if name == "postgres":
+        data = [mount for mount in mounts if mount.get("target") == data_target]
+        if len(data) != 1 or not (
+            data[0].get("type") == "volume"
+            and data[0].get("source") == "postgres_data"
+            and compose_boolean(data[0].get("read_only", False), False)
+            and not (data[0].get("volume") or {}).get("subpath")
+        ):
+            errors.append(f"postgres service requires writable postgres_data at {data_target}")
+    allowed = {*temporary, *([data_target] if name == "postgres" else [])}
+    for mount in mounts:
+        target = str(mount.get("target", ""))
+        if target not in allowed and (
+            not compose_boolean(mount.get("read_only", False), True)
+            or any(target.startswith(path + "/") for path in allowed)
+        ):
+            errors.append(f"{name} service has unexpected mount at {target}")
+    return errors
+
+
 def check_compose_runtime(compose_doc: object, dev_doc: object) -> list[str]:
     errors: list[str] = []
     app = compose_service(compose_doc, "app")
     if service_environment(app).get("APP_ENV") != "production":
         errors.append("docker-compose.yml app service must set APP_ENV: production")
     for name in ("postgres", "app"):
-        logging = compose_service(compose_doc, name).get("logging") or {}
+        service = compose_service(compose_doc, name)
+        errors.extend(check_service_hardening(name, service))
+        logging = service.get("logging") or {}
         options = logging.get("options") or {}
         if (
             logging.get("driver") != "json-file"
@@ -94,9 +198,6 @@ def check_compose_runtime(compose_doc: object, dev_doc: object) -> list[str]:
             or not options.get("max-file")
         ):
             errors.append(f"{name} service lacks json-file log rotation (max-size, max-file)")
-    postgres = compose_service(compose_doc, "postgres")
-    if "ALL" not in (postgres.get("cap_drop") or []):
-        errors.append("postgres service must drop all Linux capabilities (cap_drop: [ALL])")
     dev_app = compose_service(dev_doc, "app")
     if service_environment(dev_app).get("APP_ENV") != "development":
         errors.append("docker-compose.dev.yml must override APP_ENV with development")
@@ -141,6 +242,23 @@ def check_backup_automation(compose_doc: object, verifier: str) -> list[str]:
         errors.append("scripts/backup.sh must encrypt dumps with age or gpg")
     if compose_service(compose_doc, "backup").get("volumes"):
         errors.append("the backup service must stream to scripts/backup.sh, not write to a volume")
+    app = compose_service(compose_doc, "app")
+    expected_mount = {
+        "type": "bind",
+        "source": "${BACKUP_STATUS_HOST_DIR:-./backup-status}",
+        "target": "/run/healthos-backup",
+        "read_only": True,
+        # An existing VM updated before creating the directory must still start.
+        "bind": {"create_host_path": True},
+    }
+    mounts = compose_mounts(app)
+    data_mounts = [mount for mount in mounts if mount.get("type") != "tmpfs"]
+    if [{key: mount.get(key) for key in expected_mount} for mount in data_mounts] != [
+        expected_mount
+    ]:
+        errors.append("app must mount only the read-only backup metadata directory")
+    if service_environment(app).get("BACKUP_STATUS_FILE") != "/run/healthos-backup/status.json":
+        errors.append("app BACKUP_STATUS_FILE must select the metadata file")
     if "restore.sh" not in verifier or "backup.sh" not in verifier:
         errors.append("scripts/verify_compose.py must exercise backup.sh and restore.sh")
     return errors
@@ -272,8 +390,6 @@ def check_repository() -> list[str]:
     from_lines = re.findall(r"^FROM\s+(\S+)", dockerfile, re.MULTILINE)
     if any("@sha256:" not in image for image in from_lines):
         errors.append("every Dockerfile base image must have a digest")
-    if "postgres_data:/var/lib/postgresql/data" not in compose:
-        errors.append("the stable PostgreSQL named-volume target changed")
     if '"127.0.0.1:${APP_PORT:-8000}:8000"' not in compose:
         errors.append("the administrative API is not explicitly loopback-only")
     postgres_block = compose.split("  app:", 1)[0]

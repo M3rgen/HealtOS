@@ -2,7 +2,12 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { metricsToMorphs, DEFAULT_NORMAL_RELIEF, normalReliefScale, parseHealthos, reliefParams } from './body-metrics.js';
+import { SKIN_DETAIL, createSkinUniforms, makeSkinMaterial } from './body-skin.js';
 import './body.css';
+
+// Preserve the public viewer API while keeping profile calculations independent of three.js.
+export { metricsToMorphs, DEFAULT_NORMAL_RELIEF, normalReliefScale } from './body-metrics.js';
 
 // Locally bundled body model (see public/models/PROVENANCE.md). glTF Y-up, feet at y=0,
 // facing +Z, ~1.75 m at basis, carrying the morph targets below on every deforming mesh.
@@ -25,95 +30,8 @@ const START_TURN = .35; // front three-quarter view (radians)
 const SHAPE_BINS = 48;
 const SHAPE_SPAN_M = 2.4; // normalised-model height covered by the silhouette bins
 
-// Basis of the model: 175 cm, 70 kg (BMI 22.9), 20 % body fat, ~40 % skeletal muscle.
-const BASIS = { heightCm: 175, weightKg: 70, bodyFatPct: 20, musclePct: 40 };
-const BASIS_BMI = BASIS.weightKg / (BASIS.heightCm / 100) ** 2; // 22.86
-const BASIS_FMI = BASIS_BMI * BASIS.bodyFatPct / 100; // fat mass index, 4.57 kg/m²
-const BASIS_FFMI = BASIS_BMI - BASIS_FMI; // fat-free mass index, 18.29 kg/m²
-
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const ease = (t) => (t < .5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
-function plausible(value, lo, hi) {
-  const n = value == null || value === '' ? NaN : Number(value);
-  return Number.isFinite(n) && n >= lo && n <= hi ? n : null;
-}
-// Piecewise-linear signed axis: 0 at basis, ±1 at the chosen "full morph" points.
-const axis = (value, basis, upSpan, downSpan) => clamp((value - basis) / (value >= basis ? upSpan : downSpan), -1, 1);
-
-/**
- * Map profile metrics to two signed morph axes plus a height scale.
- * Missing or implausible values fall back to the basis, so `{}` yields the untouched model.
- *
- * fat axis (−1 … +1 → fat_low … fat_high):
- *   with weight: fat mass index FMI = BMI × fat% (fat% defaults to 20 when unknown);
- *     axis = (FMI − 4.57) / 6.5 above basis (≈ 11 kg/m², e.g. 175 cm · 100 kg · 35 %),
- *            (FMI − 4.57) / 3.0 below basis (≈ 1.6 kg/m², e.g. 175 cm · 60 kg · 6 %).
- *   fat% only: axis = (fat% − 20) / 15 above, / 12 below (35 % → +1, 8 % → −1).
- * muscle axis (−1 … +1 → muscle_low … muscle_high):
- *   muscle% term: (muscle% − 40) / 8   (48 % → +1, 32 % → −1).
- *   lean-mass term (needs weight): fat-free mass index FFMI = BMI × (1 − fat%);
- *     (FFMI − 18.3) / 5 above (≈ 23.3, very muscular), / 3 below (≈ 15.3, frail).
- *   both known → 0.6 × muscle% term + 0.4 × lean-mass term; otherwise whichever exists.
- * scale: height / 175 cm clamped to 0.82 … 1.2; applied as (√s, s, √s) because at a
- *   constant BMI body volume ∝ h², so girth grows with √h while the morphs carry BMI.
- * Height (default 175 cm) is used for BMI so height and weight are always read together.
- */
-export function metricsToMorphs({ heightCm, weightKg, bodyFatPct, musclePct } = {}) {
-  const height = plausible(heightCm, 100, 250);
-  const weight = plausible(weightKg, 25, 350);
-  const fatPct = plausible(bodyFatPct, 2, 70);
-  const musclePctValue = plausible(musclePct, 10, 75);
-  const meters = (height ?? BASIS.heightCm) / 100;
-  let fat = 0, muscle = 0;
-  if (weight != null) {
-    const bmi = weight / (meters * meters);
-    const fmi = bmi * (fatPct ?? BASIS.bodyFatPct) / 100;
-    fat = axis(fmi, BASIS_FMI, 6.5, 3);
-    const lean = axis(bmi - fmi, BASIS_FFMI, 5, 3);
-    muscle = musclePctValue == null ? lean : .6 * axis(musclePctValue, BASIS.musclePct, 8, 8) + .4 * lean;
-  } else {
-    if (fatPct != null) fat = axis(fatPct, BASIS.bodyFatPct, 15, 12);
-    if (musclePctValue != null) muscle = axis(musclePctValue, BASIS.musclePct, 8, 8);
-  }
-  const scale = height == null ? 1 : clamp(height / BASIS.heightCm, .82, 1.2);
-  return { fat: clamp(fat, -1, 1), muscle: clamp(muscle, -1, 1), scale };
-}
-
-/**
- * Normal-map strength for the current fat influences. All muscle relief lives in body.glb's
- * normal map and must fade under adipose tissue (lane A's recommendation):
- *   normalScale = min(max, max(min, (1 − fat_high)^exponent) · (1 + fatLowGain · fat_low))
- *   defaults: max 1.25, min 0.05, exponent 1.8, fatLowGain 0.25
- *   → 1.0 at fat_high 0, 0.53 @ 0.3, 0.29 @ 0.5, 0.095 @ 0.73, 0.05 @ 1; 1.25 at fat_low 1.
- * Parameters are read from body.glb `extras.healthos.suggestedNormalScale` when present, either as
- * numeric fields {max, min, exponent, fatLowGain} or parsed from its `formula` string of exactly
- * this shape; the defaults below apply otherwise. The formula string is never evaluated.
- */
-export const DEFAULT_NORMAL_RELIEF = { max: 1.25, min: .05, exponent: 1.8, fatLowGain: .25 };
-export function normalReliefScale(fatHigh, fatLow, params = DEFAULT_NORMAL_RELIEF) {
-  const { max, min, exponent, fatLowGain } = params;
-  return Math.min(max, Math.max(min, Math.pow(Math.max(0, 1 - fatHigh), exponent)) * (1 + fatLowGain * fatLow));
-}
-const RELIEF_FORMULA = /min\(\s*([\d.]+)\s*,\s*max\(\s*([\d.]+)\s*,\s*pow\(\s*1\s*-\s*fat_high\s*,\s*([\d.]+)\s*\)\s*\)\s*\*\s*\(\s*1\s*\+\s*([\d.]+)\s*\*\s*fat_low\s*\)\s*\)/;
-function parseHealthos(extras) {
-  if (typeof extras !== 'string') return extras && typeof extras === 'object' ? extras : null;
-  try { return JSON.parse(extras); } catch { return null; }
-}
-function reliefParams(extras) {
-  const healthos = parseHealthos(extras);
-  const suggested = healthos?.suggestedNormalScale;
-  if (!suggested || typeof suggested !== 'object') return DEFAULT_NORMAL_RELIEF;
-  const parsed = typeof suggested.formula === 'string' ? RELIEF_FORMULA.exec(suggested.formula) : null;
-  const fromFormula = parsed ? { max: parsed[1], min: parsed[2], exponent: parsed[3], fatLowGain: parsed[4] } : {};
-  const pick = (key) => {
-    for (const value of [suggested[key], fromFormula[key]]) {
-      const n = value == null || value === '' ? NaN : Number(value);
-      if (Number.isFinite(n)) return n;
-    }
-    return DEFAULT_NORMAL_RELIEF[key];
-  };
-  return { max: pick('max'), min: pick('min'), exponent: pick('exponent'), fatLowGain: pick('fatLowGain') };
-}
 
 function radialTexture(stops) {
   const canvas = document.createElement('canvas');
@@ -135,87 +53,6 @@ function groundDecal(texture, opacity, blending) {
   mesh.rotation.x = -Math.PI / 2;
   mesh.renderOrder = 1;
   return mesh;
-}
-
-// Tileable skin micro-detail (lane C, public/assets/skin/, see ASSETS.md): OpenGL +Y normal,
-// roughness 0.5 = neutral. One tile ≈ 6–7 cm on the body at 28 repeats per UV unit.
-// Missing files simply leave the detail off.
-const SKIN_DETAIL = {
-  normalUrl: '/assets/skin/skin-detail-normal.webp',
-  roughnessUrl: '/assets/skin/skin-detail-roughness.webp',
-  repeat: 28, // tiles across the 0–1 body UV atlas
-  normalStrength: .35,
-  roughnessStrength: 1, // base roughness × (2 × detail): 0.5 is neutral, 0.43–0.57 → ×0.86–1.14
-};
-
-// Cheap single-pass skin approximation layered onto three's physical BRDF:
-// - per-channel wrapped diffuse: red light bleeds past the terminator (subsurface softness);
-// - back-scatter: light from behind leaks through thin silhouette areas (ears, fingers) red-shifted;
-// - built-in sheen for peach fuzz, skin-like F0 (~0.028);
-// - tileable micro-detail normal blended over the base map (whiteout); the fat-driven
-//   normalScale only scales the base (muscle) map, never the pores;
-// - a thin amber Fresnel accent so the UI colour reads on the silhouette without tinting the skin.
-function makeSkinMaterial(source, skinUniforms) {
-  const material = new THREE.MeshPhysicalMaterial();
-  THREE.MeshStandardMaterial.prototype.copy.call(material, source);
-  material.defines = { STANDARD: '', PHYSICAL: '' };
-  material.specularIntensity = .7;
-  material.sheen = .35;
-  material.sheenRoughness = .55;
-  material.sheenColor.set(0x5a463c);
-  if (!material.roughnessMap && material.roughness < .6) material.roughness = .6; // untextured skin reads as plastic below this
-  material.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, skinUniforms);
-    let lights = THREE.ShaderChunk.lights_physical_pars_fragment;
-    const diffuseLine = 'reflectedLight.directDiffuse += irradiance * BRDF_Lambert( material.diffuseContribution ) * ( 1.0 - F );';
-    if (lights.includes(diffuseLine)) {
-      lights = lights.replace(diffuseLine, `
-        float skinNL = dot( geometryNormal, directLight.direction );
-        vec3 skinWrapped = saturate( ( vec3( skinNL ) + skinWrap ) / ( 1.0 + skinWrap ) );
-        reflectedLight.directDiffuse += skinWrapped * directLight.color * BRDF_Lambert( material.diffuseContribution ) * ( 1.0 - F );
-        // Back-scatter uses the smooth surface normal (mapped detail would make it noisy) and is clamped.
-        vec3 skinBackDir = normalize( directLight.direction + skinSmoothNormal * 0.35 );
-        float skinBack = min( pow( saturate( dot( geometryViewDir, - skinBackDir ) ), 4.0 ) * skinThin, 0.35 );
-        reflectedLight.directDiffuse += directLight.color * skinBack * skinScatter * skinScatterColor * material.diffuseContribution;`);
-    }
-    shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>
-        uniform vec3 rimColor; uniform float rimStrength;
-        uniform vec3 skinWrap; uniform vec3 skinScatterColor; uniform float skinScatter;
-        uniform sampler2D skinDetailNormal; uniform sampler2D skinDetailRoughness;
-        uniform float skinDetailRepeat; uniform float skinDetailNormalStrength; uniform float skinDetailRoughnessStrength;
-        float skinThin = 0.0;
-        vec3 skinSmoothNormal = vec3( 0.0, 0.0, 1.0 );`)
-      .replace('#include <lights_physical_pars_fragment>', lights)
-      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
-        #if defined( SKIN_DETAIL_ROUGHNESS ) && defined( USE_NORMALMAP )
-          roughnessFactor = clamp( roughnessFactor * mix( 1.0, 2.0 * texture2D( skinDetailRoughness, vNormalMapUv * skinDetailRepeat ).g, skinDetailRoughnessStrength ), 0.05, 1.0 );
-        #endif`)
-      .replace('#include <normal_fragment_maps>', `
-        #if defined( SKIN_DETAIL_NORMAL ) && defined( USE_NORMALMAP_TANGENTSPACE )
-          vec3 mapN = texture2D( normalMap, vNormalMapUv ).xyz * 2.0 - 1.0;
-          mapN.xy *= normalScale;
-          vec2 detailUv = vNormalMapUv * skinDetailRepeat;
-          vec3 detailN = texture2D( skinDetailNormal, detailUv ).xyz * 2.0 - 1.0;
-          // Pores alias into a comb pattern where the surface turns away (grazing, strongly anisotropic
-          // minification) or where one pixel spans a large part of a tile: fade the detail out there.
-          float detailFacing = smoothstep( 0.12, 0.45, abs( dot( nonPerturbedNormal, normalize( vViewPosition ) ) ) );
-          float detailFootprint = max( length( dFdx( detailUv ) ), length( dFdy( detailUv ) ) );
-          float detailFade = detailFacing * ( 1.0 - smoothstep( 0.08, 0.25, detailFootprint ) );
-          detailN.xy *= skinDetailNormalStrength * detailFade * vec2( 1.0, sign( normalScale.y ) );
-          normal = normalize( tbn * normalize( vec3( mapN.xy + detailN.xy, mapN.z * detailN.z ) ) );
-        #else
-          #include <normal_fragment_maps>
-        #endif`)
-      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
-        // Silhouette terms use the interpolated surface normal so normal-map creases don't light up.
-        float rimFacing = 1.0 - saturate( dot( nonPerturbedNormal, normalize( vViewPosition ) ) );
-        skinThin = rimFacing * rimFacing;
-        skinSmoothNormal = nonPerturbedNormal;
-        totalEmissiveRadiance += rimColor * rimStrength * pow( rimFacing, 4.0 );`);
-  };
-  material.customProgramCacheKey = () => 'healthos-skin-v2';
-  return material;
 }
 
 function staticFallback(container) {
@@ -299,15 +136,7 @@ export function createBody(container, motionEnabled) {
   figure.add(normalizer, ...contacts); turntable.add(figure); scene.add(turntable);
 
   // Shared skin shader uniforms (see makeSkinMaterial); detail maps arrive asynchronously.
-  const skinUniforms = {
-    rimColor: { value: new THREE.Color(0xf0c478) }, rimStrength: { value: .1 },
-    skinWrap: { value: new THREE.Vector3(.2, .09, .05) },
-    skinScatterColor: { value: new THREE.Color(1, .38, .24) }, skinScatter: { value: .2 },
-    skinDetailNormal: { value: null }, skinDetailRoughness: { value: null },
-    skinDetailRepeat: { value: SKIN_DETAIL.repeat },
-    skinDetailNormalStrength: { value: SKIN_DETAIL.normalStrength },
-    skinDetailRoughnessStrength: { value: SKIN_DETAIL.roughnessStrength },
-  };
+  const skinUniforms = createSkinUniforms();
   const skinMaterials = [];
   const detailTextures = [];
   function loadDetail(url, uniform, define) {

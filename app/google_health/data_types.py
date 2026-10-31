@@ -12,6 +12,10 @@ CIVIL_BEFORE = timedelta(hours=12)
 CIVIL_AFTER = timedelta(hours=14)
 
 
+class QueryWindowError(ValueError):
+    """The complete filter window cannot be represented without losing coverage."""
+
+
 def query_time(value: datetime) -> datetime:
     """The instant a request bound actually names: UTC, truncated to whole seconds.
 
@@ -83,7 +87,10 @@ class DataTypeSpec:
             # Daily records use civil dates. Ceil a partial timestamp to the next
             # date so a same-day incremental/backfill window is non-empty and valid.
             if end_date <= start_date or end_iso[11:19] != "00:00:00":
-                end_date += timedelta(days=1)
+                try:
+                    end_date += timedelta(days=1)
+                except OverflowError as exc:
+                    raise QueryWindowError("daily filter upper date is out of range") from exc
             return f'{field} >= "{start_date}" AND {field} < "{end_date}"'
         if self.kind == RecordKind.sample:
             field = f"{prefix}.sample_time.physical_time"
@@ -108,10 +115,13 @@ class DataTypeSpec:
         of UTC. With these windows ``deletion_scope`` covers exactly the notified record.
         Other kinds already filter on the physical start time.
         """
-        if self.name == "sleep":
-            return start, end + timedelta(seconds=1)
-        if self.kind == RecordKind.session and self.name != "electrocardiogram":
-            return start - CIVIL_BEFORE, end + CIVIL_AFTER
+        try:
+            if self.name == "sleep":
+                return start, end + timedelta(seconds=1)
+            if self.kind == RecordKind.session and self.name != "electrocardiogram":
+                return start - CIVIL_BEFORE, end + CIVIL_AFTER
+        except OverflowError as exc:
+            raise QueryWindowError("covering window is out of range") from exc
         return start, end
 
 

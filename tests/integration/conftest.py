@@ -11,7 +11,6 @@ workflow runs ``alembic upgrade head``/``check`` itself) is never touched.
 
 from __future__ import annotations
 
-import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -66,27 +65,11 @@ def database_url(monkeypatch) -> Iterator[str]:
 
 
 @pytest.fixture
-def alembic_config(database_url) -> Iterator[Config]:
-    # migrations/env.py reads DATABASE_URL through get_settings(), patched above. It also
-    # runs logging.config.fileConfig(), which disables every existing logger; restore
-    # them so later tests asserting on log records (caplog) are unaffected.
-    manager = logging.Logger.manager
-    loggers = [logging.getLogger()] + [
-        item for item in manager.loggerDict.values() if isinstance(item, logging.Logger)
-    ]
-    saved = [
-        (item, item.disabled, item.level, list(item.handlers), item.propagate) for item in loggers
-    ]
-    try:
-        yield Config("alembic.ini")
-    finally:
-        for item, disabled, level, handlers, propagate in saved:
-            item.disabled, item.level, item.propagate = disabled, level, propagate
-            item.handlers = handlers
-        # Loggers first created during the migration (alembic.*) are re-enabled too.
-        for item in list(manager.loggerDict.values()):
-            if isinstance(item, logging.Logger) and item not in loggers:
-                item.disabled = False
+def alembic_config(database_url) -> Config:
+    # migrations/env.py reads DATABASE_URL through get_settings(), patched above. The
+    # loggers its fileConfig() disables are restored by tests/conftest.py's autouse
+    # preserved_loggers fixture.
+    return Config("alembic.ini")
 
 
 @pytest.fixture

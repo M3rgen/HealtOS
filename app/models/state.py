@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -139,7 +140,9 @@ class FetchRound(Base):
 
 async def fetch_round_start(session, kind: str, key: str, *, fresh: bool, now: datetime):
     """The start of the fetch ``kind``/``key``: ``now`` when it begins at its first page
-    (``fresh``), else the stored start of the fetch it resumes."""
+    (``fresh``, including an invalid-token restart), else the stored start it resumes.
+    A restart caller must commit this with its cleared token and new retrieval receipt.
+    """
     from app.services.storage import dialect_insert
 
     row = await session.get(FetchRound, (kind, key))
@@ -169,12 +172,17 @@ class OAuthToken(TimestampMixin, Base):
 
 class WebhookEvent(TimestampMixin, Base):
     __tablename__ = "webhook_events"
+    # NULL raw_json: a signed body jsonb cannot hold (U+0000, an unpaired surrogate, NaN),
+    # kept as its raw_body bytes only (migration 20261031_0021).
+    __table_args__ = (
+        CheckConstraint("raw_json IS NOT NULL OR raw_body IS NOT NULL", name="raw_kept"),
+    )
 
     payload_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     data_type: Mapped[str | None] = mapped_column(String(128), index=True)
     health_user_id: Mapped[str | None] = mapped_column(String(128))
     operation: Mapped[str | None] = mapped_column(String(32))
-    raw_json: Mapped[dict | list] = mapped_column(RawJSON, nullable=False)
+    raw_json: Mapped[dict | list | None] = mapped_column(RawJSON)
     raw_body: Mapped[bytes | None] = mapped_column(LargeBinary)
     signature_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     element_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -187,11 +195,13 @@ class WebhookNotification(TimestampMixin, Base):
     """A globally deduplicated notification element from one or more signed batches."""
 
     __tablename__ = "webhook_notifications"
+    # SQL NULL raw_json: a rejected element jsonb cannot hold; its batches' raw_body keep it.
+    __table_args__ = (
+        CheckConstraint("raw_json IS NOT NULL OR NOT is_valid", name="raw_or_rejected"),
+    )
 
     element_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
-    raw_json: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
-        RawJSON, nullable=False
-    )
+    raw_json: Mapped[dict | list | str | int | float | bool | None] = mapped_column(RawJSON)
     data_type: Mapped[str | None] = mapped_column(String(128), index=True)
     health_user_id: Mapped[str | None] = mapped_column(String(128))
     operation: Mapped[str | None] = mapped_column(String(32))

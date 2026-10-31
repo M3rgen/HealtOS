@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import math
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -14,15 +14,56 @@ import httpx
 from app.core.config import Settings
 from app.core.logging import event
 from app.core.provenance import current_context_id, current_source, provenance
+from app.google_health import strict_json
 from app.google_health.capture import CapturedResponse, ResponseArchive, kept_headers, safe_query
 from app.google_health.data_types import AccessMethod, DataTypeSpec, query_iso
 from app.google_health.oauth import TokenProvider
+from app.google_health.response_body import ResponseBodyLimitExceeded
+from app.google_health.response_body import read_body as _read_body
+from app.google_health.response_close import cancel_closes
+from app.google_health.response_decode import ResponseDecodeRejected
+from app.google_health.response_decode import decode as _decode
+from app.google_health.response_handoff import RedirectResponseReceived, own_redirect
+from app.google_health.response_page import (  # noqa: F401 - re-exported error types
+    DuplicateResponseKeyError,
+    ErrorResponsePayloadError,
+    GoogleHealthError,
+    InvalidCollectionItemError,
+    InvalidCollectionResponseError,
+    InvalidPaginationResponseError,
+    InvalidResponseError,
+    NonStandardResponseConstantError,
+    page_values,
+)
 
 logger = logging.getLogger(__name__)
 
+# One request's retry wait must stay within the existing backoff ceiling. A valid
+# Retry-After above it ends the request; clamping would retry before Google permits.
+MAX_RETRY_DELAY_SECONDS = 60.0
 
-class GoogleHealthError(RuntimeError):
-    pass
+
+class ResponseBodyTooLargeError(GoogleHealthError):
+    """A raw receive limit, independent of compression and never retried."""
+
+    def __init__(self) -> None:
+        super().__init__("Google Health response exceeded its wire byte budget")
+
+
+class ResponseStreamError(GoogleHealthError):
+    """An unexpected stream failure, never retried; only its class reaches the archive."""
+
+    def __init__(self) -> None:
+        super().__init__("Google Health response stream failed")
+
+
+class LocalRequestRejectedError(GoogleHealthError):
+    def __init__(self) -> None:
+        super().__init__("Google Health request was rejected before sending")
+
+
+class RetryDeferredError(GoogleHealthError):
+    """Retry-After exceeds one request's budget: no retry before Google permits it."""
 
 
 class InvalidPageTokenError(GoogleHealthError):
@@ -58,6 +99,10 @@ class GoogleHealthClient:
         self._request_lock = asyncio.Lock()
         self._last_request_started = 0.0
 
+    async def warm_up(self) -> None:
+        """Obtain credentials once before starting a multi-type recovery."""
+        await self.tokens.get()
+
     async def list_data_points(
         self,
         spec: DataTypeSpec,
@@ -88,7 +133,6 @@ class GoogleHealthClient:
                 data_type=spec.name,
                 json=body,
             )
-            points = payload.get("rollupDataPoints", [])
         else:
             params: dict[str, str | int] = {"pageSize": effective_page_size}
             if filter_expression := spec.filter_for(_iso(start), _iso(end)):
@@ -104,11 +148,13 @@ class GoogleHealthClient:
                 data_type=spec.name,
                 params=params,
             )
-            points = payload.get("dataPoints", [])
-        if not isinstance(points, list):
+        try:
+            points, token = page_values(payload, spec.access_method)
+        except GoogleHealthError:
+            # No Page will reach store_page: preserve this response and every retry
+            # through the same cancellation-safe archive used for other rejections.
             await self.keep(responses)
-            raise GoogleHealthError("Google Health response has an invalid data point list")
-        token = payload.get("nextPageToken") or None
+            raise
         return Page(points, token, tuple(responses))
 
     async def get_identity(self, access_token: str | None = None) -> dict:
@@ -141,7 +187,11 @@ class GoogleHealthClient:
             raise
 
     async def keep_after(
-        self, responses: Sequence[CapturedResponse], failure: BaseException
+        self,
+        responses: Sequence[CapturedResponse],
+        failure: BaseException,
+        *,
+        closing: Sequence[asyncio.Future] = (),
     ) -> None:
         """Keep responses whose page or request was cut short by ``failure``.
 
@@ -151,8 +201,19 @@ class GoogleHealthClient:
         """
         if isinstance(failure, Exception):
             await self.keep(responses)
-        elif responses and self.archive is not None:
-            await _finish(asyncio.ensure_future(self._store(responses)), len(responses))
+        else:
+            # Close and archive concurrently within the same cancellation budget. A
+            # stalled close must not consume the time available to preserve the bytes.
+            cleanup = list(closing)
+            if responses and self.archive is not None:
+                cleanup.append(asyncio.ensure_future(self._store(responses)))
+            if cleanup:
+                try:
+                    await _finish(asyncio.gather(*cleanup, return_exceptions=True), len(responses))
+                finally:
+                    # The archive may still finish in the background, as with keep().
+                    # A close that used up its budget must not stay pending indefinitely.
+                    await cancel_closes(closing)
 
     async def _store(self, responses: Sequence[CapturedResponse]) -> None:
         assert self.archive is not None
@@ -178,10 +239,13 @@ class GoogleHealthClient:
         On failure the responses received so far are archived before the error propagates.
         """
         captured: list[CapturedResponse] = []
+        closing: list[asyncio.Future] = []
         try:
-            return await self._exchange(method, path, access_token, data_type, captured, kwargs)
+            return await self._exchange(
+                method, path, access_token, data_type, captured, closing, kwargs
+            )
         except BaseException as failure:
-            await self.keep_after(captured, failure)
+            await self.keep_after(captured, failure, closing=closing)
             raise
 
     async def _exchange(
@@ -191,6 +255,7 @@ class GoogleHealthClient:
         access_token: str | None,
         data_type: str | None,
         captured: list[CapturedResponse],
+        closing: list[asyncio.Future],
         kwargs: dict,
     ) -> tuple[dict, list[CapturedResponse]]:
         await self._pace_request()
@@ -212,19 +277,55 @@ class GoogleHealthClient:
             )
             response: httpx.Response | None = None
             body = b""
+            failure: BaseException | None = None
+            request.extensions["healthos_capture_redirect"] = True
+            if own_redirect not in self.http.event_hooks["response"]:
+                self.http.event_hooks["response"].insert(0, own_redirect)
             try:
-                response = await self.http.send(request, stream=True)
+                # Override even an injected client's follow_redirects=True. Each
+                # response must pass our status gate and reach the raw archive;
+                # a redirect target must never supply a substitute success page.
+                response = await self.http.send(request, stream=True, follow_redirects=False)
+            except RedirectResponseReceived as received:
+                response = received.response
+            except httpx.LocalProtocolError:
+                # h11 quotes the rejected header, bearer token included. Sending the
+                # same request again cannot succeed; keep that text out of the chain.
+                failure = LocalRequestRejectedError()
             except httpx.TransportError as exc:
-                failure: Exception | None = exc
-            else:
+                failure = exc
+            if isinstance(failure, LocalRequestRejectedError):
+                raise failure
+            if response is not None:
                 # Every response is kept, also an error status or a body cut off midway:
                 # the bytes as they came off the wire (still compressed if the server
                 # ignored Accept-Encoding: identity); `body` is the decoded entity.
-                wire, cut_off = await _read_body(response)
-                body, failure = _decode(wire, response.headers, cut_off)
-                captured.append(
-                    _capture(request, response, wire, cut_off, failure, len(captured), data_type)
-                )
+                wire, cut_off, failure = await _read_body(response, closing)
+                try:
+                    if failure is None:
+                        body, failure = _decode(wire, response.headers, failure)
+                except Exception as exc:
+                    failure = exc  # Never retried: handled as an unexpected stream failure.
+                finally:
+                    # Keep the wire bytes even if decoding fails in an unexpected way.
+                    captured.append(
+                        _capture(
+                            request, response, wire, cut_off, failure, len(captured), data_type
+                        )
+                    )
+                if isinstance(failure, asyncio.CancelledError):
+                    raise failure
+            if isinstance(failure, ResponseBodyLimitExceeded):
+                raise ResponseBodyTooLargeError()
+            if isinstance(failure, ResponseDecodeRejected):
+                # Deterministic size/codec failure: never retried.
+                raise GoogleHealthError(str(failure))
+            if failure is not None and not isinstance(
+                failure, (httpx.TransportError, httpx.DecodingError)
+            ):
+                # Arbitrary stream failures are not retried and their text, which may
+                # hold upstream data, stays out. DecodingError is not a TransportError.
+                raise ResponseStreamError() from None
             if failure is not None or response is None:
                 exc = failure
                 if attempt >= self.settings.google_api_max_retries:
@@ -245,25 +346,19 @@ class GoogleHealthClient:
                 if attempt >= self.settings.google_api_max_retries:
                     break
                 delay = _retry_delay(response, attempt)
+                if delay is None:
+                    # Keep the HTTP status for transient classification, but never
+                    # expose the upstream header in logs or persisted status messages.
+                    raise RetryDeferredError(
+                        f"Google Health API retry deferred (HTTP {response.status_code})"
+                    )
                 if response.status_code == 429:
                     event(logger, "RATE_LIMITED", retry_after_seconds=delay)
                 event(logger, "RETRYING", attempt=attempt + 1, delay_seconds=delay)
                 attempt += 1
                 await self.sleep(delay)
                 continue
-            if response.is_error:
-                if response.status_code == 400 and _has_error_code(body, "INVALID_PAGE_TOKEN"):
-                    raise InvalidPageTokenError("Google Health pagination token expired")
-                raise GoogleHealthError(
-                    f"Google Health API returned HTTP {response.status_code}: {_safe_error(body)}"
-                )
-            try:
-                payload = json.loads(body)
-            except ValueError as exc:
-                raise GoogleHealthError("Google Health API returned invalid JSON") from exc
-            if not isinstance(payload, dict):
-                raise GoogleHealthError("Google Health API returned a non-object JSON response")
-            return payload, captured
+            return _success_payload(response, body), captured
         raise GoogleHealthError(
             f"Google Health API request failed after retries (HTTP {last_status})"
         )
@@ -286,14 +381,26 @@ KEEP_ON_CANCEL_SECONDS = 10.0
 
 
 async def _finish(store: asyncio.Future, count: int) -> None:
-    """Wait (bounded, shielded) for a store started on behalf of a cancelled task."""
-    try:
-        await asyncio.wait_for(asyncio.shield(store), KEEP_ON_CANCEL_SECONDS)
-    except (TimeoutError, asyncio.CancelledError):
-        logger.error(
-            "Google Health responses may not have been archived before cancellation",
-            extra={"event": "RESPONSE_ARCHIVE_INTERRUPTED", "count": count},
-        )
+    """Wait within one budget, including repeated cancellation during cleanup.
+
+    asyncio.wait does not cancel the work when its caller is cancelled or times out.
+    The deadline stays fixed, so repeated stop signals cannot extend the wait.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + KEEP_ON_CANCEL_SECONDS
+    while not store.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.error(
+                "Google Health response cleanup exceeded its cancellation budget",
+                extra={"event": "RESPONSE_ARCHIVE_INTERRUPTED", "count": count},
+            )
+            return
+        try:
+            await asyncio.wait((store,), timeout=remaining)
+        except asyncio.CancelledError:
+            continue
+    store.result()
 
 
 # Shared with deletion marking, which must use exactly the bounds Google was sent.
@@ -311,69 +418,54 @@ def _minute_aligned_range(start: datetime, end: datetime) -> tuple[datetime, dat
     return aligned_start, aligned_end
 
 
-def _retry_delay(response: httpx.Response, attempt: int) -> float:
-    header = response.headers.get("Retry-After")
-    if header:
+def _retry_delay(response: httpx.Response, attempt: int) -> float | None:
+    """A bounded delay, or None when Google's valid minimum exceeds our budget.
+
+    Invalid headers do not specify a usable minimum: retain exponential backoff.
+    A valid excessive delay must instead fail without sending an early retry.
+    """
+    delay = _retry_after(response.headers.get("Retry-After"))
+    if delay is None:
+        return _backoff(attempt)
+    if delay > MAX_RETRY_DELAY_SECONDS:
+        return None
+    return delay
+
+
+def _retry_after(header: str | None) -> float | None:
+    """Parse seconds or an aware HTTP date; malformed/unrepresentable means absent.
+
+    Check finiteness before clamping: max(0, NaN) would turn a bad header into an
+    immediate retry.
+    """
+    if not header:
+        return None
+    try:
+        delay = float(header)
+    except ValueError:
         try:
-            return max(0.0, float(header))
-        except ValueError:
-            try:
-                return max(
-                    0.0,
-                    (parsedate_to_datetime(header) - datetime.now().astimezone()).total_seconds(),
-                )
-            except (TypeError, ValueError):
-                pass
-    return _backoff(attempt)
+            retry_at = parsedate_to_datetime(header)
+            delay = (retry_at - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    except OverflowError:
+        return None
+    if not math.isfinite(delay):
+        return None
+    # Preserve the existing immediate retry for negative seconds and past dates.
+    return max(0.0, delay)
 
 
 def _backoff(attempt: int) -> float:
-    return min(60.0, (2**attempt) + random.random())
-
-
-async def _read_body(response: httpx.Response) -> tuple[bytes, Exception | None]:
-    """The body bytes as received on the wire, before any Content-Encoding is undone.
-
-    A connection that fails mid-body still yields what arrived.
-    """
-    chunks: list[bytes] = []
-    failure: Exception | None = None
-    try:
-        try:
-            async for chunk in response.aiter_raw():
-                chunks.append(chunk)
-        except httpx.StreamConsumed:
-            # A response built in memory (httpx.MockTransport) read itself on creation;
-            # its stream still holds the bytes exactly as given.
-            chunks = [chunk async for chunk in response.stream]  # type: ignore[union-attr]
-    except httpx.TransportError as exc:
-        failure = exc
-    finally:
-        await response.aclose()
-    return b"".join(chunks), failure
-
-
-def _decode(
-    wire: bytes, headers: httpx.Headers, failure: Exception | None
-) -> tuple[bytes, Exception | None]:
-    """The entity body with the response's Content-Encoding (gzip, deflate, ...) undone."""
-    encoding = headers.get("content-encoding")
-    if failure is not None or not encoding or encoding.strip().lower() == "identity":
-        return wire, failure
-    try:
-        return httpx.Response(
-            200, headers={"content-encoding": encoding}, content=wire
-        ).content, None
-    except httpx.DecodingError as exc:
-        return b"", exc
+    return min(MAX_RETRY_DELAY_SECONDS, (2**attempt) + random.random())
 
 
 def _capture(
     request: httpx.Request,
     response: httpx.Response,
     wire: bytes,
-    cut_off: Exception | None,
-    failure: Exception | None,
+    cut_off: BaseException | None,
+    failure: BaseException | None,
     attempt: int,
     data_type: str | None,
 ) -> CapturedResponse:
@@ -391,30 +483,50 @@ def _capture(
         status_code=response.status_code,
         headers=kept_headers(response.headers),
         body=wire,
-        # The wire bytes are complete unless the connection failed mid-body; `error` also
+        # The wire bytes are complete unless reading stopped early; `error` also
         # names a body that arrived whole but could not be decoded.
         complete=cut_off is None,
         error=type(failure).__name__ if failure is not None else None,
     )
 
 
-def _json(body: bytes) -> object:
+_JSON_ERRORS = {
+    strict_json.INVALID: lambda: GoogleHealthError("Google Health API returned invalid JSON"),
+    strict_json.NOT_OBJECT: lambda: GoogleHealthError(
+        "Google Health API returned a non-object JSON response"
+    ),
+    strict_json.DUPLICATE_KEY: DuplicateResponseKeyError,
+    strict_json.CONSTANT: NonStandardResponseConstantError,
+    strict_json.ERROR_FIELD: ErrorResponsePayloadError,
+}
+
+
+def _success_payload(response: httpx.Response, body: bytes) -> dict:
+    """Reject HTTP failures and partial collections before interpreting their JSON.
+
+    206 is in HTTPX's is_success, but a partial collection must never become
+    terminal-page evidence; redirects and 1xx cannot prove the collection either.
+    Only the expired page token reads the body of a rejected status; other errors
+    expose only the HTTP code. Call after capture: rejection keeps completeness.
+    """
+    status = response.status_code
+    if status == 206 or not response.is_success:
+        if status == 400 and _has_error_code(body, "INVALID_PAGE_TOKEN"):
+            raise InvalidPageTokenError("Google Health pagination token expired")
+        raise GoogleHealthError(f"Google Health API returned HTTP {status}")
     try:
-        return json.loads(body)
-    except ValueError:
-        return None
-
-
-def _safe_error(body: bytes) -> str:
-    payload = _json(body)
-    error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    if not isinstance(error, dict):
-        return "request rejected"
-    return str(error.get("status") or error.get("message") or "request rejected")[:300]
+        return strict_json.loads_object(body)
+    except strict_json.StrictJsonError as exc:
+        kind = exc.kind
+    # Raise outside the handler, so no parser frame enters the exception chain.
+    raise _JSON_ERRORS[kind]()
 
 
 def _has_error_code(body: bytes, expected: str) -> bool:
-    payload = _json(body)
+    try:
+        payload: object = strict_json.loads_object(body, allow_error=True)
+    except strict_json.StrictJsonError:
+        return False
 
     def contains(value: object) -> bool:
         if isinstance(value, str):

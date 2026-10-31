@@ -1,3 +1,4 @@
+from app.models.derived import DerivedDay
 from app.models.health import (
     ActiveZoneMinute,
     Distance,
@@ -25,7 +26,10 @@ from app.models.identity import (
     RawSourceSighting,
 )
 from app.models.manual import ManualMeasurement, ManualWorkout
+from app.models.manual_flags import ManualMeasurementFlagEvent
 from app.models.raw_versions import RawApiResponse, RawHealthDataEvent, RawHealthDataVersion
+from app.models.reconciliation import ReconciliationResult, ReconciliationRun
+from app.models.retrieval import RetrievalCheckpoint, RetrievalEvent, RetrievalReceipt
 from app.models.settings import AppearanceSettings
 from app.models.state import (
     BackfillJob,
@@ -38,9 +42,12 @@ from app.models.state import (
     WebhookEvent,
     WebhookNotification,
 )
+from app.models.webhook_status import WebhookStatusEvent
 
 __all__ = [
+    "DerivedDay",
     "ManualMeasurement",
+    "ManualMeasurementFlagEvent",
     "ManualWorkout",
     "ActiveZoneMinute",
     "AppearanceSettings",
@@ -67,6 +74,11 @@ __all__ = [
     "RawSourcePair",
     "RawSourceSighting",
     "ReliabilityState",
+    "ReconciliationResult",
+    "ReconciliationRun",
+    "RetrievalCheckpoint",
+    "RetrievalEvent",
+    "RetrievalReceipt",
     "ScalarMetric",
     "SleepSession",
     "Steps",
@@ -76,5 +88,8 @@ __all__ = [
     "WebhookEvent",
     "WebhookBatchItem",
     "WebhookNotification",
+    "WebhookStatusEvent",
     "Weight",
 ]
+
+from app.models import derived_invalidation as derived_invalidation

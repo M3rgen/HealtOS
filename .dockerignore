@@ -12,6 +12,7 @@ dist
 __pycache__
 .pytest_cache
 backups
+backup-status
 .compose-smoke-backups-*
 deploy/cloudflare/credentials
 

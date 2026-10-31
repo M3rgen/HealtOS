@@ -32,7 +32,7 @@ Type=oneshot
 # docker group that can read the key file works too.
 User=root
 WorkingDirectory=/opt/healthos
-# Optional: BACKUP_AGE_RECIPIENT, BACKUP_KEY_FILE, BACKUP_HOST_DIR,
+# Optional: BACKUP_AGE_RECIPIENT, BACKUP_KEY_FILE, BACKUP_HOST_DIR, BACKUP_STATUS_HOST_DIR,
 # BACKUP_RETENTION_DAYS (default: never delete), BACKUP_MIN_FREE_MB,
 # COMPOSE_FILE for override files.
 EnvironmentFile=-/etc/healthos/backup.env

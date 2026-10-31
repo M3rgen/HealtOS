@@ -186,3 +186,30 @@ def test_cli_reset_abandoned_requeues_then_runs(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "Requeued 1 abandoned backfill window" in result.output
     assert jobs[POISON_START].status == JobStatus.completed
+
+
+async def test_receipt_start_failure_counts_as_a_failed_attempt(sessions, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    from app.sync import backfill
+
+    await add_windows(sessions, poison_retries=0)
+    client = PoisonClient()
+    failure = AsyncMock()
+    monkeypatch.setattr(
+        backfill.ReceiptWriter,
+        "begin",
+        AsyncMock(side_effect=OperationalError("INSERT", {}, Exception("synthetic"))),
+    )
+    monkeypatch.setattr(backfill.ReceiptWriter, "failure", failure)
+
+    await service(sessions, client).run(["steps"])
+
+    jobs = await jobs_by_start(sessions)
+    # The newest window is tried first; the failed receipt pauses the data type.
+    assert (jobs[POISON_START].status, jobs[POISON_START].retry_count) == (JobStatus.failed, 1)
+    assert jobs[POISON_START].last_error
+    assert jobs[HEALTHY_START].status == JobStatus.pending
+    assert client.starts == []
+    # No receipt row exists, so no outcome event is written for it.
+    failure.assert_not_awaited()

@@ -52,7 +52,7 @@ esac
 cd "$ROOT"
 psql_in() {
   docker compose exec -T postgres psql -U health -d "$1" -v ON_ERROR_STOP=1 \
-    --tuples-only --no-align --field-separator=' ' --command "$2"
+    --tuples-only --no-align --field-separator=$'\t' --command "$2"
 }
 
 docker compose exec -T postgres dropdb -U health --if-exists "$target"
@@ -65,15 +65,43 @@ count_sql="SELECT table_name, (xpath('/row/c/text()', query_to_xml(format(
   FROM information_schema.tables
   WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name"
 
-restored="$(psql_in "$target" "$count_sql")"
+restored="$(psql_in "$target" "$count_sql" 2>/dev/null)" || fail "restored row-count query failed"
+# A successful query with no rows means the dump restored nothing; never a valid drill.
 [ -n "$restored" ] || fail "restored database $target has no tables"
-live="$(psql_in health "$count_sql" 2>/dev/null || true)"
+live="$(psql_in health "$count_sql" 2>/dev/null)" || fail "live row-count query failed"
+
+# Validate both complete query results before producing any comparison. A query
+# error or malformed count must never look like an empty/equal archive.
+for counts in "$restored" "$live"; do
+  [ -n "$counts" ] || continue
+  printf '%s\n' "$counts" | awk -F '\t' '
+    NF != 2 || $1 == "" || $2 !~ /^[0-9]+$/ || seen[$1]++ { exit 1 }
+  ' || fail "invalid row-count query result"
+done
 
 echo "Restored $(basename "$backup") into database '$target'."
-printf '%-40s %12s %12s\n' table restored live
-while read -r table rows; do
-  live_rows="$(printf '%s\n' "$live" | awk -v t="$table" '$1 == t { print $2 }')"
-  printf '%-40s %12s %12s\n' "$table" "$rows" "${live_rows:--}"
-done <<<"$restored"
-echo "Alembic revision: $(psql_in "$target" 'SELECT version_num FROM alembic_version')"
+printf 'table\trestored\tlive\tcomparison\n'
+{
+  printf '%s\n' "$restored"
+  printf '\n'
+  printf '%s\n' "$live"
+} | awk -F '\t' 'BEGIN { OFS="\t" }
+  NF == 0 { side=1; next }
+  !side { restored[$1]=$2; tables[$1]=1; next }
+  { live[$1]=$2; tables[$1]=1 }
+  END {
+    for (table in tables) {
+      r=(table in restored); l=(table in live)
+      if (!r) status="live_only"
+      else if (!l) status="restored_only"
+      else if (("x" restored[table]) == ("x" live[table])) status="equal"
+      else status="different"
+      print table, (r ? restored[table] : "-"), (l ? live[table] : "-"), status
+    }
+  }
+' | LC_ALL=C sort
+echo "Counts compare a backup snapshot with the current live archive; differences alone do not imply corruption."
+revision="$(psql_in "$target" 'SELECT version_num FROM alembic_version' 2>/dev/null)" \
+  || fail "restored revision query failed"
+echo "Alembic revision: $revision"
 echo "Drop the scratch copy when done: docker compose exec -T postgres dropdb -U health $target"

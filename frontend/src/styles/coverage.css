@@ -1,0 +1,32 @@
+/* Scope every rule to coverage; preserve the existing theme and stylesheet cascade. */
+.coverage-panel{padding:14px 20px;margin-bottom:16px;min-width:0}
+.coverage-panel .panel-heading{flex-wrap:wrap}
+.coverage-panel h2{font-size:18px}
+.coverage-panel p{margin-top:6px;overflow-wrap:anywhere}
+#coverage-dialog{width:min(820px,calc(100% - 24px));max-height:90dvh;padding:18px}
+#coverage-dialog[open]{display:flex;flex-direction:column;min-height:0}
+#coverage-dialog>.dialog-heading{flex-shrink:0}
+#coverage-dialog h2{font-size:20px}
+#coverage-dialog .icon-button{flex-shrink:0}
+/* A transparent border, not padding: scrolled content never paints under the inset focus ring. */
+.coverage-dialog-body{overflow:auto;overscroll-behavior:contain;min-height:0;border:4px solid transparent}
+#coverage-form{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+#coverage-form label{flex:1 1 160px;min-width:0;margin:0}
+#coverage-form input,#coverage-form select{width:100%;min-width:0;max-width:100%}
+#coverage-form .button{flex:0 0 auto}
+#coverage-status{margin:12px 0;overflow-wrap:anywhere}
+.coverage-type{border-top:1px solid var(--line);padding:14px 0;min-width:0}
+.coverage-type h3{font-size:16px;overflow-wrap:anywhere}
+.coverage-type .fine-print{margin:6px 0}
+.coverage-days{list-style:none;padding:0;margin:8px 0}
+.coverage-days li{display:grid;grid-template-columns:100px 85px minmax(0,1fr);gap:6px 12px;padding:9px 0;border-top:1px solid var(--line-soft);font-size:13px;overflow-wrap:anywhere}
+.coverage-days small{grid-column:1/-1;color:var(--muted);line-height:1.5}
+.coverage-sources{padding-left:18px;color:var(--muted);font-size:12px}
+#coverage-retry{margin-bottom:12px}
+@media(max-width:540px){
+  .coverage-panel{padding:12px}
+  #coverage-dialog{padding:12px}
+  #coverage-form label{flex-basis:100%}
+  .coverage-days li{grid-template-columns:1fr 1fr}
+  .coverage-days li>span:last-of-type{grid-column:1/-1}
+}

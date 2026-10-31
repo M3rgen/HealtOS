@@ -157,3 +157,16 @@ def test_identity_reconciler_runs_nightly_at_a_configurable_quiet_time():
         Settings(identity_reconcile_enabled=False), Reconciliation(), identity=Identity()
     )
     assert off.get_job("identity-reconcile") is None
+
+
+async def test_runtime_schedules_bounded_derived_refresh(sessions):
+    from app.services.runtime import build_runtime
+
+    runtime = build_runtime(Settings(_env_file=None), sessions)
+    try:
+        scheduler = build_scheduler(Settings(), runtime.reconciliation, derived=runtime.derived)
+        job = scheduler.get_job("derived-refresh")
+        assert job.func == runtime.derived.run and job.max_instances == 1
+        assert job.coalesce is True and str(job.trigger) == "interval[0:05:00]"
+    finally:
+        await runtime.shutdown()

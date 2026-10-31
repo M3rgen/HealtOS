@@ -18,7 +18,11 @@ def application(monkeypatch):
         google_health_webhook_authorization="Bearer local-test",
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
-    monkeypatch.setattr(main, "build_runtime", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(
+        main,
+        "build_runtime",
+        lambda *_: SimpleNamespace(webhook_status=SimpleNamespace(record=AsyncMock())),
+    )
     application = main.create_app()
 
     @application.get("/host-probe")

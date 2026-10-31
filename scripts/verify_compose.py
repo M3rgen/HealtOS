@@ -11,11 +11,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT_NAME = f"health-mirror-smoke-{os.getpid()}"
-EXPECTED_REVISION = "20261021_0012"
+PROJECT_NAME = f"health-mirror-smoke-{os.getpid()}-{secrets.token_hex(4)}"
+EXPECTED_REVISION = "20261031_0021"
 HOST_PORT = "18080"
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP_DIR = ROOT / f".compose-smoke-backups-{os.getpid()}"
+STATUS_DIR = ROOT / f".compose-smoke-status-{os.getpid()}"
 # Matches the `.env*` ignore rules, so it never enters Git or the image build context.
 SMOKE_ENV_FILE = ROOT / f".env.compose-smoke-{os.getpid()}"
 SMOKE_KEY_FILE = ROOT / f".env.compose-smoke-backup-key-{os.getpid()}"
@@ -179,6 +180,170 @@ def published_ports(service: str, *, env: dict[str, str]) -> dict[str, object]:
     return json.loads(output)
 
 
+def verify_runtime(service: str, inspection: dict) -> None:
+    """Check actual Engine settings, including long-syntax tmpfs mounts."""
+    config = inspection["HostConfig"]
+    if config.get("ReadonlyRootfs") is not True:
+        raise RuntimeError(f"{service}: container root filesystem is writable")
+    if "ALL" not in (config.get("CapDrop") or []):
+        raise RuntimeError(f"{service}: container did not drop all Linux capabilities")
+    options = [
+        option.replace("=", ":").split(":", 1)
+        for option in config.get("SecurityOpt") or []
+        if option.replace("=", ":").split(":", 1)[0] == "no-new-privileges"
+    ]
+    if not options or any(len(option) > 1 and option[1] != "true" for option in options):
+        raise RuntimeError(f"{service}: container lacks enabled no-new-privileges")
+    temporary = ["/tmp", "/var/run/postgresql"] if service == "postgres" else ["/tmp"]
+    mounts = config.get("Mounts") or []
+    for target in temporary:
+        short = (config.get("Tmpfs") or {}).get(target)
+        long = [mount for mount in mounts if mount.get("Target") == target]
+        if short is not None:
+            if "ro" not in short.split(","):
+                continue
+        elif len(long) == 1 and long[0].get("Type") == "tmpfs" and not long[0].get("ReadOnly"):
+            continue
+        raise RuntimeError(f"{service}: missing writable tmpfs at {target}")
+    if service == "postgres":
+        data = [
+            mount
+            for mount in inspection.get("Mounts", [])
+            if mount.get("Destination") == "/var/lib/postgresql/data"
+        ]
+        if len(data) != 1 or not (
+            data[0].get("Type") == "volume"
+            and data[0].get("RW") is True
+            and data[0].get("Name") == f"{PROJECT_NAME}_postgres_data"
+        ):
+            raise RuntimeError(
+                "postgres: data must use the isolated project's writable named volume"
+            )
+
+
+def check_running_hardening(*, env: dict[str, str]) -> None:
+    for service in ("app", "postgres"):
+        container_id = compose("ps", "--quiet", service, env=env, capture=True).stdout.strip()
+        if not container_id:
+            raise RuntimeError(f"No running container found for {service}")
+        inspection = json.loads(docker("inspect", container_id, env=env, capture=True).stdout)[0]
+        verify_runtime(service, inspection)
+        # Exercise the permissions as the actual application/database user; a root
+        # exec would hide a bad tmpfs mode. PID 1 must already have dropped root.
+        if service == "postgres":
+            compose(
+                "exec",
+                "-T",
+                "--user",
+                "postgres",
+                service,
+                "sh",
+                "-ec",
+                'test "$(awk \'/^Uid:/ {print $2}\' /proc/1/status)" = "$(id -u)"; '
+                "for dir in /tmp /var/run/postgresql; do "
+                'probe=$(mktemp "$dir/healthos-smoke.XXXXXX"); rm "$probe"; done',
+                env=env,
+            )
+        else:
+            compose(
+                "exec",
+                "-T",
+                service,
+                "python",
+                "-c",
+                "import tempfile; tempfile.TemporaryFile(dir='/tmp').close()",
+                env=env,
+            )
+
+
+def check_persisted_measurement(*, env: dict[str, str]) -> None:
+    rows = compose(
+        "exec",
+        "-T",
+        "postgres",
+        "psql",
+        "-U",
+        "health",
+        "-d",
+        "health",
+        "--tuples-only",
+        "--no-align",
+        "--set",
+        "ON_ERROR_STOP=1",
+        "--command",
+        "SELECT count(*) FROM manual_measurements WHERE metric='muscle' AND value=42.5",
+        env=env,
+        capture=True,
+    ).stdout.strip()
+    if rows != "1":
+        raise RuntimeError(f"postgres: synthetic measurement did not persist: {rows!r}")
+
+
+def verify_postgres_lifecycle(*, env: dict[str, str]) -> None:
+    # First exercise a process restart, then the entrypoint on an existing data
+    # directory in a fresh container. Neither operation removes the named volume.
+    compose("restart", "postgres", env=env, capture=True)
+    compose("up", "--detach", "--wait", "--wait-timeout", "180", "app", env=env, capture=True)
+    check_persisted_measurement(env=env)
+    check_running_hardening(env=env)
+    compose(
+        "up",
+        "--detach",
+        "--force-recreate",
+        "--wait",
+        "--wait-timeout",
+        "180",
+        "postgres",
+        "app",
+        env=env,
+        capture=True,
+    )
+    check_persisted_measurement(env=env)
+    check_running_hardening(env=env)
+    compose("exec", "-T", "app", "python", "-c", HEALTH_SMOKE_SCRIPT, env=env)
+
+
+def verify_restore_counts(report: str, tables: set[str]) -> None:
+    counts = {}
+    try:
+        rows = report.split("table\trestored\tlive\tcomparison\n", 1)[1].split(
+            "\nCounts compare", 1
+        )[0]
+    except IndexError:
+        raise RuntimeError("Missing restore comparison report") from None
+    for line in rows.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4:
+            raise RuntimeError("Invalid restore comparison row")
+        table, restored, live, comparison = fields
+        if table in counts or not restored.isdecimal() or restored != live or comparison != "equal":
+            raise RuntimeError("Controlled backup drill has unequal or invalid table counts")
+        counts[table] = restored
+    if set(counts) != tables:
+        raise RuntimeError("Controlled backup drill did not compare every table")
+    if counts.get("manual_measurements") != "1" or counts.get("raw_health_data") != "0":
+        raise RuntimeError("Controlled backup drill is missing expected synthetic tables")
+
+
+def check_backup_health(expected: dict, *, env: dict[str, str]) -> None:
+    script = "\n".join(
+        [
+            "import json, os, urllib.error, urllib.request",
+            "url = 'http://127.0.0.1:8000/health/backup'",
+            "try:",
+            "    urllib.request.urlopen(url, timeout=5)",
+            "    raise SystemExit('Backup health accepted an anonymous request')",
+            "except urllib.error.HTTPError as error:",
+            "    assert error.code == 401",
+            "headers = {'Authorization': 'Bearer ' + os.environ['APP_UI_TOKEN']}",
+            "request = urllib.request.Request(url, headers=headers)",
+            "result = json.load(urllib.request.urlopen(request, timeout=5))",
+            f"assert result == json.loads({json.dumps(expected)!r}), 'Backup metadata mismatch'",
+        ]
+    )
+    compose("exec", "-T", "app", "python", "-c", script, env=env)
+
+
 def main() -> int:
     if DOCKER_COMMAND is None:
         print(
@@ -193,11 +358,16 @@ def main() -> int:
     docker_bin = str(Path(DOCKER_COMMAND).parent)
     env.update(
         {
+            # Pin the file for this process AND backup/restore subprocesses;
+            # inherited development overrides must never select another database.
+            "COMPOSE_FILE": str(ROOT / "docker-compose.yml"),
+            "COMPOSE_PROFILES": "",
             "APP_ENV_FILE": SMOKE_ENV_FILE.name,
             "APP_PORT": HOST_PORT,
             # Throwaway UI bearer token for the isolated stack (required in production).
             "APP_UI_TOKEN": secrets.token_urlsafe(32),
             "BACKUP_HOST_DIR": BACKUP_DIR.name,
+            "BACKUP_STATUS_HOST_DIR": str(STATUS_DIR),
             # A throwaway database; do not demand the production 5 GiB headroom.
             "BACKUP_MIN_FREE_MB": "64",
             "PATH": docker_bin + os.pathsep + env.get("PATH", ""),
@@ -211,6 +381,8 @@ def main() -> int:
     try:
         write_smoke_env_file()
         compose("config", "--quiet", env=env)
+        STATUS_DIR.mkdir(mode=0o755)  # host owns it; Docker must not create it as root
+        STATUS_DIR.chmod(0o755)
         cleanup_needed = True
         compose(
             "up",
@@ -251,29 +423,43 @@ def main() -> int:
         if app_uid != "10001":
             raise RuntimeError(f"Application container has unexpected UID {app_uid!r}")
 
-        app_container_id = compose("ps", "--quiet", "app", env=env, capture=True).stdout.strip()
-        app_inspect = json.loads(docker("inspect", app_container_id, env=env, capture=True).stdout)[
-            0
-        ]
-        host_config = app_inspect["HostConfig"]
-        if not host_config.get("ReadonlyRootfs"):
-            raise RuntimeError("Application container root filesystem is writable")
-        if "ALL" not in (host_config.get("CapDrop") or []):
-            raise RuntimeError("Application container did not drop all Linux capabilities")
-        security_options = host_config.get("SecurityOpt") or []
-        if not any(option.split(":", 1)[0] == "no-new-privileges" for option in security_options):
-            raise RuntimeError("Application container lacks no-new-privileges")
+        check_running_hardening(env=env)
+        verify_postgres_lifecycle(env=env)
+        check_backup_health(
+            {"status": "missing", "last_attempt": None, "last_success_at": None}, env=env
+        )
+        # Freeze the synthetic archive during dump and comparison. All schedulers
+        # are disabled; stopping app also excludes startup/HTTP background writes.
+        compose("stop", "app", env=env, capture=True)
+        tables = set(
+            compose(
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "health",
+                "-d",
+                "health",
+                "--tuples-only",
+                "--no-align",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--command",
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_type='BASE TABLE'",
+                env=env,
+                capture=True,
+            ).stdout.splitlines()
+        )
 
-        postgres_container_id = compose(
-            "ps", "--quiet", "postgres", env=env, capture=True
-        ).stdout.strip()
-        postgres_host_config = json.loads(
-            docker("inspect", postgres_container_id, env=env, capture=True).stdout
-        )[0]["HostConfig"]
-        if "ALL" not in (postgres_host_config.get("CapDrop") or []):
-            raise RuntimeError("PostgreSQL container did not drop all Linux capabilities")
-
-        backup_env = {**env, **backup_key_env()}
+        backup_env = {
+            **env,
+            **backup_key_env(),
+            "BACKUP_AGE_RECIPIENT": "",
+            "BACKUP_AGE_IDENTITY": str(SMOKE_KEY_FILE),
+            "BACKUP_RETENTION_DAYS": "never",
+        }
         backup_path = Path(
             subprocess.run(
                 [BASH, str(ROOT / "scripts" / "backup.sh")],
@@ -300,13 +486,7 @@ def main() -> int:
             text=True,
             capture_output=True,
         ).stdout
-        counts = {
-            fields[0]: fields[1]
-            for fields in (line.split() for line in restore_report.splitlines())
-            if len(fields) == 3
-        }
-        if counts.get("manual_measurements") != "1" or counts.get("raw_health_data") != "0":
-            raise RuntimeError(f"Unexpected restored row counts: {restore_report!r}")
+        verify_restore_counts(restore_report, tables)
         restored = compose(
             "exec",
             "-T",
@@ -325,6 +505,32 @@ def main() -> int:
         ).stdout.strip()
         if restored != "1":
             raise RuntimeError(f"Backup restore verification returned {restored!r}")
+
+        compose("up", "--detach", "--wait", "app", env=env, capture=True)
+        metadata = json.loads((STATUS_DIR / "status.json").read_text("utf-8"))
+        expected = {key: metadata[key] for key in ("last_attempt", "last_success_at")}
+        expected["status"] = "available"
+        check_backup_health(expected, env=env)
+        failed = subprocess.run(
+            [BASH, str(ROOT / "scripts" / "backup.sh")],
+            cwd=ROOT,
+            env={**backup_env, "BACKUP_MIN_FREE_MB": "invalid"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if failed.returncode == 0:
+            raise RuntimeError("Backup failure probe unexpectedly succeeded")
+        latest = json.loads((STATUS_DIR / "status.json").read_text("utf-8"))
+        if (
+            latest["last_attempt"]["result"] != "failure"
+            or latest["last_success_at"] != expected["last_success_at"]
+        ):
+            raise RuntimeError("Backup failure lost last success evidence")
+        expected["last_attempt"] = latest["last_attempt"]
+        check_backup_health(expected, env=env)  # atomic replacement visible before recreation
+        compose("up", "--detach", "--force-recreate", "--wait", "app", env=env, capture=True)
+        check_backup_health(expected, env=env)
 
         compose("exec", "-T", "app", "alembic", "downgrade", "base", env=env)
         compose("exec", "-T", "app", "alembic", "upgrade", "head", env=env)
@@ -346,7 +552,8 @@ def main() -> int:
             "Compose smoke test passed: build, PostgreSQL, migration, health (token required), "
             "UI assets, dashboard, "
             "manual measurement, CSV, API, CLI, "
-            "backup/restore, hardened runtime, and bindings."
+            "PostgreSQL restart/recreation persistence, backup/restore, "
+            "hardened runtime, and bindings."
         )
         return 0
     except (subprocess.CalledProcessError, RuntimeError) as exc:
@@ -365,6 +572,12 @@ def main() -> int:
             )
         SMOKE_ENV_FILE.unlink(missing_ok=True)
         SMOKE_KEY_FILE.unlink(missing_ok=True)
+        if STATUS_DIR.is_dir():
+            if STATUS_DIR.resolve().parent != ROOT.resolve():
+                raise RuntimeError("Refusing to remove status directory outside the workspace")
+            for name in ("status.json", ".writer.lock"):
+                (STATUS_DIR / name).unlink(missing_ok=True)
+            STATUS_DIR.rmdir()
         if BACKUP_DIR.is_dir():
             resolved_root = ROOT.resolve()
             resolved_backup = BACKUP_DIR.resolve()
@@ -372,8 +585,11 @@ def main() -> int:
                 raise RuntimeError("Refusing to remove a backup directory outside the workspace")
             for backup_file in resolved_backup.glob("health-*.dump*"):
                 backup_file.unlink()
-            for status_file in ("last-backup-status.json", ".last-backup-status.json.tmp"):
-                (resolved_backup / status_file).unlink(missing_ok=True)
+            (resolved_backup / "last-backup-status.json").unlink(missing_ok=True)
+            # backup.sh status temporaries: .last-backup-status.json.tmp.XXXXXXXX
+            # (and the older fixed .last-backup-status.json.tmp).
+            for status_file in resolved_backup.glob(".last-backup-status.json.tmp*"):
+                status_file.unlink()
             resolved_backup.rmdir()
 
 

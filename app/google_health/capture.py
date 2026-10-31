@@ -41,7 +41,7 @@ class CapturedResponse:
     status_code: int
     headers: dict[str, str]
     body: bytes
-    # False when the connection failed before the body ended (`body` is what arrived).
+    # False when reading stopped before EOF (`body` keeps every received byte).
     complete: bool = True
     error: str | None = None
     sha256: str = field(init=False)

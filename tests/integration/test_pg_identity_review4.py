@@ -154,7 +154,7 @@ async def test_verify_ignores_not_null_constraints_and_new_columns(pg_sessions) 
     async with pg_sessions() as session:
         assert await verify_views(session) == [
             "analytics view analytics_weight was redefined: it no longer counts what the "
-            "dashboard counts (recreate it from migration 20261021_0012)"
+            "dashboard counts (recreate it from migration 20261024_0013)"
         ]
 
 

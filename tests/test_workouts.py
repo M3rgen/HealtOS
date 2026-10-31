@@ -1,13 +1,15 @@
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from app.db.session import get_session
+from app.google_health.data_types import REGISTRY
 from app.main import create_app
-from app.models.health import ExerciseSession
 from app.models.manual import ManualWorkout
 from app.models.state import RawHealthData
+from app.services.storage import store_records
 
 
 async def test_workouts_sources_month_timezone_and_validation(sessions):
@@ -22,29 +24,28 @@ async def test_workouts_sources_month_timezone_and_validation(sessions):
     end = datetime(2026, 8, 31, 23, 30, tzinfo=UTC)
     async with sessions() as session:
         for identifier in ("valid", "deleted", "quarantined"):
-            session.add(
-                ExerciseSession(
-                    google_data_point_id=identifier,
-                    exercise_type="RUNNING",
-                    start_time=start,
-                    end_time=end,
-                    duration_seconds=3500,
-                )
+            await store_records(
+                session,
+                REGISTRY["exercise"],
+                [
+                    {
+                        "name": identifier,
+                        "exercise": {
+                            "interval": {
+                                "startTime": start.isoformat(),
+                                "endTime": end.isoformat(),
+                            },
+                            "exerciseType": "RUNNING",
+                            "activeDuration": "3500s",
+                        },
+                    }
+                ],
             )
-            session.add(
-                RawHealthData(
-                    data_type="exercise",
-                    google_data_point_id=identifier,
-                    raw_json={},
-                    payload_hash="test",
-                    first_seen_at=start,
-                    last_seen_at=start,
-                    source_start_time=start,
-                    source_end_time=end,
-                    source_deleted_at=end if identifier == "deleted" else None,
-                    is_quarantined=identifier == "quarantined",
-                )
+            raw = await session.scalar(
+                select(RawHealthData).where(RawHealthData.google_data_point_id == identifier)
             )
+            raw.source_deleted_at = end if identifier == "deleted" else None
+            raw.is_quarantined = identifier == "quarantined"
         await session.commit()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application),
@@ -94,3 +95,29 @@ async def test_workouts_sources_month_timezone_and_validation(sessions):
     async with sessions() as session:
         assert len(list(await session.scalars(select(ManualWorkout)))) == 1
     await application.state.runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    "month,zone,status",
+    [
+        ("0001-01-01", "Etc/GMT-14", 422),
+        ("9999-12-01", "UTC", 422),
+        ("0001-01-01", "UTC", 200),
+        ("0001-01-31", "UTC", 200),
+        ("0001-02-01", "Etc/GMT-14", 200),
+        ("9999-11-01", "Etc/GMT+12", 200),
+    ],
+)
+async def test_workout_http_date_windows(dashboard_dates, month, zone, status):
+    client, statements = dashboard_dates
+    response = await client.get(
+        "/api/dashboard/workouts", params={"month": month, "timezone": zone}
+    )
+    assert response.status_code == status, response.text
+    if status == 422:
+        assert statements == []
+        assert response.json() == {
+            "detail": "Seçilen tarih aralığı bu saat diliminde hesaplanamıyor."
+        }
+    elif month.startswith("0001-01"):
+        assert {row["source"] for row in response.json()} == {"Fitbit", "Manuel"}

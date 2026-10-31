@@ -1,10 +1,15 @@
 import re
+from collections.abc import Callable, Coroutine
+from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import Header, HTTPException, Request
+from fastapi.responses import Response
+from fastapi.routing import APIRoute
 
 from app.core.config import Settings
 from app.core.host_validation import hostname
+from app.core.request_limits import RequestBudget
 from app.services.runtime import Runtime
 
 
@@ -14,6 +19,46 @@ def runtime(request: Request) -> Runtime:
 
 def settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def require_budget(budget: RequestBudget) -> None:
+    retry_after = budget.retry_after()
+    if retry_after is not None:
+        raise HTTPException(
+            429, "Çok fazla istek. Lütfen bekleyin.", headers={"Retry-After": str(retry_after)}
+        )
+
+
+def require_webhook_budget(request: Request, *, authorized: bool) -> None:
+    # Runs before authorization diagnostics too: rejected floods must not write to the DB.
+    # Unauthorized callers have their own budget and cannot starve Google's deliveries.
+    limits = request.app.state.write_limits
+    require_budget(limits.webhook if authorized else limits.webhook_unauthorized)
+
+
+class ManualWriteRoute(APIRoute):
+    """Guard dashboard POSTs before FastAPI reads or validates an input model.
+
+    UI authentication still runs in outer middleware. Endpoints retain their CSRF
+    dependencies, including validation order and the OpenAPI header contract.
+    GET handlers bypass both the body reader and the manual write budget.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+        if not self.methods or "POST" not in self.methods:
+            return handler
+
+        async def bounded_handler(request: Request) -> Response:
+            require_budget(request.app.state.write_limits.manual)
+            # FastAPI's normal handler calls body()/json() before solving dependencies.
+            # Cache the bounded original bytes, retaining its schemas and 422 responses.
+            request._body = await bounded_body(
+                request, settings(request).manual_write_max_body_bytes, "İstek gövdesi çok büyük."
+            )
+            return await handler(request)
+
+        return bounded_handler
 
 
 def require_job_request(

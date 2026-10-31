@@ -22,7 +22,7 @@ run(async () => {
     await page.goto(BASE);
     await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');
     const button=page.locator('#sync-button'), notice=page.locator('#notice');
-    const finished=()=>page.waitForFunction(()=>!document.querySelector('#sync-button').disabled,null,{timeout:STEP_TIMEOUT});
+    const finished=()=>page.waitForFunction(()=>document.querySelector('#sync-button').getAttribute('aria-busy') === 'false',null,{timeout:STEP_TIMEOUT});
     await button.click();
     await finished();
     assert.match(await notice.textContent(),/^Eşitleme tamamlandı/,'Finished sync must report its result');

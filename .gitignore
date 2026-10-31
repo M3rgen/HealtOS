@@ -47,6 +47,7 @@ IYILESTIRME-PLANI-*.md
 *.sql.gz
 *.sql.zip
 backups/
+backup-status/
 oauth-token*
 *.pem
 *.key

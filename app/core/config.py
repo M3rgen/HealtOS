@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import date, timedelta
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, field_validator, model_validator
@@ -25,6 +26,28 @@ class Settings(BaseSettings):
     codex_bridge_token: str | None = None
     # Single-user UI/API bearer token; empty disables the barrier outside production.
     app_ui_token: str | None = None
+    backup_status_file: Path | None = None
+    manual_write_max_body_bytes: int = Field(
+        default=4096,
+        ge=1024,
+        le=64 * 1024,
+        description="Byte limit shared by manual measurement, workout and flag POST bodies.",
+    )
+    manual_write_requests_per_minute: int = Field(
+        default=60,
+        ge=1,
+        le=10_000,
+        description="Application-wide manual write budget per fixed 60-second window.",
+    )
+    webhook_requests_per_minute: int = Field(
+        default=120,
+        ge=1,
+        le=10_000,
+        description=(
+            "Capacity of each webhook budget: authorized requests (challenges included) and "
+            "requests without the configured authorization are counted separately."
+        ),
+    )
 
     google_health_base_url: str = "https://health.googleapis.com/v4"
     google_client_id: str = "CHANGE_ME"

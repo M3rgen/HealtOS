@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 import httpx
 import pytest
 import pytest_asyncio
+from derived_records import sleep, steps
 from fastapi import FastAPI
 
 import app.api.dashboard as dashboard_api
@@ -75,7 +76,11 @@ def records(metric, day, identifier, *, quarantined=False, deleted=False, normal
         data_type=kind,
         source_start_time=start,
         source_end_time=end,
-        raw_json={"dailyRestingHeartRate": {"date": day.isoformat(), "beatsPerMinute": 71}},
+        raw_json=steps(count=600, start=start, end=end)
+        if metric == "steps"
+        else sleep(start=start, end=end, summary={"minutesAsleep": 450})
+        if metric == "sleep"
+        else {"dailyRestingHeartRate": {"date": day.isoformat(), "beatsPerMinute": 71}},
         payload_hash="test",
         first_seen_at=stamp,
         last_seen_at=stamp,
@@ -190,3 +195,67 @@ async def test_daily_heart_date_is_not_shifted_in_western_timezone(client, sessi
 )
 async def test_history_validation(client, params):
     assert (await client.get("/api/dashboard/history", params=params)).status_code == 422
+
+
+@pytest.mark.parametrize("metric", ["steps", "sleep", "heart"])
+async def test_oldest_history_window_is_checked_before_reading(
+    dashboard_dates, monkeypatch, metric
+):
+    client, statements = dashboard_dates
+    monkeypatch.setattr(dashboard_api, "datetime", FixedDateTime)
+    monkeypatch.setattr(dashboard_service, "datetime", FixedDateTime)
+    params = {"metric": metric}
+    first = await client.get("/api/dashboard/history", params=params)
+    assert first.status_code == 200, first.text
+    pages = first.json()["total_pages"]
+    assert pages == (date(2026, 9, 30) - date.min).days // 30 + 1
+    assert first.json()["earliest_date"] == "0001-01-01"
+    previous = await client.get("/api/dashboard/history", params={**params, "page": pages - 1})
+    assert previous.status_code == 200, previous.text
+    assert len(previous.json()["days"]) == 30
+    for page in (pages, pages + 1, 10**100):
+        statements.clear()
+        response = await client.get("/api/dashboard/history", params={**params, "page": page})
+        assert response.status_code == 422, response.text
+        assert statements == []
+        assert response.json() == {
+            "detail": "Seçilen tarih aralığı bu saat diliminde hesaplanamıyor."
+        }
+
+
+@pytest.mark.parametrize("metric", ["steps", "sleep"])
+async def test_history_archive_date_conversion_overflow(dashboard_dates, monkeypatch, metric):
+    client, statements = dashboard_dates
+    monkeypatch.setattr(dashboard_api, "datetime", FixedDateTime)
+    monkeypatch.setattr(dashboard_service, "datetime", FixedDateTime)
+    response = await client.get(
+        "/api/dashboard/history", params={"metric": metric, "timezone": "Etc/GMT+12"}
+    )
+    assert response.status_code == 422, response.text
+    assert len(statements) == 1  # Only archive bounds; no payload/normalized/manual reads.
+    assert response.json() == {"detail": "Seçilen tarih aralığı bu saat diliminde hesaplanamıyor."}
+
+
+@pytest.mark.parametrize(
+    "today,zone,status",
+    [(date(1, 1, 30), "UTC", 200), (date(1, 1, 30), "Etc/GMT-14", 422), (date.max, "UTC", 422)],
+)
+async def test_history_clock_boundary(dashboard_dates, monkeypatch, today, zone, status):
+    client, statements = dashboard_dates
+
+    class BoundaryDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.combine(today, datetime.min.time(), UTC).astimezone(tz)
+
+    monkeypatch.setattr(dashboard_api, "datetime", BoundaryDateTime)
+    monkeypatch.setattr(dashboard_service, "datetime", BoundaryDateTime)
+    response = await client.get(
+        "/api/dashboard/history", params={"metric": "steps", "timezone": zone}
+    )
+    assert response.status_code == status, response.text
+    if status == 422:
+        assert statements == []
+    else:
+        assert response.json()["start_date"] == "0001-01-01"
+        assert response.json()["days"][-1]["value"] == 240

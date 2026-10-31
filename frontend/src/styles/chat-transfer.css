@@ -1,0 +1,18 @@
+.chat-turn{min-width:0}
+.chat-transfer{margin:0 0 14px;border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:12px;line-height:1.55;overflow-wrap:anywhere}
+.chat-transfer summary{cursor:pointer;color:var(--muted)}
+.chat-transfer-body{max-height:240px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.chat-transfer-body p{margin:8px 0}
+.chat-transfer-body h3{font-size:12px;margin:12px 0 6px}
+.chat-transfer-fields ul{max-height:120px;overflow:auto;overscroll-behavior:contain;padding-left:18px;font-family:monospace;scrollbar-width:thin}
+.assistant-data-notice{font-size:12px;line-height:1.55;color:var(--muted);margin:0 0 12px}
+#assistant-dialog>.dialog-heading,#assistant-dialog>.assistant-controls,#assistant-form{flex-shrink:0}
+#assistant-dialog.is-compact{padding:10px}
+#assistant-dialog.is-compact .dialog-heading{padding-bottom:6px}
+#assistant-dialog.is-compact .assistant-avatar{width:32px;height:32px}
+#assistant-dialog.is-compact .assistant-controls{margin:2px 0}
+#assistant-dialog.is-compact #assistant-input{height:44px;max-height:64px;resize:none;padding:7px}
+#assistant-dialog.is-compact #assistant-messages{padding:8px 2px}
+#assistant-dialog.is-compact .assistant-icon{width:34px;height:34px}
+
+.chat-boundary{margin:12px 0;padding:10px;border-block:1px solid var(--line);color:var(--muted);font-size:12px;overflow-wrap:anywhere}

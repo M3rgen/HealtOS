@@ -25,7 +25,7 @@ run(async () => {
       await page.goto(BASE);
       await page.waitForFunction(()=>document.querySelector('#steps-value').textContent==='2.000');
       await page.locator('#sync-button').click();
-      await page.waitForFunction(()=>!document.querySelector('#sync-button').disabled);
+      await page.waitForFunction(()=>document.querySelector('#sync-button').getAttribute('aria-busy') === 'false');
       assert.equal(started,1,'Sync button must send the deliberate API request header');
       const overflow = await page.evaluate(()=>({
         x:document.documentElement.scrollWidth>innerWidth,

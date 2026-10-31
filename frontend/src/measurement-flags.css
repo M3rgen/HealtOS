@@ -1,0 +1,5 @@
+/* Test-entry flag on a manual measurement row (measurement-flags.js). */
+.flagged-row td:nth-child(-n + 3) { color: var(--muted); }
+.row-action { background: none; border: 1px solid var(--control-border); border-radius: 6px; padding: 4px 10px; color: var(--amber); font-size: 13px; cursor: pointer; }
+.row-action:hover { border-color: var(--amber); }
+.row-action:disabled { opacity: 0.5; cursor: default; }

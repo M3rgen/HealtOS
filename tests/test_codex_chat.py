@@ -2,11 +2,13 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
-from fastapi import WebSocketDisconnect
+from fastapi import FastAPI, WebSocketDisconnect
 from pydantic import ValidationError
 from sqlalchemy import func, select
+from websockets.exceptions import ConnectionClosed
 
 from app.api import codex
 from app.models.state import RawHealthData
@@ -145,7 +147,9 @@ class RPC:
 
 
 async def take(queue):
-    return await asyncio.wait_for(queue.get(), 2)
+    item = await asyncio.wait_for(queue.get(), 2)
+    # Receipts are verified separately against real serialized health results.
+    return await take(queue) if item.get("type") == "health_transfer" else item
 
 
 async def test_new_thread_pins_requested_model_and_is_ephemeral(tmp_path, monkeypatch):
@@ -176,7 +180,7 @@ async def test_new_thread_pins_requested_model_and_is_ephemeral(tmp_path, monkey
     assert params["ephemeral"] is True
     assert params["model"] == "gpt-6.1-sol"
     assert params["allowProviderModelFallback"] is False
-    assert params["config"]["model_reasoning_effort"] == "medium"
+    assert params["config"]["model_reasoning_effort"] == "high"
     assert params["sandbox"] == "read-only"
     assert params["dynamicTools"][0]["name"] == "health_archive"
     assert "# Umay" in params["developerInstructions"]
@@ -408,3 +412,157 @@ def test_unavailable_bridge_warns_once_per_outage(monkeypatch, caplog):
     debug = [record for record in caplog.records if record.levelno == logging.DEBUG]
     assert len(warnings) == 2
     assert len(debug) == 4
+
+
+class SiteSocket:
+    def __init__(self, token="synthetic", origin="http://localhost:8000"):
+        self.app = FastAPI()
+        self.app.include_router(codex.router)
+        self.app.state.settings = SimpleNamespace(
+            app_ui_token="", codex_bridge_token=token, codex_bridge_url="ws://bridge.invalid:8766"
+        )
+        self.incoming = asyncio.Queue()
+        self.outgoing = asyncio.Queue()
+        self.scope = {
+            "type": "websocket",
+            "path": "/api/codex/chat",
+            "scheme": "ws",
+            "query_string": b"",
+            "headers": [(b"host", b"localhost:8000"), (b"origin", origin.encode())],
+        }
+
+    async def start(self):
+        await self.incoming.put({"type": "websocket.connect"})
+        self.task = asyncio.create_task(self.app(self.scope, self.incoming.get, self.outgoing.put))
+        return await self.frame()
+
+    async def frame(self):
+        return await asyncio.wait_for(self.outgoing.get(), 2)
+
+    async def message(self):
+        frame = await self.frame()
+        assert frame["type"] == "websocket.send"
+        return json.loads(frame["text"])
+
+    async def finish(self):
+        assert (await self.frame())["type"] == "websocket.close"
+        await asyncio.wait_for(self.task, 2)
+
+    async def leave(self):
+        await self.incoming.put({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(self.task, 2)
+
+
+class SyntheticBridge:
+    def __init__(self, failure=None, stall=False):
+        self.failure = failure
+        self.stall = stall
+        self.responses = asyncio.Queue()
+        self.requests = []
+        self.closed = False
+
+    async def __aenter__(self):
+        if self.failure:
+            raise self.failure
+        return self
+
+    async def __aexit__(self, *_args):
+        self.closed = True
+
+    async def send(self, text):
+        request = json.loads(text)
+        self.requests.append(request)
+        if self.stall or "id" not in request:
+            return
+        result = {
+            "initialize": {},
+            "account/read": {"account": {"type": "chatgpt"}},
+            "thread/start": {"thread": {"id": "synthetic-thread"}, "model": "synthetic-model"},
+        }[request["method"]]
+        await self.responses.put(json.dumps({"id": request["id"], "result": result}))
+
+    async def recv(self):
+        response = await self.responses.get()
+        if response is None:
+            raise ConnectionClosed(None, None)
+        return response
+
+
+@pytest.mark.parametrize(
+    ("token", "failure", "expected"),
+    [
+        (None, None, "yapılandırılmamış"),
+        ("   ", None, "yapılandırılmamış"),
+        ("synthetic", ConnectionRefusedError("private token"), "ulaşılamıyor"),
+        ("synthetic", TimeoutError("private token"), "bağlanırken zaman aşımı"),
+        ("synthetic", RuntimeError("Codex private token"), "ayarlarını ve oturumu"),
+        ("synthetic", "stall", "hazırlanması uzun sürdü"),
+    ],
+)
+async def test_site_connection_errors_are_safe_and_close_resources(
+    monkeypatch, token, failure, expected
+):
+    transport = SyntheticBridge(
+        failure=failure if failure != "stall" else None, stall=failure == "stall"
+    )
+    options = {}
+
+    def connect(url, **kwargs):
+        options.update(url=url, **kwargs)
+        return transport
+
+    monkeypatch.setattr(codex, "connect", connect)
+    monkeypatch.setattr(codex, "START_TIMEOUT_SECONDS", 0.02)
+    site = SiteSocket(token=token)
+    assert (await site.start())["type"] == "websocket.accept"
+    message = await site.message()
+    assert message["type"] == "error" and "Umay" in message["text"]
+    assert expected in message["text"]
+    assert all(word not in message["text"].lower() for word in ("codex", "token", "private"))
+    await site.finish()
+    if not (token or "").strip():
+        assert not options  # configuration failures must not attempt a bridge connection
+    else:
+        assert options["url"] == site.app.state.settings.codex_bridge_url
+        assert options["additional_headers"] == {"Authorization": "Bearer synthetic"}
+        assert options["open_timeout"] == codex.CONNECT_TIMEOUT_SECONDS
+        if failure == "stall":
+            assert transport.closed
+
+
+async def test_site_socket_disconnect_and_recovery_close_both_transports(monkeypatch):
+    transports = [SyntheticBridge(), SyntheticBridge()]
+    pending = iter(transports)
+    monkeypatch.setattr(codex, "connect", lambda *args, **kwargs: next(pending))
+    first = SiteSocket()
+    await first.start()
+    assert (await first.message())["type"] == "ready"
+    await transports[0].responses.put(None)
+    assert await first.message() == {
+        "type": "error",
+        "text": "Umay ile bağlantı kesildi. Bağlantı yeniden denenecek.",
+    }
+    await first.finish()
+    second = SiteSocket()
+    await second.start()
+    assert (await second.message())["type"] == "ready"
+    await second.leave()
+    assert all(t.closed and t.requests[-1]["params"]["ephemeral"] for t in transports)
+
+
+def test_turn_context_carries_real_local_date(monkeypatch):
+    from datetime import UTC
+
+    fixed = datetime(2026, 10, 24, 20, 5, tzinfo=UTC)
+    text = codex.turn_context("Europe/Brussels", now=fixed)
+    assert text.startswith("Kullanıcının saat dilimi: Europe/Brussels.")
+    assert "24 Ekim 2026 Cumartesi, saat 22:05" in text
+    assert text.endswith("\n\n")
+
+
+def test_persona_has_no_scripted_opening_and_high_effort():
+    persona = codex_chat.load_umay_persona()
+    assert "Kişilik sürümü: 7" in persona
+    assert "Bu yeni sohbetin açılış yaklaşımı" not in persona
+    assert not hasattr(codex_chat, "GREETING_APPROACHES")
+    assert codex_chat.EFFORT == "high"

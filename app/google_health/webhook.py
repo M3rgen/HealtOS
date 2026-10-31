@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -11,9 +12,14 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.core.config import GOOGLE_KEYSET_URL_PREFIX
 
+if TYPE_CHECKING:
+    from app.services.webhook_status import Reason
+
 
 class WebhookVerificationError(ValueError):
-    pass
+    def __init__(self, message: str, reason: Reason = "invalid_signature") -> None:
+        super().__init__(message)
+        self.reason: Reason = reason
 
 
 @dataclass
@@ -34,9 +40,11 @@ class WebhookSignatureVerifier:
         try:
             signed = base64.b64decode(signature_header, validate=True)
         except (ValueError, TypeError) as exc:
-            raise WebhookVerificationError("Invalid webhook signature encoding") from exc
+            raise WebhookVerificationError(
+                "Invalid webhook signature encoding", "malformed_signature"
+            ) from exc
         if len(signed) <= 5 or signed[0] != 1:
-            raise WebhookVerificationError("Invalid Tink signature prefix")
+            raise WebhookVerificationError("Invalid Tink signature prefix", "malformed_signature")
         key_id = int.from_bytes(signed[1:5], "big")
         keyset = await self._get_keyset()
         key_entry = _enabled_key(keyset, key_id)
@@ -58,11 +66,21 @@ class WebhookSignatureVerifier:
         if not force and self._cache and self._cache.expires_at > time.time():
             return self._cache.value
         # No redirects: the keyset must come from the pinned Google host itself.
-        response = await self.http.get(self.keyset_url, follow_redirects=False)
-        response.raise_for_status()
-        value = response.json()
-        if not isinstance(value, dict) or not isinstance(value.get("key"), list):
-            raise WebhookVerificationError("Official webhook keyset is malformed")
+        try:
+            response = await self.http.get(self.keyset_url, follow_redirects=False)
+            response.raise_for_status()
+            value = response.json()
+            if not isinstance(value, dict) or not isinstance(value.get("key"), list):
+                raise ValueError("Malformed keyset")
+            if any(
+                not isinstance(item, dict) or not isinstance(item.get("keyId"), int)
+                for item in value["key"]
+            ):
+                raise ValueError("Malformed key entry")
+        except (httpx.HTTPError, ValueError) as exc:
+            raise WebhookVerificationError(
+                "Official webhook keyset unavailable", "key_download_failed"
+            ) from exc
         self._cache = CachedKeyset(value, time.time() + 3600)
         return value
 

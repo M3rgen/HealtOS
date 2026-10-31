@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.google_health.data_types import DataTypeSpec
+from app.parsers.text import optional_text
 
 
 def canonical_json(value: Any) -> str:
@@ -74,17 +75,17 @@ def temporal(
         end = parse_datetime(interval.get("endTime"))
         timezone = interval.get("startTimeZone") or interval.get("startUtcOffset")
         if start or end:
-            return start, end, str(timezone) if timezone is not None else None
+            return start, end, optional_text(timezone)
     sample = payload.get("sampleTime", {})
     if isinstance(sample, dict):
         timestamp = parse_datetime(sample.get("physicalTime"))
         timezone = sample.get("timeZone") or sample.get("utcOffset")
         if timestamp:
-            return timestamp, timestamp, str(timezone) if timezone is not None else None
+            return timestamp, timestamp, optional_text(timezone)
     day = parse_date(payload.get("date"))
     if day:
         timestamp = datetime.combine(day, datetime.min.time(), tzinfo=UTC)
-        return timestamp, timestamp, payload.get("timeZone")
+        return timestamp, timestamp, optional_text(payload.get("timeZone"))
     start = parse_datetime(record.get("startTime"))
     end = parse_datetime(record.get("endTime"))
     if start or end:
@@ -98,11 +99,42 @@ def parse_datetime(value: object) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return parsed.replace(tzinfo=parsed.tzinfo or UTC).astimezone(UTC)
-    except ValueError:
+    except (ValueError, OverflowError):
+        # A valid local datetime can overflow Python's year range when converted to UTC.
         return None
 
 
+def _date_component(value: object) -> int | None:
+    """Accept only lossless integer components from a Google JSON date.
+
+    Booleans are JSON flags even though Python treats them as integers. Finite,
+    whole floats are valid; fractional and nonfinite floats must never be truncated.
+    Strings retain int()'s existing integer syntax and conversion limits.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # is_integer() is false for NaN and both infinities as well as fractions.
+        if not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    # Lists, objects and null are not numeric date components.
+    return None
+
+
 def parse_date(value: object) -> date | None:
+    """Parse an ISO date or Google's year/month/day object without inventing a date.
+
+    Components are validated first (no flag or fraction becomes a day); calendar
+    construction guards impossible dates and integer overflow.
+    """
     if isinstance(value, str):
         try:
             return date.fromisoformat(value)
@@ -110,8 +142,11 @@ def parse_date(value: object) -> date | None:
             return None
     if isinstance(value, dict):
         try:
-            return date(int(value["year"]), int(value["month"]), int(value["day"]))
-        except (KeyError, TypeError, ValueError):
+            year, month, day = (_date_component(value[key]) for key in ("year", "month", "day"))
+            if year is None or month is None or day is None:
+                return None
+            return date(year, month, day)
+        except (KeyError, ValueError, OverflowError):
             return None
     return None
 
@@ -136,7 +171,7 @@ def device_name(record: dict) -> str | None:
     device = source.get("device", {}) if isinstance(source, dict) else {}
     if not isinstance(device, dict):
         return None
-    return device.get("displayName") or device.get("model")
+    return optional_text(device.get("displayName") or device.get("model"))
 
 
 def first_number(payload: dict, candidates: tuple[str, ...]) -> Decimal | None:

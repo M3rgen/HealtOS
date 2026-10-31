@@ -42,8 +42,9 @@ export function setupCalendar({ getToday, getSelected, onSelect }) {
       days.append(button);
     }
     const nextMonth = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1, 12));
+    const nextFocused = document.activeElement === document.getElementById('calendar-next');
     document.getElementById('calendar-next').disabled = key(nextMonth) > getToday();
-    if (restoreFocus) focusDay();
+    if (restoreFocus || (nextFocused && document.getElementById('calendar-next').disabled)) focusDay();
   }
 
   function position() {
@@ -60,6 +61,9 @@ export function setupCalendar({ getToday, getSelected, onSelect }) {
     popover.hidePopover();
     trigger.focus();
   }
+  popover.addEventListener('beforetoggle', event => {
+    if (event.newState === 'closed' && popover.contains(document.activeElement)) trigger.focus();
+  });
   popover.addEventListener('toggle', (event) => {
     const open = event.newState === 'open';
     trigger.setAttribute('aria-expanded', String(open));

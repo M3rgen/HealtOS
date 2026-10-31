@@ -14,6 +14,7 @@
 // with a blob: URL. Uploaded SVG text is never parsed into the DOM.
 import { request } from './api.js';
 import { iconMarkup } from './icons.js';
+import { setupDialog, replaceWithFocus } from './accessibility.js';
 
 const MANIFEST_URL = '/assets/presets/manifest.json';
 const KINDS = ['logo', 'umay', 'background'];
@@ -315,6 +316,7 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
   headerMark.hidden = true;
   inlineMark?.after(headerMark);
   const dialog = $('appearance-dialog');
+  const modal = dialog && setupDialog(dialog);
   let manifest = normalize(FALLBACK), selection = {}, uploads = {}, current = {};
   // What is stored (and shared): like `selection`, but an `upload` choice made on a
   // device whose image this browser lacks is kept, not replaced by the fallback.
@@ -434,6 +436,7 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
     label.className = 'preset-tile';
     const input = document.createElement('input');
     input.type = 'radio'; input.name = `appearance-${kind}`; input.value = entry.id; input.className = 'tile-input';
+    input.checked = entry.id === current[kind];
     input.addEventListener('change', () => { if (input.checked) choose(kind, entry.id); });
     const caption = document.createElement('span');
     caption.className = 'preset-label';
@@ -448,7 +451,7 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
     const input = document.createElement('input');
     input.type = 'file'; input.className = 'tile-input'; input.dataset.upload = kind;
     input.accept = 'image/png,image/jpeg,image/webp,image/svg+xml,.png,.jpg,.jpeg,.webp,.svg';
-    input.setAttribute('aria-describedby', `appearance-${kind}-hint`);
+    input.setAttribute('aria-describedby', `appearance-${kind}-hint appearance-${kind}-error`);
     input.addEventListener('change', () => { const file = input.files?.[0]; input.value = ''; if (file) upload(kind, file); });
     const box = document.createElement('span');
     box.className = 'preset-thumb thumb-upload';
@@ -463,11 +466,14 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
     const group = dialog?.querySelector(`[data-appearance-kind="${kind}"]`);
     if (!group) return;
     const grid = group.querySelector('.preset-grid');
-    grid.querySelectorAll('[data-blobs]').forEach(el => el.dataset.blobs.split(' ').forEach(url => URL.revokeObjectURL(url)));
-    const entries = manifest[kind].map(entry => resolveEntry(kind, entry));
-    if (uploads[kind]) entries.push(entryFor(kind, UPLOAD));
-    grid.replaceChildren(...entries.map(entry => tile(kind, entry)), uploadTile(kind));
-    group.querySelector('[data-remove]').hidden = !uploads[kind];
+    replaceWithFocus(group, () => {
+      grid.querySelectorAll('[data-blobs]').forEach(el => el.dataset.blobs.split(' ').forEach(url => URL.revokeObjectURL(url)));
+      const entries = manifest[kind].map(entry => resolveEntry(kind, entry));
+      if (uploads[kind]) entries.push(entryFor(kind, UPLOAD));
+      grid.replaceChildren(...entries.map(entry => tile(kind, entry)), uploadTile(kind));
+      group.querySelector('[data-remove]').hidden = !uploads[kind];
+    }, old => old.matches('[data-upload]') ? group.querySelector('[data-upload]') :
+      group.querySelector(`input[value="${CSS.escape(old.value ?? '')}"]`) || group.querySelector('input:checked'), $('appearance-close'));
   }
   function updateForm() {
     if (!dialog) return;
@@ -478,6 +484,7 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
   function error(kind, message = '') {
     const node = dialog?.querySelector(`[data-appearance-kind="${kind}"] .appearance-error`);
     if (node) { node.textContent = message; node.hidden = !message; }
+    dialog?.querySelector(`[data-upload="${kind}"]`)?.setAttribute('aria-invalid', String(Boolean(message)));
   }
   async function choose(kind, id) {
     error(kind);
@@ -494,7 +501,6 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
       uploads[kind] = record;
       renderGroup(kind);
       await choose(kind, UPLOAD);
-      dialog.querySelector(`input[name="appearance-${kind}"][value="${UPLOAD}"]`)?.focus();
     } catch (problem) {
       error(kind, problem?.message || 'Görsel yüklenemedi.');
     } finally { group.removeAttribute('aria-busy'); }
@@ -518,9 +524,10 @@ export function setupAppearance({ store = createSyncedAppearanceStore() } = {}) 
       group.querySelector('legend').textContent = TEXT[kind].legend;
       group.querySelector('.appearance-hint').textContent = TEXT[kind].hint;
       group.querySelector('.appearance-hint').id = `appearance-${kind}-hint`;
+      group.querySelector('.appearance-error').id = `appearance-${kind}-error`;
       group.querySelector('[data-remove]').addEventListener('click', () => removeUpload(kind));
     });
-    $('appearance-open')?.addEventListener('click', () => { dialog.showModal(); dialog.querySelector('input:checked')?.focus(); });
+    $('appearance-open')?.addEventListener('click', () => modal.open({ initial: dialog.querySelector('input:checked') }));
     $('appearance-close')?.addEventListener('click', () => dialog.close());
     $('appearance-done')?.addEventListener('click', () => dialog.close());
     $('appearance-reset')?.addEventListener('click', reset);

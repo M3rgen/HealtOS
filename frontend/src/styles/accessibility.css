@@ -1,0 +1,51 @@
+/* Inset indicators stay inside scrollports and clear sticky headers. Amber
+   controls use a dark indicator against their own fill. No page clipping. */
+:focus-visible{outline:2px solid var(--amber);outline-offset:-3px}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,
+.metric-open:focus-visible,.brand:focus-visible,.nav-button:focus-visible,.history-handle:focus-visible,
+#assistant-dialog :focus-visible,#assistant-dialog #assistant-input:focus-visible{
+  outline:2px solid var(--amber);outline-offset:-3px;box-shadow:none;
+}
+.primary:focus-visible,#assistant-open:focus-visible,#assistant-dialog .assistant-send:focus-visible,
+input[type="checkbox"]:checked:focus-visible,
+.calendar-day.selected:focus-visible,#metric-history-pages button[aria-current="page"]:focus-visible{
+  outline-color:var(--button-ink);
+}
+input:focus-visible,select:focus-visible,#assistant-input:focus-visible{border-color:var(--amber)}
+/* Inside the selected tile's 2px amber edge, so focus stays distinct from selection. */
+.preset-tile:has(.tile-input:focus-visible){outline:2px solid var(--amber);outline-offset:-5px}
+[tabindex="0"]:focus-visible{outline:2px solid var(--amber);outline-offset:-3px}
+[tabindex="0"],.table-scroll{scroll-padding:8px}
+button,a,input,select,textarea,summary{scroll-margin:8px}
+.table-scroll{scroll-padding-top:44px}
+.table-scroll button{scroll-margin-top:44px}
+/* Keep the final rows and actions clear of the fixed launcher. Space belongs
+   to the scrollable content, so the panel and page keep their existing height. */
+#overview .history table,.table-scroll table{margin-bottom:72px}
+#system,#measurements .table-scroll,#sports .workouts-panel{scroll-padding-bottom:72px}
+/* Fade masks also faded/clipped focus at the bottom edge. Keep all rows and
+   their focus indicators readable; native scrollbars show the scroll affordance. */
+#overview .overview-grid,#overview .history .table-scroll{mask-image:none;-webkit-mask-image:none}
+.overview-grid:focus-within{scroll-padding-block:8px 28px}
+/* The Turkish month label gives way to the native, visibly selected keyboard
+   segments while editing, then returns on blur. */
+.month-field:focus-within input{color:var(--text)}
+.month-field:focus-within input::-webkit-datetime-edit{opacity:1}
+.month-field:focus-within .month-label{visibility:hidden}
+/* Arbitrary uploaded backgrounds must not sit directly behind interface text. */
+.topbar{background:var(--surface-sheen),var(--page)}
+.page>.section-title{background:var(--page);border-radius:8px;padding:8px}
+.preview-brand{background:var(--page);border-radius:8px;padding:6px 8px}
+/* Constrain the smallest modal too; its form scrolls within the viewport. */
+#measurement-dialog{max-height:calc(100dvh - 24px);overflow:auto;overscroll-behavior:contain}
+/* Umay stays usable above an expanded history sheet; native top-layer modals
+   and the calendar popover still take precedence. Bubble geometry is unchanged. */
+#assistant-dialog{z-index:40}
+#assistant-open{z-index:41}
+.form-error,#history-status{overflow-wrap:anywhere}
+#history-status{max-height:min(24dvh,8em);min-height:0;overflow:auto;overscroll-behavior:contain}
+[aria-disabled="true"]{cursor:wait}
+@media(forced-colors:active){
+  :focus-visible,.preset-tile:has(.tile-input:focus-visible){outline-color:Highlight!important}
+  .preset-tile:has(.tile-input:checked){border:2px solid Highlight}
+}

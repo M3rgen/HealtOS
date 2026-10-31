@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal, DecimalException, localcontext
 from typing import Any
 
 from sqlalchemy.orm import DeclarativeBase
@@ -24,16 +24,15 @@ from app.models.health import (
     Vo2Max,
     Weight,
 )
+from app.parsers import numeric
 from app.parsers.common import (
     device_name,
-    duration_seconds,
-    first_number,
-    number,
-    parse_datetime,
     payload_for,
     source_id,
     temporal,
 )
+from app.parsers.sleep import _sleep_stages, sleep_period_seconds
+from app.parsers.text import prepare_optional_text
 
 
 @dataclass(frozen=True)
@@ -42,7 +41,41 @@ class NormalizedRecord:
     values: dict[str, Any]
 
 
+def _heart_rate_motion_context(payload: dict) -> str | None:
+    """Read optional context without rejecting an otherwise usable measurement.
+
+    Nonempty metadata objects retain their original precedence. Empty or malformed
+    metadata may fall back to the alternate field; an invalid context inside the
+    selected object is absent, rather than being coerced into SQL text.
+    """
+    for key in ("metadata", "heartRateMetadata"):
+        metadata = payload.get(key)
+        if not isinstance(metadata, dict) or not metadata:
+            continue
+        context = metadata.get("motionContext")
+        # Google supplies a string enum. Other JSON types are not context labels,
+        # even if a database driver happens to accept a scalar as text.
+        if isinstance(context, str):
+            return context
+        return None
+    return None
+
+
 def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
+    # Only parser/arithmetic failures become skipped normalization. Database writes and
+    # connection failures remain outside this boundary and still roll back the page.
+    try:
+        with localcontext(Context()):
+            result = _normalize(spec, record)
+            if result is not None:
+                numeric.prepare_numeric(result.model, result.values)
+                prepare_optional_text(result.model, result.values)
+            return result
+    except DecimalException:
+        return None
+
+
+def _normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
     if not isinstance(record, dict):
         return None
     payload = payload_for(spec, record)
@@ -56,7 +89,7 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
         "source_timezone": timezone,
     }
     if spec.name == "heart-rate" and start:
-        bpm = first_number(payload, ("beatsPerMinute", "bpm", "value"))
+        bpm = numeric.first_number(payload, ("beatsPerMinute", "bpm", "value"))
         return (
             NormalizedRecord(
                 HeartRate,
@@ -64,16 +97,14 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
                     **common,
                     "timestamp": start,
                     "bpm": bpm,
-                    "motion_context": (
-                        payload.get("metadata") or payload.get("heartRateMetadata") or {}
-                    ).get("motionContext"),
+                    "motion_context": _heart_rate_motion_context(payload),
                 },
             )
             if bpm is not None
             else None
         )
     if spec.name in {"heart-rate-variability", "daily-heart-rate-variability"} and start:
-        rmssd = first_number(
+        rmssd = numeric.first_number(
             payload,
             (
                 "rootMeanSquareOfSuccessiveDifferencesMilliseconds",
@@ -87,14 +118,14 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             {**common, "timestamp": start, "rmssd": rmssd, "metrics": payload},
         )
     if spec.name in {"oxygen-saturation", "daily-oxygen-saturation"} and start:
-        spo2 = first_number(payload, ("percentage", "spo2", "averagePercentage", "average"))
+        spo2 = numeric.first_number(payload, ("percentage", "spo2", "averagePercentage", "average"))
         return (
             NormalizedRecord(OxygenSaturation, {**common, "timestamp": start, "spo2": spo2})
             if spo2 is not None
             else None
         )
     if spec.name == "steps" and start and end:
-        count = first_number(payload, ("count", "countSum", "steps"))
+        count = numeric.first_number(payload, ("count", "countSum", "steps"))
         return (
             NormalizedRecord(
                 Steps, {**common, "start_time": start, "end_time": end, "count": count}
@@ -103,19 +134,19 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             else None
         )
     if spec.name == "sleep" and start and end:
-        stages = _sleep_stages(payload)
+        stages = _sleep_stages(payload, strict=True)
         return NormalizedRecord(
             SleepSession,
             {
                 **common,
                 "start_time": start,
                 "end_time": end,
-                "duration_seconds": duration_seconds(payload.get("duration"))
-                or Decimal(str((end - start).total_seconds())),
+                "duration_seconds": sleep_period_seconds(payload, start, end)[0],
                 "deep_sleep_seconds": stages.get("deep"),
                 "light_sleep_seconds": stages.get("light"),
                 "rem_sleep_seconds": stages.get("rem"),
-                "awake_seconds": stages.get("awake") or stages.get("wake"),
+                # A measured zero is kept: only a missing stage is unknown.
+                "awake_seconds": stages["awake"] if "awake" in stages else stages.get("wake"),
                 "efficiency": _sleep_efficiency(payload),
             },
         )
@@ -123,7 +154,10 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
         metrics = payload.get("metricsSummary", {})
         if not isinstance(metrics, dict):
             metrics = {}
-        distance_mm = first_number(metrics, ("distanceMillimeters",))
+        distance_mm = numeric.first_number(metrics, ("distanceMillimeters",))
+        duration = numeric.duration_seconds(payload.get("activeDuration"))
+        if duration is None:
+            duration = numeric.duration_seconds(payload.get("duration"))
         return NormalizedRecord(
             ExerciseSession,
             {
@@ -131,15 +165,17 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
                 "start_time": start,
                 "end_time": end,
                 "exercise_type": payload.get("exerciseType") or payload.get("displayName"),
-                "duration_seconds": duration_seconds(payload.get("activeDuration"))
-                or duration_seconds(payload.get("duration"))
-                or Decimal(str((end - start).total_seconds())),
-                "calories_kcal": first_number(metrics, ("caloriesKcal",)),
-                "distance_meters": distance_mm / 1000 if distance_mm is not None else None,
+                "duration_seconds": duration
+                if duration is not None
+                else Decimal(str((end - start).total_seconds())),
+                "calories_kcal": numeric.first_number(metrics, ("caloriesKcal",)),
+                "distance_meters": numeric.from_milli(distance_mm)
+                if distance_mm is not None
+                else None,
             },
         )
     if spec.name == "daily-resting-heart-rate" and start:
-        bpm = number(payload.get("beatsPerMinute"))
+        bpm = numeric.number(payload.get("beatsPerMinute"))
         metadata = payload.get("dailyRestingHeartRateMetadata", {})
         return (
             NormalizedRecord(
@@ -157,7 +193,7 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             else None
         )
     if spec.name in {"vo2-max", "daily-vo2-max", "run-vo2-max"} and start:
-        value = number(payload.get("runVo2Max" if spec.name == "run-vo2-max" else "vo2Max"))
+        value = numeric.number(payload.get("runVo2Max" if spec.name == "run-vo2-max" else "vo2Max"))
         return (
             NormalizedRecord(
                 Vo2Max,
@@ -173,7 +209,7 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             else None
         )
     if spec.name in {"core-body-temperature", "daily-sleep-temperature-derivations"} and start:
-        value = first_number(payload, ("temperatureCelsius", "nightlyTemperatureCelsius"))
+        value = numeric.first_number(payload, ("temperatureCelsius", "nightlyTemperatureCelsius"))
         return (
             NormalizedRecord(
                 Temperature,
@@ -182,17 +218,17 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
                     "timestamp": start,
                     "metric_type": spec.name,
                     "celsius": value,
-                    "baseline_celsius": number(payload.get("baselineTemperatureCelsius")),
+                    "baseline_celsius": numeric.number(payload.get("baselineTemperatureCelsius")),
                 },
             )
             if value is not None
             else None
         )
     if spec.name in {"daily-respiratory-rate", "respiratory-rate-sleep-summary"} and start:
-        value = number(payload.get("breathsPerMinute"))
+        value = numeric.number(payload.get("breathsPerMinute"))
         full_sleep = payload.get("fullSleepStats", {})
         if value is None and isinstance(full_sleep, dict):
-            value = number(full_sleep.get("breathsPerMinute"))
+            value = numeric.number(full_sleep.get("breathsPerMinute"))
         return (
             NormalizedRecord(
                 RespiratoryRate,
@@ -207,7 +243,7 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             else None
         )
     if spec.name == "active-zone-minutes" and start and end:
-        minutes = number(payload.get("activeZoneMinutes"))
+        minutes = numeric.number(payload.get("activeZoneMinutes"))
         return (
             NormalizedRecord(
                 ActiveZoneMinute,
@@ -223,7 +259,7 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             else None
         )
     if spec.name == "distance" and start and end:
-        millimeters = number(payload.get("millimeters"))
+        millimeters = numeric.number(payload.get("millimeters"))
         return (
             NormalizedRecord(
                 Distance,
@@ -231,14 +267,14 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
                     **common,
                     "start_time": start,
                     "end_time": end,
-                    "meters": millimeters / 1000,
+                    "meters": numeric.from_milli(millimeters),
                 },
             )
             if millimeters is not None
             else None
         )
     if spec.name in {"active-energy-burned", "total-calories"} and start and end:
-        kcal = first_number(payload, ("kcal", "kcalSum"))
+        kcal = numeric.first_number(payload, ("kcal", "kcalSum"))
         return (
             NormalizedRecord(
                 EnergyExpenditure,
@@ -248,11 +284,11 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
             else None
         )
     if spec.name == "weight" and start:
-        grams = number(payload.get("weightGrams"))
+        grams = numeric.number(payload.get("weightGrams"))
         return (
             NormalizedRecord(
                 Weight,
-                {**common, "timestamp": start, "kilograms": grams / 1000},
+                {**common, "timestamp": start, "kilograms": numeric.from_milli(grams)},
             )
             if grams is not None
             else None
@@ -274,48 +310,19 @@ def normalize(spec: DataTypeSpec, record: object) -> NormalizedRecord | None:
     return None
 
 
-def _sleep_stages(payload: dict) -> dict[str, Decimal]:
-    totals: dict[str, Decimal] = {}
-    summary = payload.get("summary", {})
-    if isinstance(summary, dict) and isinstance(summary.get("stagesSummary"), list):
-        for entry in summary["stagesSummary"]:
-            if not isinstance(entry, dict):
-                continue
-            name = str(entry.get("type") or "").lower()
-            minutes = number(entry.get("minutes"))
-            if name and minutes is not None:
-                totals[name] = totals.get(name, Decimal(0)) + (minutes * 60)
-        if totals:
-            return totals
-    entries = payload.get("stages") or payload.get("sleepStages") or []
-    if isinstance(entries, dict):
-        entries = entries.get("stages") or entries.get("data") or []
-    if not isinstance(entries, list):
-        return totals
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("stage") or entry.get("type") or "").lower()
-        duration = duration_seconds(entry.get("duration") or entry.get("durationSeconds"))
-        if duration is None:
-            stage_start = parse_datetime(entry.get("startTime"))
-            stage_end = parse_datetime(entry.get("endTime"))
-            if stage_start and stage_end:
-                duration = Decimal(str((stage_end - stage_start).total_seconds()))
-        if name and duration is not None:
-            totals[name] = totals.get(name, Decimal(0)) + duration
-    return totals
-
-
 def _sleep_efficiency(payload: dict) -> Decimal | None:
     summary = payload.get("summary", {})
     if not isinstance(summary, dict):
         return None
-    asleep = number(summary.get("minutesAsleep"))
-    period = number(summary.get("minutesInSleepPeriod"))
+    asleep = numeric.number(summary.get("minutesAsleep"))
+    period = numeric.number(summary.get("minutesInSleepPeriod"))
     if asleep is None or period is None or period == 0:
         return None
-    return (asleep / period) * 100
+    try:
+        return (asleep / period) * 100
+    except DecimalException:
+        # An optional derived ratio must not reject the session it describes.
+        return None
 
 
 def _generic_value(payload: dict) -> tuple[Decimal | None, str | None]:
@@ -331,11 +338,11 @@ def _generic_value(payload: dict) -> tuple[Decimal | None, str | None]:
         "calories",
         "minutes",
     )
-    value = first_number(payload, candidates)
+    value = numeric.first_number(payload, candidates)
     if value is None:
         for key, candidate in payload.items():
             if key not in ignored and not isinstance(candidate, (dict, list)):
-                value = number(candidate)
+                value = numeric.number(candidate)
                 if value is not None:
                     break
     return value, payload.get("unit")

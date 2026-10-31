@@ -39,14 +39,62 @@ app-server bridge. Requested health data is sent to OpenAI for analysis. The
 assistant can read daily summaries and original archived Google health records;
 its data tools cannot modify the archive. Other desktop Codex chats are separate.
 
+### Source-separated daily foundation
+
+`health_archive daily` retains its legacy days/profile/charts and adds `derived` schema 1,
+method `source-daily/6`. Use the new streams for source-aware interpretation: the entire
+`dataSource` identifies a stream; no phone/band preference or cross-source sum is produced.
+HRV average, RMSSD and deep-sleep RMSSD remain different definitions. Conflicting values
+retain their observations and uncertainty; arrival/last-seen time never ranks them.
+Daily summaries retain their civil date; steps use real UTC duration within local days,
+and sleep belongs to the wake day. Intraday samples never become daily summaries.
+Sleep timelines support explicit `startTime`/`endTime` entries in `stages`/`sleepStages`
+lists (including `stages`/`data` wrappers), tested with synthetic payloads. Totals alone
+return `timeline: null`; unknown intervals, conflicting stages, overlapping sessions,
+episode boundaries and differences from supplied totals remain visible independently.
+
+Upgrade to migration `20261031_0021` before using this version. `derived_days` is a local,
+disposable read model keyed by day, timezone and method; sources remain separate inside
+its validated result. `register_range` queues at most 366 requested days without scanning
+the archive. The runtime refreshes at most 16 pending days every five minutes, committing
+one day at a time; restarts resume the persistent revision differences. Database triggers
+invalidate old/new dates, identity eligibility and future manual-profile results in the
+same transaction as their source change. PostgreSQL builders fence concurrent mutations
+with an advisory transaction lock; unchanged sightings do not dirty results. Migration
+lock acquisition times out after five seconds; retry the upgrade after writers finish.
+The tool may write only this local cache. Raw/manual/history rows remain untouched.
+Requested derived values, source metadata and observations follow the existing tool path
+to OpenAI, alongside the unchanged legacy and raw-record access. This adds no chat memory.
+Tool reads build cold or pending days first, one short transaction per day, so ingestion
+waits for one day's build at most and no day is built from a PostgreSQL REPEATABLE READ
+snapshot (such a reader reports the day as stale). A failing day is stored as failed for
+its revision (`state: "error"`, `derived_build_failed`; only the exception type is
+logged), skipped by the refresh queue and rebuilt after its next source change.
+`daily`'s `derived` card is at most 64 KiB: `detail: "full"` when everything fits,
+otherwise `"summary"` (per stream value, state, uncertainties, `observation_count`;
+observations, source metadata and sleep timelines are left to narrower ranges, `sleep`
+and `records`), or `"omitted"` with a `suggested_range`. The legacy fields are unchanged.
+
+### Interpretation budgets
+
+Interpretation schema 2 actions plan the whole query before allocating output, so `limit` and
+`cursor` never change these ceilings: 1,000 summaries; 40,950 `baseline`/`analyze` evidence
+references, counted with the history repeated in every summary (five daily metrics × 90 days ×
+(90 lookback days + the day itself), so one record a day always fits); 20,000 intraday cells and
+20,000 intraday references; 20,000 session overlap references; 16 relationship regimes, 20,000
+pairs and 40,000 pair references. Exceeding one returns its `*_budget_exceeded` code; narrow the
+range or the metric. Only `response_budget_exceeded` (64 KiB per page) yields to a smaller `limit`.
+
 ### Umay personality
 
-`app/personas/umay/soul.md` defines Umay's identity, values, warm Turkish voice, and
-mythological narrator voice, and example dialogues. The backend reads this file for
+`app/personas/umay/soul.md` defines Umay's identity, warm Turkish voice, mythological
+imagery, relationship to the data, and style examples. The backend reads this file for
 each new site conversation and sends it as conversation-specific developer
 instructions. The health analysis and tool rules remain separate base instructions
 in `app/services/codex_chat.py`. Examples are style guidance, not user health data.
-This does not edit global Codex settings or affect desktop conversations.
+This does not edit global Codex settings or affect desktop conversations. There is no
+scripted opening: Umay builds it from the user's first message and the local date and
+time that the backend adds to every turn (from the browser's timezone).
 
 Umay defaults to short, natural Turkish paragraphs, including when interpreting
 health records. Formatting is reserved for requests or comparisons that benefit
@@ -91,13 +139,20 @@ The local website must remain private (the default Compose port binds to
    the current conversation; **Yeni sohbet**, reconnecting, or reloading starts
    a separate conversation. Site conversations are ephemeral, not sidebar chats.
 
-Run the launcher again after the host restarts; no service unit is shipped. It runs the
-bridge in the background and reuses a healthy instance. The launcher copies the current
-ChatGPT login into an isolated `~/.codex/healthos-bridge` home (or under `CODEX_HOME`),
+For Linux production, install [`healthos-bridge.service`](../deploy/systemd/healthos-bridge.service)
+using the [runbook](RUNBOOK.md#restart-the-umay-bridge). Its `--foreground` launcher owns the
+bridge process group, forwards stops and reports unexpected exits (including exit 0) as failures.
+The service preserves its token and never rewrites the project `.env`; provision the same
+`CODEX_BRIDGE_TOKEN` for the service and backend. A restart does not require recreating the app.
+The manual command above still detaches and reuses a healthy instance; run it again after a
+host restart when no service is installed. Explicit `CODEX_BRIDGE_URL` values are preserved.
+The launcher copies the current ChatGPT login into an isolated `~/.codex/healthos-bridge`
+home (or under `CODEX_HOME`); service restarts retain refreshed credentials there,
 with desktop plugins, shell, browser, computer-use and multi-agent tools disabled.
 The bridge requires a random bearer token; only the backend receives that token.
 Token and credentials are never included in frontend bundles or tool responses.
-The bridge log is `healthos-bridge/bridge.log`. Keep that local home private.
+Manual logs are in `healthos-bridge/bridge.log`; service logs go to the journal.
+The isolated home is mode 0700, its token, login and configuration files mode 0600.
 Windows-specific steps (an isolated npm-installed CLI run through Node) are in
 [legacy/WINDOWS.md](legacy/WINDOWS.md#umay-bridge-on-windows).
 
@@ -111,9 +166,11 @@ A bridge started by an older launcher listened on all interfaces: stop the PID i
 `healthos-bridge/bridge.pid` and run the launcher again (see the [runbook](RUNBOOK.md#restart-the-umay-bridge)).
 
 Usage counts against the signed-in ChatGPT account's limits. Codex must be running
-and able to reach OpenAI. If the connection closes, use **Yeniden bağlan**. For a
+and able to reach OpenAI. Missing configuration, connection failures and startup timeouts
+produce safe Umay status messages. The panel retries five times with increasing waits;
+**Yeniden bağlan** starts a fresh attempt budget. Sending is disabled until Umay is ready. For a
 native backend outside Docker, set `CODEX_BRIDGE_URL=ws://127.0.0.1:8766` instead.
-The site explicitly uses **GPT-6.1 Sol / medium** for new conversations and each
+The site explicitly uses **GPT-6.1 Sol / high** for new conversations and each
 turn. It does not switch to a different model when access fails; the chat reports
 the error. The model and effort are visible in the chat's connection status.
 
@@ -147,12 +204,35 @@ seven-day table, and CSV export to that date. The main menu is centered and the
 personal archive badge has been removed.
 Manual measurements persist in PostgreSQL's `manual_measurements` table. The
 startup migration adds this table without rewriting Google source records.
+An entry made only to try the form can be marked as a test entry, and the mark
+cleared again, without changing or deleting it: `POST
+/api/dashboard/measurements/{id}/flag` and `.../unflag` (body optional:
+`{"flag": "test", "reason": "..."}`, reason at most 200 characters; same
+`X-HealthOS-Request: 1` rule as adding a measurement) each append one row to
+`manual_measurement_flag_events` (`mark` or `unmark`); the latest row per
+measurement (`created_at`, then `id`) is its state. A request that would not
+change the state appends nothing (`200`, `"changed": false`; `201` when it
+did); an unknown id is `404`. `GET /api/dashboard/measurements` adds `flags`
+(the flags set now, e.g. `["test"]`) to each entry and still lists flagged
+ones; the profile card, the 3D body and Umay's daily data
+(`dashboard_data`) leave them out and use the entry before, or show no value.
+Readers decide it in one place: `app/services/manual_flags.py`,
+`excluded_measurements()` (an SQL subquery of ids) and
+`excluded_measurement_ids(session) -> set[uuid.UUID]`.
 The dashboard remains local-only; the public webhook proxy still exposes only
 the webhook endpoint.
 
 Daily summaries use the selected civil timezone. Sleep is assigned to the day
-of waking, with awake time removed. Overlapping sessions count once; where only
-stage totals exist, overlapping asleep duration is a conservative estimate.
+of waking. Asleep time is read from each session's raw payload: Google's
+`summary.minutesAsleep` when present, otherwise the session period less AWAKE
+and RESTLESS stages; a session without summary or stages counts its whole period
+as an upper bound. Sessions ending at or before their start are skipped, so a day
+of only such sessions has no value, not zero. Overlapping sessions count once;
+where only stage totals exist, overlapping asleep duration is a conservative
+estimate. Each day lists what its sleep value assumes in `sleep_assumptions`:
+`invalid_sessions_skipped`, `from_normalized_columns` (no readable raw payload:
+normalized duration less awake), `duration_from_payload` (a top-level `duration`,
+not in the Google schema), `awake_unknown` and `overlap_estimated`.
 HRV, oxygen saturation, and resting heart rate use daily source summaries, not
 averages mixed with intraday samples. Missing data remains blank, not zero.
 Step intervals crossing hours/days are distributed proportionally by duration;
@@ -315,7 +395,7 @@ Copy `.env.example` to `.env`; never commit `.env`.
 | `STARTUP_GAP_THRESHOLD_MINUTES` | Minimum persisted sync/write gap that permits startup recovery; defaults to 120 minutes |
 | `AUTOMATIC_RECOVERY_ENABLED`, `AUTOMATIC_RECOVERY_MAX_DAYS` | Enable bounded reconciliation recovery and cap its lookback; defaults to 7 days |
 | `RECOVERY_COOLDOWN_MINUTES` | Minimum time between automatic recovery attempts; defaults to 360 minutes |
-| `CODEX_BRIDGE_BIND_HOST`, `CODEX_BRIDGE_URL`, `CODEX_BRIDGE_TOKEN` | Optional Umay bridge address and token; the launcher writes the URL and token |
+| `CODEX_BRIDGE_BIND_HOST`, `CODEX_BRIDGE_URL`, `CODEX_BRIDGE_TOKEN` | Optional Umay bridge address and token; manual launcher preserves configured URLs, service reads existing credentials |
 
 Generate an encryption key locally and put it only in `.env`.
 
@@ -795,7 +875,7 @@ may only widen (no `DELETE` or `TRUNCATE`; an `UPDATE` may only move `first_seen
 label or `dataSource`). `health-mirror verify` checks them with the other guards, their keys and checks, that no
 rule, row-level security or policy sits on a guarded table, that no guard sits on a table that is
 not guarded (a guarded table renamed away), that every `identity-merged` event still has its link,
-that the `analytics_*` views are the ones of 0012, and the links and chains themselves: see
+that the `analytics_*` views are the ones of 0013, and the links and chains themselves: see
 [Integrity verification](#integrity-verification). `identity_reconcile_state`,
 `identity_deferred_deletions` (one row per deferred deletion; never deleted, `resolved_at` set
 when a later complete fetch decides it, or finds its two sources one device) and `fetch_rounds` (when a sync round or backfill window
@@ -981,8 +1061,9 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 | Per pair of sources with evidence of two devices and per key both hold: the same reading or not | `raw_source_agreements` | append-only (trigger); the latest per key is current, summed by `verify` |
 | Reconciler checkpoints and counts, deferred deletions, fetch round starts | `identity_reconcile_state`, `identity_deferred_deletions`, `fetch_rounds` | bookkeeping (no row deleted) |
 | Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
-| Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only |
+| Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only. `raw_json` is NULL when jsonb cannot hold the signed body (U+0000, an unpaired surrogate, a non-finite number): the bytes are in `raw_body` and such an element is rejected |
 | Manual measurements and workouts | `manual_measurements`, `manual_workouts` | append-only: the UI only adds entries; a correction is a new entry (for the same measurement time the newest entry wins) |
+| Test-entry flags on manual measurements (`mark` / `unmark`) | `manual_measurement_flag_events` | append-only (trigger); the latest per measurement is current, the measurement is unchanged |
 
 ### Verbatim Google responses
 
@@ -1062,6 +1143,7 @@ above, and why it is allowed:
 | version renumbering (`import-versions`) | `raw_health_data_versions` | `version` only, in a transaction with `healthos.renumber = '1'` |
 | quarantine of rollup records (migration `0002`, applied long ago) | `raw_health_data` | flag columns only, payload untouched |
 | batch/element processing (`app/services/webhook_processing.py`) | `webhook_events`, `webhook_notifications` | operational: `status`, counters, `last_error`, `processed_at`, `failure_count`, `element_count`, filling a missing `raw_body`/`signature_verified_at` once; payload frozen by trigger |
+| test-entry flag and its removal (`app/services/manual_flags.py`) | `manual_measurement_flag_events` | inserts only; `manual_measurements` is only read |
 | `signature_verified_at` backfill (migration `0003`) | `webhook_events` | operational, fills a NULL |
 | sync state, backfill jobs, reliability state, appearance, OAuth token rotation | `sync_state`, `backfill_jobs`, `reliability_state`, `appearance_settings`, `oauth_tokens` | operational metadata, not received data |
 | normalized UPSERTs | `heart_rate`, `steps`, … | derived, see below |
@@ -1080,11 +1162,17 @@ received data lives only there.
 
 A normalized row carries the key of its raw row, so a duplicate raw row has a duplicate normalized
 row. Those rows are not deleted, flagged or rewritten: whether a row counts is decided in one
-place, `raw_health_data_supersessions`, and every reader applies it (the dashboard's source
-filters, the workout list, the history bounds, Umay's archive tool and, on PostgreSQL, the
-`analytics_*` views, which add `NOT EXISTS` on a deleted-marked or superseded raw row). A rebuild of the
-normalized tables from `raw_health_data` therefore gives the same counts, and nothing has to be kept
-in sync. A renamed record written after `20261021_0012` updates its existing normalized row (same
+place, `raw_health_data_supersessions`, and every reader applies it through one definition
+(`app/models/eligibility.py`: `raw_counted`, `normalized_counted` and its SQL text for the views). A
+record counts when its raw row is live (not marked deleted at the source), neither its raw row nor
+its normalized row is quarantined, and it is not superseded, through a link in force, by a row that
+is neither marked deleted nor quarantined. A normalized row without a raw row never counts, and a
+quarantine on either side hides the record from every reader. The dashboard (UI, CSV and history),
+the workout list, Umay's archive tool (`daily`, `inventory`, `records`) and, on PostgreSQL, the
+`analytics_*` views (since `20261024_0013`) all count the same records; the dashboard's
+`valid_sources_only` flag, kept for older callers, is now the default and changes nothing. A
+rebuild of the normalized tables from `raw_health_data` therefore gives the same counts, and
+nothing has to be kept in sync. A renamed record written after `20261021_0012` updates its existing normalized row (same
 key), so no new duplicate appears.
 
 ## Webhooks
@@ -1251,7 +1339,8 @@ After a host interruption the expected recovery sequence is:
 4. The startup watchdog assesses the persisted gap and, when eligible, starts one bounded
    reconciliation. `cloudflared` forwards webhooks again as soon as port 8000 answers; until then
    Cloudflare returns 502 and Google retries.
-5. The optional Umay bridge is a host process without a service unit; start it again by hand.
+5. If installed and enabled, `healthos-bridge.service` starts the optional Umay host bridge;
+   otherwise use the manual launcher. See the [bridge runbook](RUNBOOK.md#restart-the-umay-bridge).
 
 A sync state or webhook element left `running` by a process that died is failed (and so becomes
 retryable) at startup, but only once nothing has touched it for 15 minutes: a running fetch refreshes
@@ -1385,7 +1474,7 @@ its `raw_source_decisions` row), with sightings for both of its sources that nev
 every owner decision naming sources that have sightings, the identity tables' keys and checks
 unchanged (keys, checks and foreign keys only: NOT NULL constraints, which PostgreSQL 18 lists
 too, are not compared), no rule, row-level security or policy on a guarded table, no guard on a
-table that is not guarded, and the `analytics_*` views counting exactly as 0012 defines them
+table that is not guarded, and the `analytics_*` views counting exactly as 0013 defines them
 (compared on their own columns: a column added to a normalized table later, which `SELECT *`
 views do not pick up, is no finding), and no row without a Google id holding payloads of more
 than one source in its history (a payload written onto another source's row; a missing
@@ -1405,7 +1494,8 @@ superseded rows that count again because every row holding them was marked delet
 are superseded themselves, superseded rows holding an older value than their holder, and
 superseded rows returned after their holder with another reading or end (hidden behind a stale
 holder until a complete fetch of their window marks it).
-Against a database still at 20261020_0011 it says so and names the upgrade instead of failing on
+Against a database still at 20261020_0011, or not yet at 20261024_0014 (without
+`manual_measurement_flag_events`), it says so and names the upgrade instead of failing on
 the missing tables. It exits 1 on any finding. For long-term preservation also monitor PostgreSQL disk health, retain multiple generations of dumps, and periodically restore a dump to a separate local PostgreSQL instance.
 
 ## Troubleshooting
@@ -1416,6 +1506,7 @@ the missing tables. It exits 1 on any finding. For long-term preservation also m
 - **Backfill appears slow**: sleep/exercise pages are capped at 25 by Google; progress persists after every page.
 - **Webhook subscriber creation fails**: confirm public HTTPS/TLS 1.2+, exact auth secret, both handshake results, and project **number**.
 - **Webhook 401**: check the exact authorization header; do not replace Google's public keyset URL with an untrusted key.
+- **Webhook 503 `Webhook verification temporarily unavailable`**: Google's public keyset could not be downloaded (`key_download_failed`, log `WEBHOOK_VERIFICATION_UNAVAILABLE`); this is not a signature verdict, Google retries the delivery. Check outbound network access to the keyset URL.
 - **Repeated rows**: run `health-mirror verify`; database uniqueness is `(data_type, google_data_point_id)` for raw records.
 - **Unknown new Google fields**: they are already retained in `raw_json`. Add or revise a parser later and reprocess locally without calling Google again.
 
@@ -1423,11 +1514,13 @@ the missing tables. It exits 1 on any finding. For long-term preservation also m
 
 Connect read-only analytics tools to the `analytics_*` views, such as
 `analytics_heart_rate`, `analytics_sleep_sessions`, `analytics_energy_expenditure`, and
-`analytics_scalar_metrics`. These views expose the normalized tables with what the dashboard
-counts: rows marked `is_quarantined` and, since `20261021_0012` (PostgreSQL), rows whose raw
-record is marked deleted at the source or is a [superseded duplicate](#record-identity) are left
-out (before, only quarantined rows were, so a source-deleted record still counted in the views
-but not on the dashboard). The underlying normalized tables keep every row for auditing, and the
+`analytics_scalar_metrics`. These views expose the normalized tables with what every reader
+counts ([Derived tables](#derived-tables)): since `20261024_0013` (PostgreSQL) a row needs a live,
+unquarantined raw row with its key, is not quarantined itself and is not a
+[superseded duplicate](#record-identity). Before, `20261021_0012` left out only quarantined rows
+and rows whose raw record was marked deleted or superseded, so a normalized row without a raw row,
+or one whose raw row alone was quarantined, still counted in the views (and on the dashboard,
+though not in its history). The underlying normalized tables keep every row for auditing, and the
 raw JSON remains available for future Pandas/Jupyter, SQL, Grafana, n8n, or
 local-agent pipelines. The archive itself has no AI layer; the optional Umay chat reads it only
 on request.

@@ -23,6 +23,19 @@ api /health
 
 Recreating the app interrupts the webhook for a few seconds; Google retries failed deliveries.
 
+Updating a deployment that predates the backup metadata mount (`BACKUP_STATUS_HOST_DIR`,
+default `./backup-status`): create the directory once before `docker compose up`, so the
+backup account owns it:
+
+```sh
+install -d -m 755 backup-status   # or the absolute BACKUP_STATUS_HOST_DIR shared with the timer
+```
+
+If it is missing, Compose creates it owned by root (`create_host_path`). The app still
+starts and the root backup timer can publish into it; a timer running as another account
+cannot, until `sudo chown` gives the directory to that account. `GET /health/backup`
+reports `missing` until the next backup run.
+
 ## Apply migrations
 
 Migrations live in `migrations/versions/` and run automatically: the container command is
@@ -243,7 +256,7 @@ make backup
 docker compose exec app alembic current          # expect 20261020_0011
 git pull --ff-only
 docker compose up -d --build
-docker compose exec app alembic current          # expect 20261021_0012 (head)
+docker compose exec app alembic current          # expect 20261021_0012 (or a later head)
 df -h /var/lib/docker                            # room for the aliases (below)
 docker compose exec -T app health-mirror identity-backfill --dry-run > /tmp/identity-dry.json
 ```
@@ -424,6 +437,49 @@ image runs against the 0012 schema with the no-migrate override above; it ignore
 and links (and does not run the nightly job), so its dashboard counts the duplicates again and new
 renames duplicate again until you roll forward.
 
+### `20261024_0013` (analytics views count what every reader counts)
+
+Replaces the `analytics_*` views (`CREATE OR REPLACE`, same columns; no table, row or index
+changes): a normalized row now also needs a live, unquarantined raw row with its key, as the
+dashboard, its history, Umay's tools and the workout list require (docs/REFERENCE.md, Derived
+tables). It waits at most 100 ms per attempt for a reader of a view and retries until
+`lock_timeout` (30 s, `-x lock-timeout=...`); when no attempt succeeds it fails with
+`20261024_0013 could not replace the analytics_* views`, changing nothing: retry once the reader
+(a long analytics query) has finished.
+
+```sh
+make backup
+git pull --ff-only
+docker compose up -d --build
+docker compose exec app alembic current          # expect 20261024_0013 (head)
+docker compose exec app health-mirror verify     # exit 0: the views are the ones of 0013
+```
+
+`alembic downgrade 20261021_0012` restores the views of 0012 the same way; the previous image
+then runs against them unchanged.
+
+### `20261024_0014` (test-entry flags on manual measurements)
+
+Adds `manual_measurement_flag_events`: one row per decision to mark a manual measurement as a test
+entry (`mark`) or to clear that (`unmark`); the latest row per measurement is its state. The
+measurement rows are never changed (`manual_measurements` stays append-only). The table refuses
+`UPDATE`, `DELETE` and `TRUNCATE` like the 0011 tables, and `health-mirror verify` checks its
+triggers. Fast and lock-free for existing tables: an empty table, its index and its triggers (no
+foreign key, so `manual_measurements` is not locked).
+
+Marking an entry: on the Ölçümler page, "Test olarak işaretle" on its row ("İşareti kaldır" clears
+it), or on the host (loopback, with the UI token):
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $APP_UI_TOKEN" -H 'X-HealthOS-Request: 1' \
+  http://127.0.0.1:8000/api/dashboard/measurements/<id>/flag     # .../unflag clears it
+```
+
+`GET /api/dashboard/measurements` lists the ids with their `flags`. A flagged entry stays listed
+with a "Test kaydı" badge; the profile card, the 3D body and Umay's daily data use the entry before
+it. `alembic downgrade 20261024_0013` refuses while the table has rows (`-x allow-flag-loss=1`
+would drop the decisions, never on the live archive).
+
 ## Import payload versions from archive dumps
 
 Payload versions overwritten before `20261020_0011` survive only in older dumps. Import them one
@@ -490,7 +546,7 @@ architecture, verify its checksum, replace `/usr/local/bin/cloudflared`, then
 | `APP_UI_TOKEN` | Yes | Put a new value in `.env`, then `docker compose up -d --force-recreate app`. The restart ends every login session (sessions are kept in memory); log in again. |
 | `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` | Yes, with a gap | The app accepts exactly one value; there is no overlap period. Update the subscriber's authorization with Google and `.env` back to back, then recreate the app. Deliveries in between get 401; Google retries them and reconciliation covers anything lost. Run `health-mirror webhook-readiness` afterwards. |
 | `GOOGLE_TOKEN_ENCRYPTION_KEY` | Only by re-linking | There is a single Fernet key and no re-encryption command. Take a backup, set the new key, recreate the app, then open `/auth/google/start` through the SSH tunnel and consent again; the callback stores the refresh token encrypted with the new key. Until then syncs fail with `Stored OAuth token cannot be decrypted`. Older backups still need the old key; backups are kept forever, so keep the old key forever as well. |
-| `CODEX_BRIDGE_TOKEN` | Yes | Stop the bridge (below), delete `~/.codex/healthos-bridge/bridge.token`, start the launcher again (it generates a token and updates `.env`), then recreate the app. |
+| `CODEX_BRIDGE_TOKEN` | Yes | Stop the bridge (below). For systemd, change the private service environment and app `.env` to the same new value, then restart the service and recreate the app. Manual mode: remove the old token file and configured token, rerun the launcher, then recreate the app. |
 | `POSTGRES_PASSWORD` | Manual | The image only reads it when the data directory is first created. Change the role first, `docker compose exec postgres psql -U health -d health -c "ALTER ROLE health PASSWORD '<new>'"`, then update `.env` and run `docker compose up -d --force-recreate app`. |
 | Backup key | Yes | Point `BACKUP_AGE_RECIPIENT` (or `/etc/healthos/backup.key`) at the new key. New backups use it. Backups are kept forever, so keep the old identity (in the password manager) for as long as any backup made with it exists. |
 
@@ -505,8 +561,24 @@ journalctl -u healthos-backup.service -n 20
 journalctl -p crit -t healthos-backup   # failures reported by healthos-backup-failure.service
 ```
 
+Each run streams ciphertext into its own private temporary file. A stdlib Python helper
+publishes the complete dump with an atomic hard link that cannot replace an existing name;
+same-second collisions add a unique suffix before `.dump.age` or `.dump.gpg`. The backup
+filesystem must support hard links, otherwise publication fails and old backups stay intact.
+Discovery, restore and explicitly enabled retention accept both naming forms.
+
 Check the status file weekly: `result` must be `success` and `timestamp` from the last day. A
 `failure` carries the reason in `message`; a stale timestamp means the timer is not running.
+
+The protected `GET /health/backup` reads only status metadata, without database access.
+Its `status` is `available`, `legacy`, `missing`, `invalid`, `unreadable` or `unconfigured`.
+`last_attempt` contains `result` (`success`/`failure`) and UTC `timestamp`;
+`last_success_at` is UTC or `null` when there is no evidence. A failure preserves the
+previous success across app recreation. Success is published only after encryption
+and final artifact placement. No paths, keys or raw error messages enter this response.
+The old detailed `last-backup-status.json` remains compatible. On first publication,
+only a valid legacy **success** proves an earlier success; a legacy failure cannot.
+Back up the metadata directory along with operational state to retain that history.
 
 ### Watch the disk
 
@@ -551,7 +623,12 @@ and the unit fails; it never deletes old backups to make room. Fix it by adding 
 
 Restore drill, monthly and after every change to backups or keys. It never touches the live
 `health` database: it drops and recreates a scratch database, restores into it, and prints row
-counts next to the live counts plus the restored Alembic revision.
+counts across the union of tables plus the restored Alembic revision. Each table is
+`equal`, `different`, `restored_only` or `live_only`; query/invalid-output errors and a
+restored copy without tables fail the command instead of appearing equal. Count differences are informational: an old
+snapshot and a changing live archive normally differ, and equal counts alone do not
+prove content integrity. The isolated Compose drill freezes synthetic data and fails
+unless every table matches. No comparison restores into the live database.
 
 ```sh
 BACKUP_AGE_IDENTITY=/path/to/healthos-backup.age \
@@ -566,22 +643,139 @@ afterwards. Replacing the live database is a separate, destructive procedure; se
 
 ## Restart the Umay bridge
 
-The bridge is a host process, not a container. Its state is in `~/.codex/healthos-bridge/` (or under
-`CODEX_HOME`): `bridge.pid`, `bridge.token`, `bridge.log`.
+The bridge runs on the host. Linux production can use
+[`deploy/systemd/healthos-bridge.service`](../deploy/systemd/healthos-bridge.service).
+The paths below assume a checkout in `/opt/healthos`, with dependencies installed using
+`uv sync --frozen --no-dev`, and the existing CLI installed at `/usr/local/bin/codex`.
+Adjust the unit's explicit paths if your installation differs; no dependency upgrade is needed.
+
+1. Stop any manually launched bridge using its recorded `bridge.pid` before enabling the unit.
+   Provision a dedicated account and private home (once):
+
+   ```sh
+   sudo useradd --system --user-group --home-dir /var/lib/healthos-bridge --shell /usr/sbin/nologin healthos-bridge
+   sudo install -d -m 700 -o healthos-bridge -g healthos-bridge /var/lib/healthos-bridge
+   sudo install -d -m 700 /etc/healthos
+   ```
+
+2. Sign in as this account, with the same home used by the unit. An existing login can instead
+   be provisioned privately as `/var/lib/healthos-bridge/auth.json`, owner `healthos-bridge`,
+   mode 0600; never put credentials in the checkout or the unit:
+
+   ```sh
+   sudo -u healthos-bridge env HOME=/var/lib/healthos-bridge CODEX_HOME=/var/lib/healthos-bridge /usr/local/bin/codex login
+   sudoedit /etc/healthos/bridge.env
+   sudo chmod 600 /etc/healthos/bridge.env
+   ```
+
+   In that root-owned environment file, set `CODEX_BRIDGE_TOKEN` to the backend's existing
+   private token (or provision one random value in both places). Do not paste it into shell
+   arguments or logs. The service also reuses an existing private `bridge.token` when no
+   environment token is supplied; if neither exists, startup fails instead of rotating it.
+   Set `CODEX_BRIDGE_BIND_HOST` only to override address selection. The default remains the
+   `docker0` gateway on Linux Docker Engine, loopback elsewhere. The app's existing
+   `host.docker.internal:host-gateway` mapping needs no change. Keep the backend's explicit
+   `CODEX_BRIDGE_URL`; for a native backend use `ws://127.0.0.1:8766` and a loopback bind.
+   Service mode never writes `.env` and does not need to read it: the checkout's mode 600
+   `.env` stays unreadable to this account, so service settings belong in `bridge.env`.
+   Recreate the app only after a token or URL change.
+
+3. Apply the existing [`deploy/firewall/`](../deploy/firewall/) nftables or UFW instructions
+   before starting. Only loopback and Docker bridges may reach port 8766. UI/API stays on
+   `127.0.0.1`; the public tunnel still allows only `POST /webhooks/google-health`.
+   The account needs read/execute access to the checkout and Python environment, not write access.
+   The virtualenv's Python interpreter and CLI must live outside `/home` (`ProtectHome=true`).
+
+   ```sh
+   sudo install -m 644 deploy/systemd/healthos-bridge.service /etc/systemd/system/healthos-bridge.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now healthos-bridge
+   ```
+
+Routine operations and diagnostics:
+
+```sh
+sudo systemctl stop healthos-bridge
+sudo systemctl start healthos-bridge
+sudo systemctl restart healthos-bridge
+sudo systemctl status healthos-bridge --no-pager
+sudo journalctl -u healthos-bridge -n 80 --no-pager
+ss -ltn | grep 8766
+```
+
+`Type=simple` tracks process lifetime, not application readiness: check the listener and open
+Umay on the local dashboard. The supervisor stops the process group, waits up to five seconds,
+then kills leftovers; systemd also owns the entire cgroup with a 15-second stop limit.
+Unexpected exits fail the service, including a spontaneous exit 0. Restarts wait 10 seconds,
+with at most five starts per 300 seconds. After fixing a login, executable, port conflict or
+configuration problem, use `sudo systemctl reset-failed healthos-bridge`, then start it again.
+Identity stays in `/var/lib/healthos-bridge/healthos-bridge/`, directory 0700 and private files
+0600. Service output goes to the journal; no detached PID is adopted. Enablement survives reboot.
+The first service start copies the source login; later starts keep credentials refreshed inside
+the isolated home. To renew that login, stop the service and repeat the login command above with
+`CODEX_HOME=/var/lib/healthos-bridge/healthos-bridge`, then start the service.
+
+Without systemd, the manual launcher remains available; its files are under
+`~/.codex/healthos-bridge/` (or `CODEX_HOME`), including `bridge.pid` and `bridge.log`:
 
 ```sh
 kill "$(cat ~/.codex/healthos-bridge/bridge.pid)"
 uv run --frozen --no-dev python scripts/start_codex_bridge.py
-docker compose up -d --force-recreate app      # only if the token or URL in .env changed
-ss -ltn | grep 8766                            # must show the docker0 address or 127.0.0.1
+docker compose up -d --force-recreate app      # only if token or URL changed
 ```
 
-A bridge started by an older launcher may still listen on all interfaces (`0.0.0.0`, port 8766). The current launcher
-reuses any healthy bridge, so it will not replace that one by itself (it prints a warning when the
-bridge also answers on loopback). Stop it through `bridge.pid` as above and launch again. After a
-reboot the bridge is not restarted automatically; run the launcher again.
+Older bridges might still listen on `0.0.0.0`: stop them explicitly before relaunching, since
+manual mode reuses a healthy instance. Manual mode alone does not restart after reboot.
+In the panel, missing settings, refusal, timeout and disconnect show safe Umay messages;
+five retries use increasing waits, then **Yeniden bağlan** resets the budget. Sending is disabled
+while waiting. Reconnecting starts a new ephemeral conversation; there is no persistent memory.
+Requested health records still go to OpenAI through the signed-in account for interpretation.
+Synthetic process/WebSocket tests do not validate VM systemd, Docker routing or firewall rules;
+the maintainer must verify start/stop/reboot, allowed Docker access and denied LAN access there.
 
 ## The webhook went quiet
+
+Sistem → Google bildirimleri → Bildirim ayrıntıları, aşağıdaki salt okunur uçla aynı
+tanılamayı gösterir (UI kimlik doğrulaması gerekir; genel webhook hostundan erişilemez):
+
+```sh
+api /api/webhooks/status | python3 -m json.tool
+```
+
+- `last_notification_at`: geçerli imza ve en az bir geçerli bildirim öğesiyle alınmış,
+  eski tekrar teslimi sayılmayan son teslim. İşleme başarısı ya da son veri yazımı değildir.
+  Eski arşivde yalnız ham baytları ve geçerli öğesi bulunan doğrulama zamanı kanıt sayılır.
+- `silence`: servis yedi günlük eşiği hesaplar. İlk yapılandırılmış uygulama başlangıcı
+  bekleme süresini başlatır; yeni kurulum hemen sessiz sayılmaz. Yapılandırılmamış alıcı,
+  henüz teslim alınmaması, eşik aşılması ve durum ucuna erişilememesi panelde ayrıdır.
+  Challenge, bozuk trafik, tüm öğeleri reddedilen gövde ve eski tekrar süreyi sıfırlamaz.
+- `counters.scope=persistent_diagnostic_events`: `20261025_0017` ile eklenen ayrı
+  `webhook_status_events` tablosuna yalnız olay eklenir; webhook arşivi değiştirilmez.
+  `since` ilk tanılama gözleminin zamanıdır; sayaçlar süreçler arasında ortaktır ve yeniden
+  başlatmada korunur. Önceki arşivden sayaç türetilmez; veritabanı kesintisinde gözlem eksilebilir.
+- `reasons` yetkilendirme, eksik/bozuk/geçersiz imza, anahtar indirme hatası, challenge,
+  yinelenen teslim, eski tekrar ve işleme hatalarını ayırır. `units` sayım birimlerini belirtir.
+  İstek başına birden fazla olay olabilir; `valid` yalnız kriptografik başarıdır.
+  `invalid` eksik/bozuk/geçersiz imzaları toplar; yetkilendirme ve anahtar hatası ayrı kalır.
+  Google'ın anahtar seti alınamazsa (`key_download_failed`) yanıt `401` değil `503`'tür:
+  imza hakkında hüküm değildir, Google teslimi sonra yeniden dener.
+- Yetkilendirme öncesi retler (`authorization_rejected`, `receiver_unconfigured`) herkesçe
+  tetiklenebilir ve tanılama satırı silinmez; bu yüzden neden başına dakikada en fazla bir
+  satır kalıcı yazılır. Bu iki nedenin `counters` değeri istek sayısından az olabilir.
+  Yetkili aşamadaki nedenler ve teslimler eksiksiz yazılır.
+- `process_local` yalnız bu sürecin başlangıcından (`since`) beri bellekte tutulur; yeniden
+  başlatmada sıfırlanır, worker'lar arasında ortak değildir. `unpersisted` örneklemeyle
+  atlanan yetki öncesi ret satırlarını neden başına sayar. `rate_limited.authorized` ve
+  `rate_limited.unauthorized` iki webhook bütçesinin `429` ile reddettiği istekleri sayar;
+  hız retleri hiç kalıcı yazılmaz ([sınırlar](#webhook-ve-manuel-yazma-sınırları)).
+- `expired`, imzanın süre sonu değildir: biçimde böyle bir alan yoktur. Yerel
+  `SIGNED_REPLAY_MAX_AGE` kuralı, ilk doğrulamasından **24 saatten fazla** geçen arşivlenmiş
+  gövdenin yeniden işlenmesini engeller. Bu istek hem `valid` hem `expired` sayılabilir;
+  yanıt 204 kalır. Tam 24 saatlik teslim mevcut kurala göre kabul edilir.
+- Abonelik ve yenileme kanıtı/istemcisi bulunmadığından `subscription.status` ve
+  `renewal_status` daima `unknown`; yapılandırma hazırlığı yenileme başarısı değildir.
+  GET çağrısı Google'a gitmez, abonelik oluşturmaz veya yenilemez. `last_error` yalnız sabit
+  kod, doğrulama/işleme aşaması ve zaman içerir; imza, gövde ve sağlık değeri içermez.
 
 Symptoms: the dashboard's newest records lag by hours, or `/health` reports `stale`/`degraded`.
 
@@ -604,7 +798,10 @@ Symptoms: the dashboard's newest records lag by hours, or `/health` reports `sta
    ```
 
    `WEBHOOK_SIGNATURE_INVALID` with `reason=authorization` means the subscriber's secret and `.env`
-   differ. `WEBHOOK_REPLAY_IGNORED` means a signed body older than 24 hours arrived again and was
+   differ. `WEBHOOK_VERIFICATION_UNAVAILABLE` means Google's public keyset could not be fetched:
+   the delivery got 503 and Google retries it, so check the app's outbound network rather than the
+   secret. A rising `process_local.rate_limited.authorized` means real deliveries are hitting 429
+   (`WEBHOOK_REQUESTS_PER_MINUTE`). `WEBHOOK_REPLAY_IGNORED` means a signed body older than 24 hours arrived again and was
    deliberately not reprocessed.
 3. **Tunnel.** `systemctl status cloudflared`, `journalctl -u cloudflared --since '6 hours ago'`,
    then the external checks in [CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md#verify-the-public-surface):
@@ -648,3 +845,150 @@ A requeued window resumes from its saved page token; if it keeps failing it is a
 after ten more attempts.
 
 If Google simply has no accessible data for that range, leaving the window abandoned is harmless.
+
+## Kapsama ve çekim fişleri — 20261025_0015
+
+Önce `alembic upgrade head` çalıştırılır. Migration `retrieval_receipts`, `retrieval_events`
+ve operasyonel `retrieval_checkpoints` tablolarını, indekslerini ve fiş korumalarını ekler;
+mevcut ham ve manuel kayıtlara dokunmaz. Fiş/olay tablolarında UPDATE/DELETE ve PostgreSQL
+TRUNCATE reddedilir; korumalar
+`health-mirror verify` ile denetlenir. Fiş varken downgrade veri kaybını reddeder.
+Geçmişe fiş doldurulmaz; eski başarılı işler ve `fetch_rounds` eksiksizlik kanıtı değildir.
+
+Incremental (webhook ve uzlaştırma dahil) ve backfill çekimleri artık her denemeyi kaydeder.
+Sayfa olayı kayıtlar ve checkpoint ile aynı işlemde kalıcılaşır. Operasyonel fiş
+işaretçisi değişebilir ve tarihsel kanıt değildir; tokenı belirli bir sayfa olayına bağlar.
+Aynı tokenla eski fiş tahmin edilmez. Geri alınan sayfanın dönüş sayısı hata olayında kalır; bu olay kayıtların kalıcılaştığını kanıtlamaz. Son sayfadan sonra sonuç
+olayı eklenir; fiş güncellenmez. Devam, kaydedilmiş sayfanın token özetine bağlanır; eski
+fişsiz token son sayfaya ulaşsa bile eksiksizlik kanıtlamaz. Token sıfırlanınca ayrı bir ilk
+sayfa denemesi açılır. Hata, iptal veya süreç kesintisi yarım denemeyi başarıya dönüştürmez.
+
+Sistem → Kapsama → Ayrıntıları aç üzerinden dönem ve veri türü seçilir. Uzun içerik pencere
+içinde kayar. `GET /api/sync/coverage` mevcut oturum/bearer kimlik doğrulamasını kullanır:
+
+```text
+/api/sync/coverage?start_date=2026-09-01&end_date=2026-09-07&timezone=Europe/Istanbul&data_type=steps
+```
+
+Tarihler dahil, en çok 31 gün; `timezone` zorunludur. `data_type` isteğe bağlıdır. Türler
+alfabetik sayfalanır: `limit` 1–4, `offset` 0–1000; yanıttaki `next_offset` izlenir. Sunucu
+sayfayı en çok 62 tür/gün hücresine indirir. Özet yalnız o sayfanın kapalı tür/günlerini
+sayar. Yanıt başına 12 KiB; en çok 2000 fiş, 5000 olay üstverisi, dönemle örtüşen sayfalardan 8 MiB zaman verisi ve tür başına
+100000 dönem kaydı okunur. Limit aşımı kırpılmış başarı yerine yapısal 413 döndürür.
+
+`has_value` mevcut uygunluk/dışlama kurallarını kullanır; kaynaklar ayrı satırlarda kalır.
+`presence_basis=eligible_record` olan türlerde bu, dışlanmamış kayıt varlığıdır; skalerin
+veya ölçüm sıklığının doğruluğunu kanıtlamaz. `retrieval` bundan bağımsızdır:
+`completed_with_records`, `completed_empty`, `incomplete`, `unknown`. Dönen kayıtlar dışlanan
+kayıtları da içerir; eklenen/güncellenen satır sayısı değildir. `returned_records` günün
+kanıtlanmış dönüş gözlemlerini sayar (yeniden çekimler dahil); gün belirlenemiyorsa null.
+Pencere toplamı günlere dağıtılmaz. Fişsiz geçmişe “hiç çekilmedi” denmez.
+
+Günlük filtreler civil tarihe, uyku bitiş zamanına, diğer oturumlar civil başlangıç için
+saat farkı sınırlarına göre değerlendirilir. Fiziksel günler seçilen saat diliminde 23/25
+saat olabilir; saniye hassasiyeti ve rollup dakika hizalaması korunur. Bugün kapalı gün
+sayılmaz; kanıt ufku ilk sayfa denemesinin başlangıcıdır. Gece yarısını geçen veya sonraki
+gün devam eden sorgu, ilk sayfa başlarken gelecekte olan günü tamamlanmış göstermez. Zaman filtresi
+olmayan kataloglarda günlük değer/çekim kanıtı yoktur (`no_time_filter`). Umay'ın şema 1
+kapsama kartı ve 12 KiB sınırı aynı kalır; bu HTTP raporuyla birleştirilmez.
+
+## Uzlaştırma fark geçmişi — 20261025_0016
+
+Migration yalnız `reconciliation_runs` ve `reconciliation_results` tablolarını ekler.
+Günlük/haftalık görev, `health-mirror reconcile` ve watchdog aynı raporlama yolunu kullanır.
+Fişsiz veya raporsuz geçmişten tahmini fark raporu üretilmez. Rapor bulunan veritabanında
+downgrade reddedilir; ham arşiv, sürümler ve değiştirilemez çekim fişleri korunur.
+
+`GET /api/sync/reconciliation?offset=0&limit=20` mevcut oturum/bearer kimlik doğrulamasıyla
+okunur; yeni iş başlatmaz. `limit` 1–100, `offset` 0–10000; geçersiz değerler 422 döndürür.
+Yanıt `runs`, `total`, `offset`, `limit` içerir; boş geçmişte `runs=[]`, `total=0` olur.
+Çalıştırmalar `started_at DESC, id DESC`, her çalıştırmanın `types` sonuçları `data_type ASC`
+sırasındadır. Sayfalar çalışma bazındadır; tür sonuçları sayfalar arasında bölünmez.
+
+Her çalıştırma istenen aralığı, kimliğini, başlangıç/bitişi, durumu ve güvenli hata türünü
+tutar. Tür sonuçlarında `inserted`, `updated`, `unchanged`, `source_deleted` ve
+`pages_committed` bulunur. Bunlar o çalıştırma sırasında commit edilmiş işlemlerdir;
+ham değer, token veya istisna mesajı rapora kopyalanmaz. Sayaçlar kayıt/sayfa/checkpoint
+veya silinme işlemiyle aynı transaction'dadır. Rollback sayılmaz; sonraki sayfa/pencere
+başarısız olsa da önceki commit'ler raporda kalır. Tekrar gelen aynı içerik yeni/değişmiş
+sayılmaz. Önceki başka pencerenin token devamı bu isteğin farklarına eklenmez.
+
+`completed` bütün türlerin çekimleri tamamlandığında, `partial` hata öncesinde en az bir
+istenen sayfa veya tür tamamlandığında, `failed` böyle bir ilerleme olmadan hata olduğunda
+yazılır. İptal `cancelled` olur. Türler başlamadan `pending`, çalışırken `running` kalır.
+Süreç sonuç yazamadan kesilirse rapor `running` ve bitişi null kalır; okuma bunu başarıya
+dönüştürmez. Watchdog yalnız kendi kimliğine ait bitmiş, bütün türleri tamamlanmış kalıcı
+raporu başarılı kurtarma kabul eder; cooldown, canlı eşitleme ve çakışma kilitleri korunur.
+Başarılı token devamı bütün aralığın yeniden ilk sayfadan çekildiği anlamına gelmez;
+eksiksizlik kanıtı yine çekim fişlerindedir. Kaynak silinmesi yalnız mevcut tam çekim
+kapsamında `source_deleted_at` ile işaretlenir; kimlik ertelemeleri değişmez.
+
+### Başarısız türetilmiş günleri yeniden deneme
+
+Hesaplama hatası düzeltildikten sonra `METHOD` veya kaynak kayıtlarını değiştirmeden:
+
+```sh
+python -m app.cli.derived_retry 2026-09-01 2026-09-30 Europe/Istanbul --dry-run
+python -m app.cli.derived_retry 2026-09-01 2026-09-30 Europe/Istanbul
+```
+
+İki tarih dahil, aralık 1–366 gündür; saat dilimi açıkça verilmelidir. Yalnız güncel
+yöntemin bu aralık/saat dilimindeki mevcut `build_error` günleri adaydır; soğuk gün
+oluşturulmaz. Kaynak değişmişse kilit altında güncel revizyon hesaplanır. Her gün ayrı
+transaction'da commit edilir, kilit günler arasında bırakılır. Kesilme yalnız etkin günü
+geri alır; yeniden çalıştırma başarılı günleri atlar. Normal okumalar ve zamanlayıcı,
+kaynak revizyonu değişmedikçe başarısız günleri kendiliğinden yeniden denemez.
+
+Rapor aday, işlenen, başarılı, başarısız, kaynağı değişen ve atlanan gün sayılarını içerir;
+sağlık değeri içermez. Atlanan, aday olmayan (eksik/sağlıklı) günlerle kilit beklenirken başka
+bir hesaplayıcının düzelttiği adaylardır. Kaynağı değişen gün yeniden hesaplanırken kaynağı
+değişmiştir; yenileme kuyruğu onu yeniden kurar ve başarısız sayılmaz. `--dry-run` yalnız
+okur, işlenen/başarılı/başarısız sıfır olur; aday sayısı yapılacak işi gösterir. Yeniden
+denemede hata kaydı kalan gün varsa çıkış kodu 1, geçersiz girdi için 2, başarı veya salt
+okunur deneme için 0'dır. Veritabanı hatasında o günün
+önceki hata kaydı korunur; sonraki günler denenir. Ham, manuel ve geçmiş kayıtlar değişmez.
+
+### Webhook ve manuel yazma sınırları
+
+- Manuel ölçüm/antrenman oluşturma ve ölçüm işaretleme/kaldırma POST gövdeleri
+  `MANUAL_WRITE_MAX_BODY_BYTES` ile sınırlıdır (varsayılan 4096 bayt, 1024–65536).
+  Başlık olmasa veya az bildirilse de gerçek baytlar JSON ayrıştırılmadan sayılır;
+  aşım `413`, bozuk/çoklu `Content-Length` ise `400` döndürür.
+- Webhook mevcut `GOOGLE_HEALTH_WEBHOOK_MAX_BODY_BYTES` sınırını ve imzalanan özgün
+  baytları korur; yetkisiz webhook gövdesi okunmaz.
+- Uygulama başına üç ayrı, sabit 60 saniyelik pencereli bütçe vardır: manuel yazma
+  (`MANUAL_WRITE_REQUESTS_PER_MINUTE=60`) ve iki webhook bütçesi; ikisinin de kapasitesi
+  `WEBHOOK_REQUESTS_PER_MINUTE=120`'dir (her ayar 1–10000). `Authorization` değeri sabit
+  zamanlı karşılaştırmayla eşleşen istekler (challenge dahil) yetkili bütçeyi, eşleşmeyenler
+  ve yapılandırılmamış alıcıya gelenler yetkisiz bütçeyi harcar. Yetkili bütçe bu
+  karşılaştırmadan sonra, gövde okunmadan ve imza doğrulanmadan önce harcanır; yetkisiz sel
+  Google teslimlerini `429`'a düşüremez. İstemci adresi, UUID ve proxy başlıkları bütçeyi
+  değiştirmez. GET, sohbet, sağlık kontrolü ve statik dosyalar bu bütçeleri tüketmez.
+- Dolan bütçe gövdeyi okumadan `429` ve pozitif saniye cinsinden `Retry-After`
+  döndürür. Hız reddi kalıcı tanılama yazmaz; son doğrulanmış teslimi ilerletmez.
+  Sayaçlar yalnız süreç belleğindedir, yeniden başlatmada sıfırlanır; birden çok
+  worker birbirinden bağımsızdır. Ret sayıları `/api/webhooks/status` içinde
+  `process_local.rate_limited` altında görünür. Pencere sınırının iki yanında kısa
+  kümeler mümkündür.
+
+## jsonb'nin tutamadığı imzalı webhook gövdeleri — 20261031_0021
+
+PostgreSQL jsonb, Python'un kabul ettiği U+0000'ı (`\u0000`), eşsiz vekil karakteri
+(`\ud800`) ve sonlu olmayan sayıları (`NaN`, `Infinity`, `1e400`) tutamaz. Böyle bir imzalı
+gövde önceden `webhook_events.raw_json` yazımında hata verip bütün alımı geri alıyordu; ham
+baytlar hiç saklanmıyordu. Bu migration iki sütunu NULL olabilir yapar ve iki kısıt ekler:
+satırda `raw_json` ya da `raw_body` bulunur; `raw_json` NULL olan öğe reddedilmiştir.
+Mevcut satırlar okunmaz, değiştirilmez, silinmez. NOT NULL'ı kaldırmak iki tabloda
+ACCESS EXCLUSIVE kilidi ister; 0012–0020'nin aksine çalışan bir `pg_dump` bunu engeller.
+Migration kilidi en çok 30 sn bekler (`-x lock-timeout=2min` ile değişir), alamazsa
+`20261031_0021 could not lock ... retry` hatasıyla hiçbir şeyi değiştirmeden durur; yedek
+bitince yeniden çalıştırılır.
+
+Böyle bir gövde `raw_body`'de bayt bayt saklanır (`payload_hash` yine bu baytların SHA-256'sı),
+`raw_json` NULL kalır. Tutulamayan öğe `raw_json` NULL ve türetilmiş sütunları boş olarak
+reddedilir; aslı batch'in `raw_body`'sinde, `webhook_batch_items` sırasındadır. Temiz kardeş
+öğeler işlenir. Tutulamayan öğeler, `json.loads`'un aynı değere indirdiği farklı yazımlarda
+aynı `element_hash`'i alabilir (`1e400`, `2e999` ve `Infinity` hepsi inf olur). Veri kaybolmaz:
+her öğenin baytı kendi batch'inin `raw_body`'sinde ve `webhook_batch_items` sırasındadır, öğe
+de zaten reddedilir. `raw_json` NULL satır varken `alembic downgrade 20261025_0020` hiçbir şeyi
+değiştirmeden reddedilir.

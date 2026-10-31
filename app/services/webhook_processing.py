@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import CursorResult, func, null, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.logging import event
@@ -24,8 +27,19 @@ from app.models.state import (
     WebhookEvent,
     WebhookNotification,
 )
-from app.parsers.common import parse_datetime, payload_hash
+from app.parsers.common import canonical_json
+from app.services.webhook_metadata import (
+    UNREPRESENTABLE,
+    NotificationWindowError,
+    extract_notification,
+    index_metadata,
+    jsonb_storable,
+    notification_data,
+    notification_windows,
+)
+from app.services.webhook_status import WebhookStatusService
 from app.sync.incremental import IncrementalSync, stale_running_cutoff
+from app.sync.ownership import NOTIFICATION_NAMESPACE, OwnershipLost, run_ownership
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +82,12 @@ class WebhookBatchProcessor:
         sessions: async_sessionmaker,
         incremental: IncrementalSync,
         supported_data_types: set[str],
+        status: WebhookStatusService | None = None,
     ) -> None:
         self.sessions = sessions
         self.incremental = incremental
         self.supported_data_types = supported_data_types
+        self.status = status
         # Only elements being processed right now have an entry; see _element_lock.
         self._element_locks: dict[str, _ElementLock] = {}
 
@@ -94,6 +110,9 @@ class WebhookBatchProcessor:
             if stored is None:
                 raise ValueError(f"Unknown webhook batch: {batch_hash}")
             payload = stored.raw_json
+            if payload is None and stored.raw_body is not None:
+                # jsonb could not hold this body (or it is JSON null): read the signed bytes.
+                payload = json.loads(stored.raw_body)
         return await self._prepare_batch(
             batch_hash,
             payload,
@@ -119,28 +138,31 @@ class WebhookBatchProcessor:
                 if session.get_bind().dialect.name == "postgresql"
                 else sqlite_insert
             )
-            first_data = _notification_data(elements[0]) if len(elements) == 1 else None
-            statement = (
-                dialect_insert(WebhookEvent)
-                .values(
-                    payload_hash=batch_hash,
-                    data_type=first_data.get("dataType") if first_data else None,
-                    health_user_id=first_data.get("healthUserId") if first_data else None,
-                    operation=first_data.get("operation") if first_data else None,
-                    raw_json=payload,
-                    raw_body=raw_body,
-                    signature_verified_at=signature_verified_at or now,
-                    element_count=len(elements),
-                    failure_count=0,
+            if raw_body is not None:
+                # Only a delivery inserts; prepare_existing_batch has its row already.
+                # A body jsonb cannot hold is kept as its bytes alone (raw_json NULL).
+                first_data = notification_data(elements[0]) if len(elements) == 1 else None
+                statement = (
+                    dialect_insert(WebhookEvent)
+                    .values(
+                        payload_hash=batch_hash,
+                        **index_metadata(first_data),
+                        raw_json=payload if jsonb_storable(payload) else null(),
+                        raw_body=raw_body,
+                        signature_verified_at=signature_verified_at or now,
+                        element_count=len(elements),
+                        failure_count=0,
+                    )
+                    .on_conflict_do_nothing(index_elements=["payload_hash"])
+                    .returning(WebhookEvent.payload_hash)
                 )
-                .on_conflict_do_nothing(index_elements=["payload_hash"])
-                .returning(WebhookEvent.payload_hash)
-            )
-            inserted = (await session.scalar(statement)) is not None
+                inserted = (await session.scalar(statement)) is not None
             batch = await session.get(WebhookEvent, batch_hash)
             if batch is None:
                 raise RuntimeError("Webhook batch could not be persisted")
             if not inserted and raw_body is not None and _stale(batch.signature_verified_at, now):
+                if self.status:
+                    self.status.observe(session, "expired_replay")
                 event(logger, "WEBHOOK_REPLAY_IGNORED", batch_hash=batch_hash)
                 return IngestResult(
                     batch_hash=batch_hash,
@@ -148,6 +170,8 @@ class WebhookBatchProcessor:
                     inserted=False,
                     should_process=False,
                 )
+            if raw_body is not None and self.status and not inserted:
+                self.status.observe(session, "duplicate")
             existing_items = await session.scalar(
                 select(func.count())
                 .select_from(WebhookBatchItem)
@@ -158,15 +182,30 @@ class WebhookBatchProcessor:
                     select(OAuthToken.health_user_id).where(OAuthToken.subject == "me")
                 )
                 for ordinal, item in enumerate(elements, start=1):
-                    element_digest = payload_hash(item)
-                    extracted, validation_error = self._extract(item, expected_user_id)
+                    element_digest = _element_hash(item)
+                    storable = jsonb_storable(item)
+                    # An element jsonb cannot hold keeps nothing derived; its bytes stay
+                    # in the batch raw_body at this ordinal.
+                    extracted, validation_error = (
+                        extract_notification(item, expected_user_id, self.supported_data_types)
+                        if storable
+                        else ({}, UNREPRESENTABLE)
+                    )
+                    if validation_error is None:
+                        try:
+                            notification_windows(
+                                self.incremental.specs[extracted["dataType"]],
+                                extracted["intervals"],
+                            )
+                        except NotificationWindowError as exc:
+                            validation_error = str(exc)
                     is_valid = validation_error is None
+                    if not is_valid and self.status:
+                        self.status.observe(session, "notification_rejected")
                     values = {
                         "element_hash": element_digest,
-                        "raw_json": item,
-                        "data_type": extracted.get("dataType"),
-                        "health_user_id": extracted.get("healthUserId"),
-                        "operation": extracted.get("operation"),
+                        "raw_json": item if storable else null(),
+                        **index_metadata(extracted),
                         "intervals": extracted.get("intervals"),
                         "is_valid": is_valid,
                         "status": "pending" if is_valid else "rejected",
@@ -209,6 +248,21 @@ class WebhookBatchProcessor:
                     WebhookNotification.status != "completed",
                 )
             )
+            if raw_body is not None and self.status:
+                valid = await session.scalar(
+                    select(WebhookBatchItem.element_hash)
+                    .join(
+                        WebhookNotification,
+                        WebhookNotification.element_hash == WebhookBatchItem.element_hash,
+                    )
+                    .where(
+                        WebhookBatchItem.batch_hash == batch_hash,
+                        WebhookNotification.is_valid.is_(True),
+                    )
+                    .limit(1)
+                )
+                if valid:
+                    self.status.observe(session, "notification_received")
         return IngestResult(
             batch_hash=batch_hash,
             element_count=len(elements),
@@ -216,32 +270,15 @@ class WebhookBatchProcessor:
             should_process=prepared or bool(incomplete),
         )
 
-    def _extract(self, item: object, expected_user_id: str | None) -> tuple[dict, str | None]:
-        if not isinstance(item, dict):
-            return {}, "notification element must be an object"
-        data = item.get("data")
-        if not isinstance(data, dict):
-            return {}, "notification element.data must be an object"
-        extracted = {
-            "dataType": data.get("dataType"),
-            "healthUserId": data.get("healthUserId"),
-            "operation": data.get("operation"),
-            "intervals": data.get("intervals"),
-        }
-        for field in ("dataType", "healthUserId", "operation"):
-            if not isinstance(extracted[field], str) or not extracted[field]:
-                return extracted, f"notification {field} must be a non-empty string"
-        if not isinstance(extracted["intervals"], list):
-            return extracted, "notification intervals must be an array"
-        if expected_user_id is None:
-            return extracted, "authorized Google Health user ID is unavailable"
-        if extracted["healthUserId"] != expected_user_id:
-            return extracted, "notification healthUserId does not match the authorized account"
-        if extracted["dataType"] not in self.supported_data_types:
-            return extracted, "notification dataType is not enabled by this mirror"
-        return extracted, None
-
     async def process_batch(self, batch_hash: str) -> ProcessingStats:
+        try:
+            return await self._process_batch(batch_hash)
+        except Exception:
+            if self.status:
+                await self.status.record("batch_processing_failed")
+            raise
+
+    async def _process_batch(self, batch_hash: str) -> ProcessingStats:
         async with self.sessions() as session:
             hashes = (
                 await session.scalars(
@@ -284,94 +321,117 @@ class WebhookBatchProcessor:
 
     async def _process_element(self, element_hash: str) -> str:
         async with self._element_lock(element_hash):
-            async with self.sessions.begin() as session:
+            # Keep ownership from before the claim through every window and result.
+            # Recovery never waits for this lock or takes the data-type lock.
+            async with run_ownership(
+                self.sessions, element_hash, wait=False, namespace=NOTIFICATION_NAMESPACE
+            ) as sessions:
+                if sessions is None:
+                    return "running"
+                return await self._process_owned_element(element_hash, sessions)
+
+    async def _process_owned_element(self, element_hash: str, sessions) -> str:
+        async with sessions.begin() as session:
+            notification = await session.get(WebhookNotification, element_hash)
+            if notification is None:
+                return "failed"
+            if not notification.is_valid:
+                return "rejected"
+            if notification.status == "completed":
+                return "completed"
+            claim = await session.execute(
+                update(WebhookNotification)
+                .where(
+                    WebhookNotification.element_hash == element_hash,
+                    WebhookNotification.status.in_(("pending", "failed")),
+                )
+                .values(
+                    status="running",
+                    attempt_count=WebhookNotification.attempt_count + 1,
+                    last_error=None,
+                )
+                .returning(
+                    WebhookNotification.data_type,
+                    WebhookNotification.intervals,
+                )
+            )
+            claimed = claim.one_or_none()
+        if claimed is None:
+            return "running"
+        data_type, intervals = claimed
+        try:
+            # Archived pending/failed notifications predate ingestion validation.
+            # Recheck under ownership and before counting or starting any fetch.
+            windows = notification_windows(self.incremental.specs[data_type], intervals)
+            await self._run_incremental(element_hash, data_type, windows, sessions)
+            async with sessions.begin() as session:
                 notification = await session.get(WebhookNotification, element_hash)
-                if notification is None:
-                    return "failed"
-                if not notification.is_valid:
-                    return "rejected"
-                if notification.status == "completed":
-                    return "completed"
-                claim = await session.execute(
-                    update(WebhookNotification)
-                    .where(
-                        WebhookNotification.element_hash == element_hash,
-                        WebhookNotification.status.in_(("pending", "failed")),
-                    )
-                    .values(
-                        status="running",
-                        attempt_count=WebhookNotification.attempt_count + 1,
-                        last_error=None,
-                    )
-                    .returning(
-                        WebhookNotification.data_type,
-                        WebhookNotification.intervals,
-                    )
-                )
-                claimed = claim.one_or_none()
-            if claimed is None:
-                return "running"
-            data_type, intervals = claimed
-            try:
-                await self._run_incremental(element_hash, data_type, intervals)
-                async with self.sessions.begin() as session:
-                    notification = await session.get(WebhookNotification, element_hash)
-                    notification.status = "completed"
-                    notification.processed_at = datetime.now(UTC)
-                    notification.last_error = None
-                event(logger, "WEBHOOK_ELEMENT_PROCESSED", data_type=data_type)
-                result = "completed"
-            except Exception as exc:
-                async with self.sessions.begin() as session:
-                    notification = await session.get(WebhookNotification, element_hash)
-                    notification.status = "failed"
-                    notification.last_error = str(exc)[:2000]
-                logger.exception(
-                    "Webhook notification processing failed",
-                    extra={"event": "WEBHOOK_ELEMENT_FAILED", "data_type": data_type},
-                )
-                result = "failed"
-            await self._finalize_related_batches(element_hash)
-            return result
+                notification.status = "completed"
+                notification.processed_at = datetime.now(UTC)
+                notification.last_error = None
+            event(logger, "WEBHOOK_ELEMENT_PROCESSED", data_type=data_type)
+            result = "completed"
+        except NotificationWindowError as exc:
+            async with sessions.begin() as session:
+                notification = await session.get(WebhookNotification, element_hash)
+                notification.is_valid = False
+                notification.status = "rejected"
+                notification.validation_error = str(exc)
+                notification.last_error = None
+                if self.status:
+                    self.status.observe(session, "notification_rejected")
+            result = "rejected"
+        except Exception as exc:
+            async with sessions.begin() as session:
+                notification = await session.get(WebhookNotification, element_hash)
+                notification.status = "failed"
+                notification.last_error = str(exc)[:2000]
+                if self.status:
+                    self.status.observe(session, "processing_failed")
+            logger.exception(
+                "Webhook notification processing failed",
+                extra={"event": "WEBHOOK_ELEMENT_FAILED", "data_type": data_type},
+            )
+            result = "failed"
+        await self._finalize_related_batches(element_hash, sessions)
+        return result
 
     async def _run_incremental(
-        self, element_hash: str, data_type: str, intervals: list | None
+        self,
+        element_hash: str,
+        data_type: str,
+        windows: list[tuple[datetime | None, datetime | None]],
+        sessions,
     ) -> None:
-        start, end = _physical_range(intervals)
-        spec = self.incremental.specs[data_type]
-        windows: list[tuple[datetime | None, datetime | None]] = []
-        if start and end:
-            # Widen session windows so the filter (and deletion marking) covers the record.
-            start, end = spec.covering_window(start, end)
-            cursor = start
-            while cursor < end:
-                window_end = (
-                    min(cursor + timedelta(days=spec.max_window_days), end)
-                    if spec.max_window_days
-                    else end
-                )
-                windows.append((cursor, window_end))
-                cursor = window_end
-        else:
-            windows.append((None, None))
+        async def check_owner() -> None:
+            # A lost backend must never reconnect through the application's pool.
+            # IncrementalSync also checks this after waiting for data-type ownership.
+            try:
+                async with sessions.begin():
+                    pass
+            except SQLAlchemyError as exc:
+                raise OwnershipLost("webhook ownership connection was lost") from exc
+
         for window_start, window_end in windows:
-            async with self.sessions.begin() as session:
+            async with sessions.begin() as session:
                 await session.execute(
                     update(WebhookNotification)
                     .where(WebhookNotification.element_hash == element_hash)
                     .values(sync_attempt_count=WebhookNotification.sync_attempt_count + 1)
                 )
             with provenance(source="webhook", context_id=f"webhook:{element_hash}"):
-                await self.incremental.run(data_type, window_start, window_end)
-            async with self.sessions.begin() as session:
+                await self.incremental.run(
+                    data_type, window_start, window_end, check_owner=check_owner
+                )
+            async with sessions.begin() as session:
                 await session.execute(
                     update(WebhookNotification)
                     .where(WebhookNotification.element_hash == element_hash)
                     .values(sync_success_count=WebhookNotification.sync_success_count + 1)
                 )
 
-    async def _finalize_related_batches(self, element_hash: str) -> None:
-        async with self.sessions() as session:
+    async def _finalize_related_batches(self, element_hash: str, sessions) -> None:
+        async with sessions.begin() as session:
             batch_hashes = (
                 await session.scalars(
                     select(WebhookBatchItem.batch_hash).where(
@@ -380,10 +440,16 @@ class WebhookBatchProcessor:
                 )
             ).all()
         for batch_hash in set(batch_hashes):
-            await self._finalize_batch(batch_hash)
+            await self._finalize_batch(batch_hash, sessions)
 
-    async def _finalize_batch(self, batch_hash: str) -> None:
-        async with self.sessions.begin() as session:
+    async def _finalize_batch(self, batch_hash: str, sessions=None) -> None:
+        sessions = sessions if sessions is not None else self.sessions
+        async with sessions.begin() as session:
+            # Serialize summaries before reading notification outcomes. A finalizer
+            # queued behind a newer retry must derive its result from that retry.
+            batch = await session.get(WebhookEvent, batch_hash, with_for_update=True)
+            if batch is None:
+                return
             rows = (
                 await session.execute(
                     select(
@@ -403,43 +469,51 @@ class WebhookBatchProcessor:
             incomplete = [row for row in rows if row.is_valid and row.status != "completed"]
             rejected = [row for row in rows if not row.is_valid]
             failed = [row for row in rows if row.is_valid and row.status == "failed"]
-            batch = await session.get(WebhookEvent, batch_hash)
-            if batch is None:
-                return
             batch.failure_count = len(rejected) + len(failed)
             errors = [row.validation_error for row in rejected] + [row.last_error for row in failed]
             batch.last_error = "; ".join(error for error in errors if error)[:2000] or None
             batch.processed_at = None if incomplete else datetime.now(UTC)
 
     async def recover_running(self, now: datetime | None = None) -> int:
-        """Fail elements left `running` by a process that died mid-attempt.
+        """Fail abandoned elements under nonblocking notification ownership.
 
-        A `running` element is never claimed again, so without this its batch stays
-        unprocessed forever. Called at startup (before any webhook is accepted), once more
-        after the stale grace period, and by process_pending; failed elements are retried
-        by the next delivery or replay. An element may belong to another live process (the
-        server while a replay CLI runs, or the reverse): it is left alone while its own row
-        or the sync state of its data type (which a running fetch refreshes per page) has
-        been updated within STALE_RUNNING_AFTER.
+        Timestamps only select candidates. A live owner remains protected while waiting
+        for Google, for a data-type lock, and between windows, however old its heartbeat.
+        Recheck candidates under ownership so a concurrent retry cannot be failed.
         """
         cutoff = stale_running_cutoff(now)
         live_types = select(SyncState.data_type).where(
             SyncState.status == JobStatus.running, SyncState.updated_at >= cutoff
         )
-        async with self.sessions.begin() as session:
-            result = await session.execute(
-                update(WebhookNotification)
-                .where(
-                    WebhookNotification.status == "running",
-                    WebhookNotification.updated_at < cutoff,
-                    or_(
-                        WebhookNotification.data_type.is_(None),
-                        WebhookNotification.data_type.not_in(live_types),
-                    ),
-                )
-                .values(status="failed", last_error=INTERRUPTED_ERROR)
+        conditions = (
+            WebhookNotification.status == "running",
+            WebhookNotification.updated_at < cutoff,
+            or_(
+                WebhookNotification.data_type.is_(None),
+                WebhookNotification.data_type.not_in(live_types),
+            ),
+        )
+        async with self.sessions() as session:
+            candidates = list(
+                await session.scalars(select(WebhookNotification.element_hash).where(*conditions))
             )
-        recovered = result.rowcount or 0
+        recovered = 0
+        for element_hash in candidates:
+            async with run_ownership(
+                self.sessions, element_hash, wait=False, namespace=NOTIFICATION_NAMESPACE
+            ) as sessions:
+                if sessions is None:
+                    continue
+                async with sessions.begin() as session:
+                    result = await session.execute(
+                        update(WebhookNotification)
+                        .where(WebhookNotification.element_hash == element_hash, *conditions)
+                        .values(status="failed", last_error=INTERRUPTED_ERROR)
+                    )
+                    count = cast(CursorResult[Any], result).rowcount or 0
+                    if count and self.status:
+                        self.status.observe(session, "processing_interrupted")
+                recovered += count
         if recovered:
             event(logger, "WEBHOOK_ELEMENTS_RECOVERED", count=recovered)
         return recovered
@@ -475,31 +549,12 @@ class WebhookBatchProcessor:
         return total
 
 
+def _element_hash(item: object) -> str:
+    # payload_hash, which cannot encode an unpaired surrogate; equal for every other value.
+    return hashlib.sha256(canonical_json(item).encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _stale(verified_at: datetime | None, now: datetime) -> bool:
     if verified_at is None:
         return True
     return now - as_utc(verified_at) > SIGNED_REPLAY_MAX_AGE
-
-
-def _notification_data(item: object) -> dict | None:
-    if not isinstance(item, dict):
-        return None
-    data = item.get("data")
-    return data if isinstance(data, dict) else None
-
-
-def _physical_range(intervals: object) -> tuple[datetime | None, datetime | None]:
-    if not isinstance(intervals, list):
-        return None, None
-    ranges = []
-    for item in intervals:
-        physical = item.get("physicalTimeInterval", {}) if isinstance(item, dict) else {}
-        if not isinstance(physical, dict):
-            continue
-        start = parse_datetime(physical.get("startTime"))
-        end = parse_datetime(physical.get("endTime"))
-        if start and end and start < end:
-            ranges.append((start, end))
-    if not ranges:
-        return None, None
-    return min(start for start, _ in ranges), max(end for _, end in ranges)

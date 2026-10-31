@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -26,7 +27,11 @@ def application(monkeypatch):
         google_health_webhook_authorization="Bearer webhook-secret",
     )
     monkeypatch.setattr(main, "get_settings", lambda: settings)
-    monkeypatch.setattr(main, "build_runtime", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(
+        main,
+        "build_runtime",
+        lambda *_: SimpleNamespace(webhook_status=SimpleNamespace(record=AsyncMock())),
+    )
     return main.create_app()
 
 

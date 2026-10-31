@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.config import Settings
 from app.core.logging import event
+from app.services.derived import DerivedRefresh
 from app.services.identity_reconciler import IdentityReconciler
 from app.services.pipeline_health import PipelineHealthService
 from app.services.watchdog import PipelineWatchdog
@@ -34,6 +35,7 @@ def build_scheduler(
     watchdog: PipelineWatchdog | None = None,
     pipeline_health: PipelineHealthService | None = None,
     identity: IdentityReconciler | None = None,
+    derived: DerivedRefresh | None = None,
 ) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_listener(log_missed_job, EVENT_JOB_MISSED)
@@ -86,6 +88,15 @@ def build_scheduler(
             "cron",
             minute=0,
             id="pipeline-freshness-refresh",
+            replace_existing=True,
+            **JOB_DEFAULTS,
+        )
+    if derived is not None:
+        scheduler.add_job(
+            derived.run,
+            "interval",
+            minutes=5,
+            id="derived-refresh",
             replace_existing=True,
             **JOB_DEFAULTS,
         )

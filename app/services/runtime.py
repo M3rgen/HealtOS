@@ -12,12 +12,14 @@ from app.google_health.data_types import mirror_data_types, supported_data_types
 from app.google_health.oauth import OAuthClient, TokenProvider
 from app.google_health.webhook import WebhookSignatureVerifier
 from app.services.credentials import CredentialStore
+from app.services.derived import DerivedRefresh
 from app.services.discovery import DiscoveryService
 from app.services.identity_reconciler import IdentityReconciler
 from app.services.pipeline_health import PipelineHealthService
 from app.services.responses import DatabaseResponseArchive
 from app.services.watchdog import PipelineWatchdog
 from app.services.webhook_processing import WebhookBatchProcessor
+from app.services.webhook_status import WebhookStatusService
 from app.sync.backfill import BackfillService
 from app.sync.incremental import IncrementalSync
 from app.sync.reconciliation import ReconciliationService
@@ -39,6 +41,8 @@ class Runtime:
     discovery: DiscoveryService
     pipeline_health: PipelineHealthService
     watchdog: PipelineWatchdog
+    webhook_status: WebhookStatusService
+    derived: DerivedRefresh | None = None
     identity: IdentityReconciler | None = None
     tasks: set[asyncio.Task] = field(default_factory=set)
     scheduler: object | None = None
@@ -97,6 +101,7 @@ def build_runtime(settings: Settings, sessions: async_sessionmaker) -> Runtime:
     }.intersection(mirror_specs)
     pipeline_health = PipelineHealthService(settings, sessions, frequent_types)
     watchdog = PipelineWatchdog(settings, sessions, pipeline_health, reconciliation)
+    webhook_status = WebhookStatusService(settings, sessions)
     return Runtime(
         credentials=credentials,
         oauth=oauth,
@@ -106,9 +111,13 @@ def build_runtime(settings: Settings, sessions: async_sessionmaker) -> Runtime:
         backfill=backfill,
         reconciliation=reconciliation,
         webhook_verifier=WebhookSignatureVerifier(settings.google_health_webhook_public_key_url),
-        webhook_processor=WebhookBatchProcessor(sessions, incremental, set(mirror_specs)),
+        webhook_processor=WebhookBatchProcessor(
+            sessions, incremental, set(mirror_specs), webhook_status
+        ),
+        webhook_status=webhook_status,
         discovery=DiscoveryService(google, discovery_specs, settings.sync_concurrency),
         pipeline_health=pipeline_health,
         watchdog=watchdog,
         identity=IdentityReconciler(sessions),
+        derived=DerivedRefresh(sessions),
     )

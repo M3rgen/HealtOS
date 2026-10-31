@@ -1,0 +1,545 @@
+{
+  "root_help": "                                                                                \n Usage: root [OPTIONS] COMMAND [ARGS]...                                        \n                                                                                \n Operate the Personal Health Data Mirror.                                       \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --install-completion          Install completion for the current shell.      │\n│ --show-completion             Show completion for the current shell, to copy │\n│                               it or customize the installation.              │\n│ --help                        Show this message and exit.                    │\n╰──────────────────────────────────────────────────────────────────────────────╯\n╭─ Commands ───────────────────────────────────────────────────────────────────╮\n│ status                  Show synchronization and backfill status.            │\n│ backfill                Start or resume the historical backfill and wait for │\n│                         completion.                                          │\n│ sync                    Run incremental synchronization for one or every     │\n│                         configured data type.                                │\n│ reconcile               Re-read a recent window across every mirrored data   │\n│                         type.                                                │\n│ webhook-readiness       Report secret-safe Google Health subscriber          │\n│                         prerequisites.                                       │\n│ webhook-status          Show secret-safe local webhook receipt and           │\n│                         processing status.                                   │\n│ webhook-replay-pending  Retry durable pending webhook elements without       │\n│                         asking Google to resend them.                        │\n│ verify                  Check archive guards, payload and body hashes,       │\n│                         version history, and sync errors.                    │\n│ history                 List every stored version of raw records (oldest     │\n│                         first) as JSON.                                      │\n│ import-versions         Add payload versions (and whole records) that only   │\n│                         survive in old dumps.                                │\n│ identity-backfill       Decide source chains, add v2 aliases and link        │\n│                         duplicate rows of a record (idempotent).             │\n│ identity-decide         Decide what the reconciler left open: two sources    │\n│                         are one device, or two devices.                      │\n│ identity-sources        List a data type's source fingerprints: spans,       │\n│                         devices, chains (with review state),                 │\n│                         pairs kept apart, the owner's decisions, and what    │\n│                         the chain rule leaves open.                          │\n│ responses               List stored Google responses (newest first, metadata │\n│                         only) as JSON.                                       │\n│ export-response         Write one stored Google response body byte for byte  │\n│                         (metadata goes to stderr).                           │\n│ probe                   Probe accessible Google Health types without         │\n│                         archiving records or a backfill.                     │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+  "commands": {
+    "status": {
+      "help": "                                                                                \n Usage: root status [OPTIONS]                                                   \n                                                                                \n Show synchronization and backfill status.                                      \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": []
+    },
+    "backfill": {
+      "help": "                                                                                \n Usage: root backfill [OPTIONS]                                                 \n                                                                                \n Start or resume the historical backfill and wait for completion.               \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --data-type              <str>                                               │\n│ --reset-abandoned               Requeue abandoned windows (of --data-type,   │\n│                                 or all) with a fresh retry count first.      │\n│ --help                          Show this message and exit.                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "data_type",
+          "opts": [
+            "--data-type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": null,
+          "is_flag": false
+        },
+        {
+          "name": "reset_abandoned",
+          "opts": [
+            "--reset-abandoned"
+          ],
+          "secondary_opts": [],
+          "default": false,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "BOOL",
+          "help": "Requeue abandoned windows (of --data-type, or all) with a fresh retry count first.",
+          "is_flag": true
+        }
+      ]
+    },
+    "sync": {
+      "help": "                                                                                \n Usage: root sync [OPTIONS] [data_type]                                         \n                                                                                \n Run incremental synchronization for one or every configured data type.         \n                                                                                \n╭─ Arguments ──────────────────────────────────────────────────────────────────╮\n│   data_type      <str>                                                       │\n╰──────────────────────────────────────────────────────────────────────────────╯\n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "data_type",
+          "opts": [
+            "data_type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": null,
+          "is_flag": null
+        }
+      ]
+    },
+    "reconcile": {
+      "help": "                                                                                \n Usage: root reconcile [OPTIONS]                                                \n                                                                                \n Re-read a recent window across every mirrored data type.                       \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --days        <int range> [1<=x<=3650]  [default: 7]                         │\n│ --help                                  Show this message and exit.          │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "days",
+          "opts": [
+            "--days"
+          ],
+          "secondary_opts": [],
+          "default": 7,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 1<=x<=3650>",
+          "help": null,
+          "is_flag": false
+        }
+      ]
+    },
+    "webhook-readiness": {
+      "help": "                                                                                \n Usage: root webhook-readiness [OPTIONS]                                        \n                                                                                \n Report secret-safe Google Health subscriber prerequisites.                     \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": []
+    },
+    "webhook-status": {
+      "help": "                                                                                \n Usage: root webhook-status [OPTIONS]                                           \n                                                                                \n Show secret-safe local webhook receipt and processing status.                  \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": []
+    },
+    "webhook-replay-pending": {
+      "help": "                                                                                \n Usage: root webhook-replay-pending [OPTIONS]                                   \n                                                                                \n Retry durable pending webhook elements without asking Google to resend them.   \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": []
+    },
+    "verify": {
+      "help": "                                                                                \n Usage: root verify [OPTIONS]                                                   \n                                                                                \n Check archive guards, payload and body hashes, version history, and sync       \n errors.                                                                        \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": []
+    },
+    "history": {
+      "help": "                                                                                \n Usage: root history [OPTIONS]                                                  \n                                                                                \n List every stored version of raw records (oldest first) as JSON.               \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ *  --data-type                    <str>                 Google data type,    │\n│                                                         e.g. heart-rate.     │\n│                                                         [required]           │\n│    --id                           <str>                 One record's         │\n│                                                         google_data_point_id │\n│                                                         (shown even with one │\n│                                                         version).            │\n│    --since                        <%Y-%m-%d|%Y-%m-%dT%  Only records         │\n│                                   H:%M:%S>              replaced at or after │\n│                                                         this UTC date/time.  │\n│    --limit                        <int range>           Most recently        │\n│                                   [1<=x<=10000]         changed records.     │\n│                                                         [default: 20]        │\n│    --payload      --no-payload                          Include raw          │\n│                                                         payloads.            │\n│                                                         [default: payload]   │\n│    --help                                               Show this message    │\n│                                                         and exit.            │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "data_type",
+          "opts": [
+            "--data-type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "Google data type, e.g. heart-rate.",
+          "is_flag": false
+        },
+        {
+          "name": "google_id",
+          "opts": [
+            "--id"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "One record's google_data_point_id (shown even with one version).",
+          "is_flag": false
+        },
+        {
+          "name": "since",
+          "opts": [
+            "--since"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "DateTime",
+          "help": "Only records replaced at or after this UTC date/time.",
+          "is_flag": false
+        },
+        {
+          "name": "limit",
+          "opts": [
+            "--limit"
+          ],
+          "secondary_opts": [],
+          "default": 20,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 1<=x<=10000>",
+          "help": "Most recently changed records.",
+          "is_flag": false
+        },
+        {
+          "name": "payload",
+          "opts": [
+            "--payload"
+          ],
+          "secondary_opts": [
+            "--no-payload"
+          ],
+          "default": true,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "BOOL",
+          "help": "Include raw payloads.",
+          "is_flag": true
+        }
+      ]
+    },
+    "import-versions": {
+      "help": "                                                                                \n Usage: root import-versions [OPTIONS]                                          \n                                                                                \n Add payload versions (and whole records) that only survive in old dumps.       \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ *  --from-db           <str>                      Restored archive: a        │\n│                                                   database name on the live  │\n│                                                   server, or a full URL.     │\n│                                                   Repeat for several dumps;  │\n│                                                   they are imported newest   │\n│                                                   first.                     │\n│                                                   [required]                 │\n│    --batch-size        <int range> [1<=x<=50000]  [default: 2000]            │\n│    --dry-run                                      Count only; write nothing. │\n│    --help                                         Show this message and      │\n│                                                   exit.                      │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "from_db",
+          "opts": [
+            "--from-db"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": true,
+          "type": "STRING",
+          "help": "Restored archive: a database name on the live server, or a full URL. Repeat for several dumps; they are imported newest first.",
+          "is_flag": false
+        },
+        {
+          "name": "batch_size",
+          "opts": [
+            "--batch-size"
+          ],
+          "secondary_opts": [],
+          "default": 2000,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 1<=x<=50000>",
+          "help": null,
+          "is_flag": false
+        },
+        {
+          "name": "dry_run",
+          "opts": [
+            "--dry-run"
+          ],
+          "secondary_opts": [],
+          "default": false,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "BOOL",
+          "help": "Count only; write nothing.",
+          "is_flag": true
+        }
+      ]
+    },
+    "identity-backfill": {
+      "help": "                                                                                \n Usage: root identity-backfill [OPTIONS]                                        \n                                                                                \n Decide source chains, add v2 aliases and link duplicate rows of a record       \n (idempotent).                                                                  \n                                                                                \n Decides, from the sightings, that two sources are one renamed device (the      \n owner decides                                                                  \n the rest with identity-decide). The report lists, per data type, every chain   \n (from -> to                                                                    \n source, gap in seconds, review state), the chains to review, the sources the   \n rule left                                                                      \n open (``ambiguous``, with why), refuted chains, and the pairs of sources that  \n share a class                                                                  \n but are kept apart; review them after a dry run (docs/RUNBOOK.md).             \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --batch-size               <int range>              [default: 5000]          │\n│                            [100<=x<=100000]                                  │\n│ --dry-run                                           Report only; write       │\n│                                                     nothing.                 │\n│ --data-type                <str>                    Only this data type      │\n│                                                     (repeatable); default:   │\n│                                                     every archived type.     │\n│ --after                    <%Y-%m-%d|%Y-%m-%dT%H:%  Only rows starting       │\n│                            M:%S>                    at/after this UTC time   │\n│                                                     (resume a stopped run of │\n│                                                     --data-type).            │\n│ --incremental                                       Only rows changed since  │\n│                                                     each data type's         │\n│                                                     checkpoint (what the     │\n│                                                     nightly job runs).       │\n│ --statement-timeout        <str>                    PostgreSQL               │\n│                                                     statement_timeout for    │\n│                                                     each batch (e.g. 120s,   │\n│                                                     5min).                   │\n│                                                     [default: 120s]          │\n│ --help                                              Show this message and    │\n│                                                     exit.                    │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "batch_size",
+          "opts": [
+            "--batch-size"
+          ],
+          "secondary_opts": [],
+          "default": 5000,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 100<=x<=100000>",
+          "help": null,
+          "is_flag": false
+        },
+        {
+          "name": "dry_run",
+          "opts": [
+            "--dry-run"
+          ],
+          "secondary_opts": [],
+          "default": false,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "BOOL",
+          "help": "Report only; write nothing.",
+          "is_flag": true
+        },
+        {
+          "name": "data_type",
+          "opts": [
+            "--data-type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": true,
+          "type": "STRING",
+          "help": "Only this data type (repeatable); default: every archived type.",
+          "is_flag": false
+        },
+        {
+          "name": "after",
+          "opts": [
+            "--after"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "DateTime",
+          "help": "Only rows starting at/after this UTC time (resume a stopped run of --data-type).",
+          "is_flag": false
+        },
+        {
+          "name": "incremental",
+          "opts": [
+            "--incremental"
+          ],
+          "secondary_opts": [],
+          "default": false,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "BOOL",
+          "help": "Only rows changed since each data type's checkpoint (what the nightly job runs).",
+          "is_flag": true
+        },
+        {
+          "name": "statement_timeout",
+          "opts": [
+            "--statement-timeout"
+          ],
+          "secondary_opts": [],
+          "default": "120s",
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "PostgreSQL statement_timeout for each batch (e.g. 120s, 5min).",
+          "is_flag": false
+        }
+      ]
+    },
+    "identity-decide": {
+      "help": "                                                                                \n Usage: root identity-decide [OPTIONS] {decision}                               \n                                                                                \n Decide what the reconciler left open: two sources are one device, or two       \n devices.                                                                       \n                                                                                \n Recorded append-only (raw_source_decisions) and applied at once; the rows      \n whose devices                                                                  \n change are settled again. ``link`` joins two sources into one device (their    \n rows are                                                                       \n linked where they hold the same reading); ``reject`` stops using a chain: its  \n links no                                                                       \n longer hide anything, both sources count on their own (each record once per    \n device), and                                                                   \n ``confirm`` undoes that; ``confirm`` also takes a chain off the review list;   \n ``distinct``                                                                   \n declares two devices (a row whose reading then comes back only under the other \n source is                                                                      \n marked deleted by the next complete fetch: permanent) and ``not-distinct``     \n undoes it. Run                                                                 \n with --dry-run first (docs/RUNBOOK.md).                                        \n                                                                                \n╭─ Arguments ──────────────────────────────────────────────────────────────────╮\n│ *    decision      <str>  link, reject or confirm (a chain FROM -> TO);      │\n│                           distinct or not-distinct.                          │\n│                           [required]                                         │\n╰──────────────────────────────────────────────────────────────────────────────╯\n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ *  --data-type         <str>                      [required]                 │\n│ *  --from              <str>                      Fingerprint (prefix, as    │\n│                                                   reports print it) of the   │\n│                                                   earlier form.              │\n│                                                   [required]                 │\n│ *  --to                <str>                      Fingerprint (prefix) of    │\n│                                                   the later form.            │\n│                                                   [required]                 │\n│    --note              <str>                      Why (kept with the         │\n│                                                   decision).                 │\n│    --dry-run                                      Report the effect; write   │\n│                                                   nothing.                   │\n│    --batch-size        <int range>                [default: 5000]            │\n│                        [100<=x<=100000]                                      │\n│    --help                                         Show this message and      │\n│                                                   exit.                      │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "decision",
+          "opts": [
+            "decision"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "link, reject or confirm (a chain FROM -> TO); distinct or not-distinct.",
+          "is_flag": null
+        },
+        {
+          "name": "data_type",
+          "opts": [
+            "--data-type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": null,
+          "is_flag": false
+        },
+        {
+          "name": "first",
+          "opts": [
+            "--from"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "Fingerprint (prefix, as reports print it) of the earlier form.",
+          "is_flag": false
+        },
+        {
+          "name": "second",
+          "opts": [
+            "--to"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "Fingerprint (prefix) of the later form.",
+          "is_flag": false
+        },
+        {
+          "name": "note",
+          "opts": [
+            "--note"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "Why (kept with the decision).",
+          "is_flag": false
+        },
+        {
+          "name": "dry_run",
+          "opts": [
+            "--dry-run"
+          ],
+          "secondary_opts": [],
+          "default": false,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "BOOL",
+          "help": "Report the effect; write nothing.",
+          "is_flag": true
+        },
+        {
+          "name": "batch_size",
+          "opts": [
+            "--batch-size"
+          ],
+          "secondary_opts": [],
+          "default": 5000,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 100<=x<=100000>",
+          "help": null,
+          "is_flag": false
+        }
+      ]
+    },
+    "identity-sources": {
+      "help": "                                                                                \n Usage: root identity-sources [OPTIONS]                                         \n                                                                                \n List a data type's source fingerprints: spans, devices, chains (with review    \n state), pairs kept apart, the owner's decisions, and what the chain rule       \n leaves open.                                                                   \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ *  --data-type        <str>  [required]                                      │\n│    --help                    Show this message and exit.                     │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "data_type",
+          "opts": [
+            "--data-type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": null,
+          "is_flag": false
+        }
+      ]
+    },
+    "responses": {
+      "help": "                                                                                \n Usage: root responses [OPTIONS]                                                \n                                                                                \n List stored Google responses (newest first, metadata only) as JSON.            \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --data-type        <str>                                                     │\n│ --context          <str>                        A run id, e.g.               │\n│                                                 webhook:<element hash> or    │\n│                                                 backfill:<job id>.           │\n│ --since            <%Y-%m-%d|%Y-%m-%dT%H:%M:%S  Fetched at/after (UTC).      │\n│                    >                                                         │\n│ --limit            <int range> [1<=x<=10000]    [default: 20]                │\n│ --help                                          Show this message and exit.  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "data_type",
+          "opts": [
+            "--data-type"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": null,
+          "is_flag": false
+        },
+        {
+          "name": "context_id",
+          "opts": [
+            "--context"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "STRING",
+          "help": "A run id, e.g. webhook:<element hash> or backfill:<job id>.",
+          "is_flag": false
+        },
+        {
+          "name": "since",
+          "opts": [
+            "--since"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "DateTime",
+          "help": "Fetched at/after (UTC).",
+          "is_flag": false
+        },
+        {
+          "name": "limit",
+          "opts": [
+            "--limit"
+          ],
+          "secondary_opts": [],
+          "default": 20,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 1<=x<=10000>",
+          "help": null,
+          "is_flag": false
+        }
+      ]
+    },
+    "export-response": {
+      "help": "                                                                                \n Usage: root export-response [OPTIONS] {response_id}                            \n                                                                                \n Write one stored Google response body byte for byte (metadata goes to stderr). \n                                                                                \n╭─ Arguments ──────────────────────────────────────────────────────────────────╮\n│ *    response_id      <int>  raw_api_responses.id [required]                 │\n╰──────────────────────────────────────────────────────────────────────────────╯\n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --output  -o      <path>  Write the body here instead of standard output.    │\n│ --help                    Show this message and exit.                        │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "response_id",
+          "opts": [
+            "response_id"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": true,
+          "nargs": 1,
+          "multiple": false,
+          "type": "INT",
+          "help": "raw_api_responses.id",
+          "is_flag": null
+        },
+        {
+          "name": "output",
+          "opts": [
+            "--output",
+            "-o"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "path",
+          "help": "Write the body here instead of standard output.",
+          "is_flag": false
+        }
+      ]
+    },
+    "probe": {
+      "help": "                                                                                \n Usage: root probe [OPTIONS]                                                    \n                                                                                \n Probe accessible Google Health types without archiving records or a backfill.  \n                                                                                \n The probe's Google responses are kept in raw_api_responses (source \"probe\").   \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --days        <int range> [1<=x<=365]  [default: 30]                         │\n│ --help                                 Show this message and exit.           │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "days",
+          "opts": [
+            "--days"
+          ],
+          "secondary_opts": [],
+          "default": 30,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 1<=x<=365>",
+          "help": null,
+          "is_flag": false
+        }
+      ]
+    }
+  }
+}

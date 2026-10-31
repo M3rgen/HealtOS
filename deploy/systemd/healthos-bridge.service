@@ -1,0 +1,34 @@
+[Unit]
+Description=HealthOS Umay bridge
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=healthos-bridge
+Group=healthos-bridge
+WorkingDirectory=/opt/healthos
+Environment=HOME=/var/lib/healthos-bridge
+Environment=CODEX_HOME=/var/lib/healthos-bridge
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/healthos/bridge.env
+ExecStart=/opt/healthos/.venv/bin/python /opt/healthos/scripts/start_codex_bridge.py --foreground
+StateDirectory=healthos-bridge
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/healthos-bridge
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

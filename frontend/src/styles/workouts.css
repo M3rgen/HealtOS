@@ -1,0 +1,39 @@
+/* The panel and timeline share the available height; the open form scrolls inside the panel. */
+#sports .workouts-panel{flex:1 1 0;min-height:0;min-width:0;overflow:auto;scrollbar-gutter:stable}
+#sports .history-heading{display:flex;flex-direction:row;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+#sports .history-heading>div{text-align:left}
+.workout-months{display:flex;align-items:center;justify-content:center;gap:10px;margin:14px 0 10px;order:0;align-self:auto;width:auto;height:auto}
+#sports .workout-month-label{margin:0;min-width:0}
+.workout-months .month-field{min-width:0;max-width:100%}
+.workout-months button{min-width:42px;min-height:42px;padding:6px 12px;font-size:22px}
+#sports #workout-month{width:100%;min-width:0}
+#workout-zone{margin:0 0 8px;overflow-wrap:anywhere}
+.workout-state{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px}
+#sports #workout-status{margin:0;flex:1 1 160px;overflow-wrap:anywhere}
+#workout-timeline{flex:1 1 0;min-height:120px;overflow:auto;overscroll-behavior:contain;padding:4px 8px 4px 2px}
+#sports .workouts-panel:has(#workout-editor[open]) #workout-timeline{flex:0 0 auto;height:28dvh;min-height:120px}
+#workout-timeline:focus-visible{outline:2px solid var(--amber);outline-offset:-2px;border-radius:6px}
+.workout-days,.workout-day>ol{list-style:none;padding:0;margin:0}
+.workout-day{margin-bottom:20px;animation:workout-in 180ms ease-out}
+.workout-day h3{font-size:14px;font-weight:600;margin:0 0 10px;color:var(--muted)}
+.workout-day>ol{border-left:1px solid var(--line);margin-left:5px;padding-left:16px;display:grid;gap:10px}
+.workout-entry{position:relative;min-width:0}
+.workout-entry:before{content:"";position:absolute;left:-21px;top:18px;width:7px;height:7px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px var(--surface)}
+.workout-entry article{padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--inset);overflow-wrap:anywhere}
+.workout-entry-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.workout-entry h4{font-size:15px;font-weight:600;margin:0}
+.workout-source{font-size:11px;line-height:1.5;padding:2px 8px;border:1px solid var(--line);border-radius:6px;color:var(--muted)}
+.workout-manual{color:var(--amber);background:var(--amber-soft);border-color:var(--amber-line)}
+#sports .workout-time{font-size:12px;margin:8px 0;color:var(--muted)}
+.workout-values{display:flex;flex-wrap:wrap;gap:10px 24px;margin:0}
+.workout-values>div{min-width:50px}
+.workout-values dt{font-size:11px;color:var(--muted);margin-bottom:3px}
+.workout-values dd{font-size:13px;margin:0;font-variant-numeric:tabular-nums}
+#sports #workout-editor{padding-bottom:8px}
+@keyframes workout-in{from{opacity:0}to{opacity:1}}
+@media(max-width:700px){
+  #sports .workouts-panel{padding:14px 12px}
+  .workout-months{gap:8px}
+  #sports .workout-fields{grid-template-columns:minmax(0,1fr)}
+}
+@media(prefers-reduced-motion:reduce){.workout-day{animation:none}}

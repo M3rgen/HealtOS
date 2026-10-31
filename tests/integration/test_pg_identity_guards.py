@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+from test_pg_migrations import HEAD
 from typer.testing import CliRunner
 
 from app.google_health.data_types import REGISTRY
@@ -238,9 +239,8 @@ def test_migration_up_down_refuses_while_identity_rows_exist(
         with pytest.raises(RuntimeError, match="raw_health_data_identity holds"):
             command.downgrade(alembic_config, "20261020_0011")
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20261021_0012"
-            )
+            # One transaction: the refused downgrade leaves the database at head.
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
         alembic_config.cmd_opts = Namespace(x=["allow-identity-loss=1"])
         command.downgrade(alembic_config, "20261020_0011")
         alembic_config.cmd_opts = None
@@ -284,7 +284,9 @@ def test_0012_runs_next_to_a_dump_and_gives_up_on_a_writer(
             text("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()")
         ).all()
         blocker.execute(text(f"LOCK TABLE {', '.join(tables)} IN ACCESS SHARE MODE"))
-        command.upgrade(alembic_config, "head")
+        # Up to 0020: 0021 needs an exclusive lock on the webhook tables and gives up next
+        # to a dump (test_pg_webhook_body_only_migration).
+        command.upgrade(alembic_config, "20261025_0020")
         blocker.rollback()
         command.downgrade(alembic_config, "20261020_0011")
         # What a writing transaction (a sync page) holds.

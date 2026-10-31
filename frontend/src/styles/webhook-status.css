@@ -1,0 +1,17 @@
+.webhook-status-panel{padding:14px 20px;margin-bottom:16px;min-width:0}
+.webhook-status-panel .panel-heading{flex-wrap:wrap}
+.webhook-status-panel h2{font-size:18px}
+#webhook-status-summary{margin-top:6px;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
+#webhook-status-dialog{width:min(640px,calc(100% - 24px));max-height:90dvh;padding:18px}
+#webhook-status-dialog[open]{display:flex;flex-direction:column;min-height:0}
+#webhook-status-dialog>.dialog-heading{flex-shrink:0}
+#webhook-status-dialog h2{font-size:20px;overflow-wrap:anywhere}
+#webhook-status-close{flex-shrink:0}
+/* A transparent border, not padding: scrolled content never paints under the inset focus ring. */
+.webhook-status-body{overflow:auto;overscroll-behavior:contain;min-height:0;border:4px solid transparent;font-size:14px;line-height:1.6;overflow-wrap:anywhere}
+#webhook-status-retry{white-space:normal;margin:12px 0}
+#webhook-status-details{margin:0}
+#webhook-status-details>div{border-top:1px solid var(--line);padding:10px 0}
+#webhook-status-details dt{color:var(--muted)}
+#webhook-status-details dd{margin:4px 0 0}
+@media(max-width:540px){.webhook-status-panel,#webhook-status-dialog{padding:12px}}

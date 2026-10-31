@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
 import json
+import zlib
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from compressed_records import compressed
+from raw_response_records import (
+    NAME,
+    SPEC,
+    PausedBody,
+    Tokens,
+    body,
+    client,
+    no_secret,
+    steps,
+    stored,
+)
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -15,6 +30,7 @@ from typer.testing import CliRunner
 
 from app.cli import main as cli
 from app.core.config import Settings
+from app.core.provenance import provenance
 from app.db.base import Base
 from app.google_health.client import GoogleHealthClient, GoogleHealthError
 from app.google_health.data_types import REGISTRY
@@ -25,63 +41,6 @@ from app.services.responses import DatabaseResponseArchive, verify_responses
 from app.services.storage import store_page
 from app.sync.deletions import mark_source_deletions
 from app.sync.incremental import IncrementalSync
-
-SPEC = REGISTRY["steps"]
-NAME = "users/me/dataTypes/steps/dataPoints/a"
-
-
-def steps(count: int, name: str = NAME) -> dict:
-    return {
-        "name": name,
-        "steps": {
-            "interval": {
-                "startTime": "2026-08-17T10:00:00Z",
-                "endTime": "2026-08-17T10:01:00Z",
-            },
-            "count": str(count),
-        },
-    }
-
-
-def body(*records: dict, token: str | None = None) -> bytes:
-    # Odd spacing and key order on purpose: only the stored bytes keep them.
-    payload = json.dumps(
-        {"dataPoints": list(records), **({"nextPageToken": token} if token else {})}
-    )
-    return ("  " + payload.replace(": ", ":   ") + "\n").encode()
-
-
-class Tokens:
-    async def get(self):
-        return "secret-access-token"
-
-    def invalidate(self):
-        pass
-
-
-def client(handler, sessions=None, **settings) -> GoogleHealthClient:
-    async def no_sleep(_delay):
-        return None
-
-    return GoogleHealthClient(
-        Settings(_env_file=None, google_api_min_request_interval_seconds=0, **settings),
-        Tokens(),
-        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        sleep=no_sleep,
-        archive=DatabaseResponseArchive(sessions) if sessions else None,
-    )
-
-
-async def stored(sessions) -> list[RawApiResponse]:
-    async with sessions() as session:
-        return list(
-            (await session.scalars(select(RawApiResponse).order_by(RawApiResponse.id))).all()
-        )
-
-
-def no_secret(response: RawApiResponse) -> None:
-    for value in (response.query, response.request_body, response.headers, response.path):
-        assert "secret-access-token" not in str(value)
 
 
 async def test_a_page_keeps_every_exchange_byte_for_byte(sessions) -> None:
@@ -343,53 +302,55 @@ async def test_verify_reports_a_redefined_sqlite_guard(sessions) -> None:
         ]
 
 
-@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
-def test_a_compressed_response_is_kept_as_it_came_off_the_wire(
-    tmp_path, monkeypatch, encoding
-) -> None:
-    import gzip
-    import hashlib
-    import zlib
+@pytest.mark.parametrize(
+    ("encoding", "damage"),
+    [(e, "truncated") for e in ["gzip", "deflate", "raw-deflate"]]
+    + [(e, "checksum") for e in ["gzip", "deflate"]],
+)
+@pytest.mark.parametrize("recover", [False, True])
+async def test_invalid_compression_is_archived_and_retried(
+    sessions, encoding, damage, recover, caplog
+):
+    payload = body(steps(7))
+    wire = compressed(payload, encoding, damage)
+    if damage == "truncated":
+        inflater = zlib.decompressobj({"gzip": 31, "deflate": 15, "raw-deflate": -15}[encoding])
+        assert inflater.decompress(wire) == payload and not inflater.eof
+    calls = []
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'wire.db'}")
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
-    decoded = body(steps(7))
-    wire = gzip.compress(decoded, mtime=0) if encoding == "gzip" else zlib.compress(decoded)
+    def handler(request):
+        calls.append(request)
+        data = payload if recover and len(calls) == 3 else wire
+        headers = {} if data is payload else {"content-encoding": encoding.removeprefix("raw-")}
+        return httpx.Response(200, headers=headers, stream=httpx.ByteStream(data))
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        # Sent compressed although the client asked for identity; a stream, as on a socket.
-        assert request.headers["accept-encoding"] == "identity"
-        return httpx.Response(
-            200,
-            headers={"content-type": "application/json", "content-encoding": encoding},
-            stream=httpx.ByteStream(wire),
-        )
-
-    async def fetch() -> RawApiResponse:
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+    google = client(handler, sessions, google_api_max_retries=2)
+    try:
         start = datetime(2026, 8, 17, tzinfo=UTC)
-        page = await client(handler).list_data_points(SPEC, start, start + timedelta(hours=1))
-        assert page.data_points == [steps(7)]  # parsed from the decoded body
-        async with sessions.begin() as session:
-            await store_page(session, SPEC, page)
-        (row,) = await stored(sessions)
-        async with sessions() as session:
-            assert await verify_responses(session) == (1, [])
-        return row
-
-    row = asyncio.run(fetch())
-    assert row.body == wire and row.body != decoded
-    assert row.body_sha256 == hashlib.sha256(wire).hexdigest()
-    assert row.body_size == len(wire)
-    assert row.headers["content-encoding"] == encoding and row.complete and row.error is None
-    monkeypatch.setattr(cli, "SessionLocal", sessions)
-    target = tmp_path / "page.bin"
-    exported = CliRunner().invoke(cli.app, ["export-response", "1", "--output", str(target)])
-    assert exported.exit_code == 0, exported.output
-    assert target.read_bytes() == wire
-    assert f'"content_encoding": "{encoding}"' in exported.output
-    asyncio.run(engine.dispose())
+        if recover:
+            page = await google.list_data_points(SPEC, start, start + timedelta(hours=1))
+            assert page.data_points == [steps(7)]
+            async with sessions.begin() as session:
+                await store_page(session, SPEC, page)
+        else:
+            with pytest.raises(GoogleHealthError) as caught:
+                await google.list_data_points(SPEC, start, start + timedelta(hours=1))
+            cause = caught.value.__cause__
+            assert isinstance(cause, httpx.DecodingError)
+            assert str(cause) == "Google Health response content decoding failed"
+            assert cause.__cause__ is None and cause.__context__ is None
+        rows = await stored(sessions)
+        assert len(calls) == len(rows) == 3
+        assert [r.attempt for r in rows] == list(range(len(rows)))
+        for i, row in enumerate(rows):
+            expected = payload if recover and i == 2 else wire
+            assert row.body == expected and row.body_size == len(expected) and row.complete
+            assert row.body_sha256 == hashlib.sha256(expected).hexdigest()
+            assert row.error == (None if recover and i == 2 else "DecodingError")
+            no_secret(row)
+        assert "secret-access-token" not in caplog.text and "private-marker" not in caplog.text
+    finally:
+        await google.http.aclose()
 
 
 async def _cancel_when(task: asyncio.Task, started: asyncio.Event) -> None:
@@ -397,6 +358,92 @@ async def _cancel_when(task: asyncio.Task, started: asyncio.Event) -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):  # the cancellation is never swallowed
         await task
+
+
+@pytest.mark.parametrize("phase", ["before", "read", "read-error", "close"])
+@pytest.mark.parametrize("encoding", ["identity", "gzip", "deflate"])
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("cleanup", ["release", "cancel-again", "timeout"])
+async def test_cancellation_keeps_wire_bytes_and_closes_the_response(
+    sessions, monkeypatch, phase, encoding, retry, cleanup
+) -> None:
+    import app.google_health.client as module
+
+    decoded = body(steps(7))
+    wire = {"identity": decoded, "gzip": gzip.compress(decoded), "deflate": zlib.compress(decoded)}[
+        encoding
+    ]
+    if phase in {"read", "read-error"}:
+        wire = wire[:12]  # Incomplete compressed data must never be decoded.
+    stream = PausedBody(wire, phase)
+    calls = []
+    headers = {
+        "content-type": "application/json",
+        "content-encoding": encoding,
+        "content-length": str(len(wire) + (10 if phase in {"read", "read-error"} else 0)),
+        "date": "Mon, 17 Aug 2026 10:00:00 GMT",
+        "retry-after": "1",
+        "set-cookie": "secret-access-token",
+        "authorization": "secret-access-token",
+    }
+
+    def handler(request):
+        calls.append(request)
+        if retry and len(calls) == 1:
+            return httpx.Response(503, content=b"retry")
+        return httpx.Response(200, headers=headers, stream=stream)
+
+    google = client(handler, sessions)
+    monkeypatch.setattr(module, "KEEP_ON_CANCEL_SECONDS", 0.1)
+    start = datetime(2026, 8, 17, tzinfo=UTC)
+    with provenance(source="backfill", context_id="backfill:synthetic"):
+        task = asyncio.create_task(google.list_data_points(SPEC, start, start + timedelta(hours=1)))
+    try:
+        await asyncio.wait_for(
+            (stream.closing if phase in {"close", "read-error"} else stream.reading).wait(), 5
+        )
+        task.cancel("secret-access-token")
+        await asyncio.wait_for(stream.closing.wait(), 5)
+        if cleanup == "cancel-again":
+            task.cancel("secret-access-token")
+            await asyncio.sleep(0)
+        if cleanup != "timeout":
+            stream.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        await asyncio.wait_for(stream.closed.wait(), 1)
+        rows = await stored(sessions)
+        assert len(calls) == 1 + retry and len(rows) == 1 + retry
+        if retry:
+            assert (rows[0].body, rows[0].attempt, rows[0].complete) == (b"retry", 0, True)
+        row = rows[-1]
+        expected = b"" if phase == "before" else wire
+        assert row.body == expected and row.body_size == len(expected)
+        assert row.body_sha256 == hashlib.sha256(expected).hexdigest()
+        assert row.complete == (phase == "close") and row.error == "CancelledError"
+        assert row.attempt == int(retry) and row.status_code == 200
+        assert (row.source, row.context_id, row.data_type) == (
+            "backfill",
+            "backfill:synthetic",
+            "steps",
+        )
+        assert row.method == "GET" and row.path.endswith("/dataTypes/steps/dataPoints")
+        assert row.query == calls[-1].url.query.decode() and row.request_body is None
+        assert row.headers == {
+            k: v for k, v in headers.items() if k not in {"authorization", "set-cookie"}
+        }
+        assert stream.close_calls == 1
+        for item in rows:
+            no_secret(item)
+            assert "secret-access-token" not in str(item.error)
+        async with sessions() as session:
+            assert await session.scalar(select(func.count()).select_from(RawHealthData)) == 0
+    finally:
+        stream.release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await google.http.aclose()
 
 
 async def test_a_page_received_before_a_cancellation_is_kept(sessions, monkeypatch) -> None:
@@ -425,13 +472,17 @@ async def test_a_page_received_before_a_cancellation_is_kept(sessions, monkeypat
         assert await session.scalar(select(func.count()).select_from(RawHealthData)) == 0
 
 
-async def test_a_response_received_before_a_cancelled_retry_is_kept(sessions) -> None:
+@pytest.mark.parametrize("header", ["60", "inf", "NaN", "bad"])
+async def test_a_response_received_before_a_cancelled_retry_is_kept(sessions, header) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, content=b'{"error": {"status": "UNAVAILABLE"}}')
+        return httpx.Response(
+            503, headers={"Retry-After": header}, content=b'{"error": {"status": "UNAVAILABLE"}}'
+        )
 
     started = asyncio.Event()
 
     async def cancelled_backoff(_delay):
+        assert 0 <= _delay <= 60
         started.set()
         await asyncio.Event().wait()
 
@@ -447,26 +498,43 @@ async def test_a_response_received_before_a_cancelled_retry_is_kept(sessions) ->
     await _cancel_when(task, started)
     (row,) = await stored(sessions)
     assert row.status_code == 503 and row.body == b'{"error": {"status": "UNAVAILABLE"}}'
+    assert row.headers["retry-after"] == header and row.complete
 
 
-async def test_a_store_interrupted_by_cancellation_still_finishes(sessions) -> None:
+@pytest.mark.parametrize("stalled", [False, True])
+async def test_a_store_interrupted_by_cancellation_still_finishes(
+    sessions, monkeypatch, stalled
+) -> None:
     from app.google_health.client import KEEP_ON_CANCEL_SECONDS
 
     assert 0 < KEEP_ON_CANCEL_SECONDS <= 30
     started = asyncio.Event()
+    release, finished = asyncio.Event(), asyncio.Event()
 
     class SlowArchive(DatabaseResponseArchive):
         async def keep(self, responses):
             started.set()
-            await asyncio.sleep(0.05)
+            if stalled:
+                await release.wait()
+            else:
+                await asyncio.sleep(0.05)
             await super().keep(responses)
+            finished.set()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b'{"healthUserId": "synthetic"}')
 
     google = client(handler)
     google.archive = SlowArchive(sessions)
-    await _cancel_when(asyncio.create_task(google.get_identity()), started)
+    if stalled:
+        monkeypatch.setattr("app.google_health.client.KEEP_ON_CANCEL_SECONDS", 0.05)
+    try:
+        await asyncio.wait_for(_cancel_when(asyncio.create_task(google.get_identity()), started), 1)
+        assert finished.is_set() != stalled
+    finally:
+        release.set()
+        await asyncio.wait_for(finished.wait(), 1)
+        await google.http.aclose()
     (row,) = await stored(sessions)
     assert row.source == "identity" and row.body == b'{"healthUserId": "synthetic"}'
 
@@ -475,6 +543,7 @@ async def test_a_backfill_page_received_before_a_cancellation_is_kept(
     sessions, monkeypatch
 ) -> None:
     import app.services.storage as storage
+    from app.google_health.pagination import PageBudget
     from app.models.state import BackfillJob, JobStatus
     from app.sync.backfill import BackfillService
 
@@ -503,7 +572,8 @@ async def test_a_backfill_page_received_before_a_cancellation_is_kept(
         client(handler, sessions),
         {"steps": SPEC},
     )
-    await _cancel_when(asyncio.create_task(backfill._run_job(job.id)), started)
+    window = backfill._run_next_window("steps", PageBudget())
+    await _cancel_when(asyncio.create_task(window), started)
     (row,) = await stored(sessions)
     assert row.body == body(steps(3)) and row.source == "backfill"
 
