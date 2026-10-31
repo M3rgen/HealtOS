@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import typer.rich_utils
 from cli_records import cli_database as cli_database
 from typer.main import get_command
 from typer.testing import CliRunner
@@ -55,6 +56,9 @@ def test_entry_point_and_flat_registration_are_unchanged():
 def test_help_and_parameters_match_the_original_cli(name, monkeypatch):
     monkeypatch.setenv("COLUMNS", "80")
     monkeypatch.delenv("FORCE_COLOR", raising=False)
+    # Typer reads GITHUB_ACTIONS/FORCE_COLOR/PY_COLORS once at import and then forces a colour
+    # terminal, so on GitHub runners the help would carry ANSI codes the contract never had.
+    monkeypatch.setattr(typer.rich_utils, "FORCE_TERMINAL", False)
     result = RUNNER.invoke(cli.app, [*([name] if name else []), "--help"], terminal_width=100)
     assert result.exit_code == 0, result.output
     assert result.stderr == ""

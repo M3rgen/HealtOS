@@ -94,7 +94,7 @@ to real values:
 | --- | --- |
 | `POSTGRES_PASSWORD` | `python3 -c "import secrets; print(secrets.token_hex(32))"` (hex avoids URL escaping). |
 | `APP_UI_TOKEN` | `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`. 32–512 printable characters, no spaces. This is the dashboard password. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Your OAuth **Web application** client ([README step 4](../README.md#4-connect-google-health)). Keep the redirect URI `http://localhost:8000/auth/google/callback`; it works through the SSH tunnel below. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Your OAuth **Web application** client ([README step 3](../README.md#3-connect-google-health)). Keep the redirect URI `http://localhost:8000/auth/google/callback`; it works through the SSH tunnel below. |
 | `GOOGLE_TOKEN_ENCRYPTION_KEY` | A Fernet key; see the command below. It encrypts the stored refresh token and signs the OAuth state. |
 | `GOOGLE_HEALTH_WEBHOOK_ENDPOINT_URI` | `https://webhook.example.com/webhooks/google-health` (must be HTTPS). |
 | `GOOGLE_HEALTH_WEBHOOK_AUTHORIZATION` | The exact header value you will give Google's subscriber, e.g. `Bearer ` followed by `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`. |
@@ -239,7 +239,7 @@ remain outside the container. Never put keys or backup contents in the metadata 
 ## 9. Optional: the Umay bridge
 
 Umay talks to a Codex app-server that runs on the VM under your ChatGPT login. Read the privacy note
-in the [README](../README.md#optional-meet-umay) first: your questions and the records Umay requests
+in the [README](../README.md#optional-umay) first: your questions and the records Umay requests
 are sent to OpenAI.
 
 1. Install the Codex CLI so `codex` is on `PATH`, and sign in with `codex login`.

@@ -54,7 +54,7 @@ async def test_reconciliation_chunks_rollup_types_to_api_limit():
 @pytest.mark.parametrize("job_id", ["daily-reconciliation", "weekly-reconciliation"])
 async def test_scheduled_entry_points_persist_the_requested_range(sessions, job_id):
     runner = service(sessions, Client(Page([], None)))
-    scheduler = build_scheduler(Settings(_env_file=None), runner)
+    scheduler = build_scheduler(Settings(_env_file=None, reconciliation_enabled=True), runner)
     job = scheduler.get_job(job_id)
     result = await job.func(**job.kwargs)
     assert isinstance(result["heart-rate"], StoreStats)

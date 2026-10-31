@@ -82,7 +82,10 @@ async function retryScenarios(browser, width, height) {
   await page.goto(TARGET);
   await page.waitForFunction(() => document.querySelectorAll('#history-rows tr').length === 7);
   await page.clock.install();
-  await page.clock.pauseAt(new Date());
+  // The installed clock flows until paused and its first real-time sync can run it a little ahead
+  // of Node's Date.now(), so pausing at new Date() can land in the clock's past ("Cannot
+  // fast-forward to the past"). Pause just ahead of the page's own clock instead.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now()) + 1000);
   await page.locator('#assistant-open').click({force: true});
   await page.clock.runFor(25);
 
