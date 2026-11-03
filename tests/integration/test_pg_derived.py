@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.google_health.data_types import REGISTRY
+from app.models import raw_rejections
 from app.models.derived_invalidation import BUILD_LOCK
 from app.models.state import WebhookEvent
 from app.models.webhook_status import WebhookStatusEvent
@@ -63,8 +64,12 @@ async def test_0018_preserves_archive_history_manual_rows_and_guard_definitions(
                 )
             )
             session.add(WebhookStatusEvent(reason="signature_valid", occurred_at=T0))
+        # Tables of later migrations (20261102_0022, 0023) do not exist at the 0017 target.
+        newer = {"display_preferences", *raw_rejections.TABLES}
+        # 0023's guards on its own new tables exist at head only.
+        later = set(raw_rejections.PG_TRIGGER_SQL)
         async with sessions() as session:
-            before = await snapshot(session)
+            before = await snapshot(session, newer)
             before_guards = (await session.execute(guards)).all()
         command.upgrade(alembic_config, "20261025_0019")
         async with sessions() as session:
@@ -73,32 +78,35 @@ async def test_0018_preserves_archive_history_manual_rows_and_guard_definitions(
         command.check(alembic_config)
         assert streams(await read(sessions))[0]["value"] == 120
         async with sessions() as session:
-            assert await snapshot(session) == before
+            assert await snapshot(session, newer) == before
             assert set(before_guards) <= set((await session.execute(guards)).all())
             assert await verify_guards(session) == []
             current_guards = (await session.execute(guards)).all()
-            changed = [row[0] for row in current_guards if row not in legacy_guards]
+            assert {row[0] for row in current_guards} >= later
+            existing_guards = [row for row in current_guards if row[0] not in later]
+            changed = [row[0] for row in existing_guards if row not in legacy_guards]
             assert set(changed) == {
                 "derived_raw_health_data_insert",
                 "derived_raw_health_data_update",
                 "derived_raw_health_data_supersessions_insert",
                 "derived_raw_source_devices_insert",
             }
-            assert [(row[0], *row[2:]) for row in current_guards] == [
+            assert [(row[0], *row[2:]) for row in existing_guards] == [
                 (row[0], *row[2:]) for row in legacy_guards
             ]  # no function or ALWAYS status changes
+            assert {row[3] for row in current_guards if row[0] in later} == {b"A"}  # ALWAYS
         command.downgrade(alembic_config, "20261025_0019")
         async with sessions() as session:
-            assert await snapshot(session) == before
+            assert await snapshot(session, newer) == before
             assert (await session.execute(guards)).all() == legacy_guards
         command.upgrade(alembic_config, "head")
         async with sessions() as session:
-            assert await snapshot(session) == before
+            assert await snapshot(session, newer) == before
             assert (await session.execute(guards)).all() == current_guards
             assert await verify_guards(session) == []
         command.downgrade(alembic_config, "20261025_0017")
         async with sessions() as session:
-            assert await snapshot(session) == before
+            assert await snapshot(session, newer) == before
             assert (await session.execute(guards)).all() == before_guards
     finally:
         await engine.dispose()
