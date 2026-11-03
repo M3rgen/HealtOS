@@ -89,6 +89,11 @@ async def connection(sessions):
     ]
     + [{"refresh_token": value} for value in (" ", "\t", "\r\n", " \t\r\n", "\u00a0\u2003")]
     + [
+        {"refresh_token": template.format(char)}
+        for char in ("\ud800", "\udbff", "\udc00", "\udfff")
+        for template in ("{}synthetic-private", "synthetic{}-private", "synthetic-private{}")
+    ]
+    + [
         {"refresh_token": value}
         for value in (True, False, 0, 17, 1.25, [], ["synthetic-private"], {}, {"private": 1})
     ]
@@ -180,13 +185,13 @@ async def test_invalid_tokens_preserve_connection_then_recover(
         fragment = '"metadata":[{' + pair + "}]" if nested else pair
         body = (json.dumps(payload)[:-1] + "," + fragment + "}").encode()
     recovered = dict(
-        access_token="recovered-access", refresh_token=" \töpaque \r\n", scope="new-scope"
+        access_token="recovered-access", refresh_token=" \töpaque🧬 \r\n", scope="new-scope"
     )
     streams = [TokenStream([body[:10], body[10:]])]
     handler = AsyncMock(
         side_effect=[
             httpx.Response(status, stream=streams[0], headers=headers),
-            httpx.Response(200, json=recovered),
+            httpx.Response(200, content=json.dumps(recovered).encode()),
         ]
     )
     sleep = AsyncMock()
@@ -228,7 +233,11 @@ async def test_invalid_tokens_preserve_connection_then_recover(
             else "OAuth response did not contain an access token"
             if "access_token" in invalid
             else "OAuth response contained an invalid refresh token"
-            if "refresh_token" in invalid and not isinstance(invalid["refresh_token"], str)
+            if "refresh_token" in invalid
+            and (
+                not isinstance(invalid["refresh_token"], str)
+                or any("\ud800" <= char <= "\udfff" for char in invalid["refresh_token"])
+            )
             else "OAuth response contained a blank refresh token"
             if "refresh_token" in invalid
             else "OAuth token endpoint returned an error response"
@@ -245,7 +254,7 @@ async def test_invalid_tokens_preserve_connection_then_recover(
             streams.append(TokenStream([body[:10], body[10:]]))
             handler.side_effect = [
                 httpx.Response(status, stream=streams[-1], headers=headers),
-                httpx.Response(200, json=recovered),
+                httpx.Response(200, content=json.dumps(recovered).encode()),
             ]
             with caplog.at_level(logging.INFO), pytest.raises(OAuthError) as exchange_failure:
                 await callback(linked, raise_app_exceptions=True)
@@ -277,10 +286,11 @@ async def test_invalid_tokens_preserve_connection_then_recover(
         async with sessions() as session:
             assert await session.scalar(select(func.count()).select_from(RawApiResponse)) == 0
         with caplog.at_level(logging.INFO):
-            assert await asyncio.wait_for(runtime.tokens.get(), 2) == "recovered-access"
+            # Recovery includes SQLite worker scheduling; it has no two-second contract.
+            assert await runtime.tokens.get() == "recovered-access"
         assert await runtime.tokens.get() == "recovered-access"
         if both_grants:
-            handler.side_effect = [httpx.Response(200, json=recovered)]
+            handler.side_effect = [httpx.Response(200, content=json.dumps(recovered).encode())]
             assert (await callback(linked)).status_code == 200
             runtime.google.get_identity.assert_awaited_once_with(access_token="recovered-access")
             assert runtime.tokens._token is None

@@ -10,25 +10,40 @@ from app.core.timeutil import as_utc
 # while records carry physical UTC times. UTC offsets range from -12:00 to +14:00.
 CIVIL_BEFORE = timedelta(hours=12)
 CIVIL_AFTER = timedelta(hours=14)
+# Records of one sleep are dated by its end: the local day the sleep ended (the wake day),
+# wherever its start lies. Sleep that crosses midnight, sleep by day (a night shift) and two
+# sleeps of one day are each one record of the day they ended. A sleep summary's sample time
+# is the end of the sleep it describes (checked against the archive's sleep sessions), so its
+# start and end are that instant.
+WAKE_DATED_TYPES = frozenset({"sleep", "respiratory-rate-sleep-summary"})
 
 
 class QueryWindowError(ValueError):
     """The complete filter window cannot be represented without losing coverage."""
 
 
-def query_time(value: datetime) -> datetime:
-    """The instant a request bound actually names: UTC, truncated to whole seconds.
+def query_time(value: datetime, *, upper: bool = False) -> datetime:
+    """The instant a request bound names: UTC, rounded out to whole seconds.
 
-    Request bounds are sent with second precision, so ``10:00:00.5`` asks Google for
-    ``10:00:00``. Anything that reasons about what a request covered (deletion marking)
-    must use these bounds, not the finer datetimes the caller passed in.
+    Lower bounds round down; exclusive upper bounds round up. A positive subsecond
+    window must still include its records when sent with second precision. Exact
+    seconds stay unchanged, including an exclusive upper bound at midnight.
+    Retrieval evidence and deletion marking must use these same rounded bounds.
+    An unrepresentable upper bound is rejected rather than silently losing coverage.
     """
-    return as_utc(value).replace(microsecond=0)
+    value = as_utc(value)
+    rounded = value.replace(microsecond=0)
+    if upper and value.microsecond:
+        try:
+            rounded += timedelta(seconds=1)
+        except OverflowError as exc:
+            raise QueryWindowError("filter upper second is out of range") from exc
+    return rounded
 
 
-def query_iso(value: datetime) -> str:
+def query_iso(value: datetime, *, upper: bool = False) -> str:
     """RFC 3339 form of ``query_time`` as written into filters and rollup ranges."""
-    return query_time(value).isoformat().replace("+00:00", "Z")
+    return query_time(value, upper=upper).isoformat().replace("+00:00", "Z")
 
 
 class RecordKind(StrEnum):

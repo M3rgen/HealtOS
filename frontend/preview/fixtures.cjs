@@ -111,6 +111,23 @@ const chatAnswer = '**Merhaba!** Son 7 günün özeti:\n\n' +
   '| Gün | Adım | Uyku |\n|---|---:|---:|\n| Pzt | 10.240 | 7 sa 40 dk |\n| Sal | 8.910 | 6 sa 55 dk |\n\n' +
   'Uyku düzenini korumak için yatış saatini sabit tutmayı deneyebilirsin.';
 
+// GET /api/sync/coverage: every requested day retrieved with records (app/api/sync.py).
+function coverage(params) {
+  const start = new Date(`${params.get('start_date')}T00:00:00Z`), end = new Date(`${params.get('end_date')}T00:00:00Z`);
+  const days = [];
+  for (let at = start; at <= end; at = new Date(at.getTime() + 86400000))
+    days.push({ date: at.toISOString().slice(0, 10), has_value: true, retrieval: 'completed_with_records', returned_records: 12 + days.length * 3 });
+  const type = params.get('data_type') || 'steps';
+  return { supported_data_types: syncStatus.map(row => row.data_type), next_offset: null,
+    summary: { days_without_value: 0, unknown_days: 0, incomplete_days: 0 },
+    types: [{ data_type: type, presence_basis: 'metric_value', source_regimes: [{ source: 'Fitbit', value_days: days.length, record_count: days.reduce((n, d) => n + d.returned_records, 0) }], days }] };
+}
+
+// GET /api/webhooks/status: notifications arriving, no failures.
+const webhookStatus = { last_notification_at: '2026-10-16T13:58:00Z',
+  silence: { state: 'receiving', warning: false, never_received: false, since: null, threshold_seconds: 604800 },
+  counters: { since: '2026-09-24T00:00:00Z', valid: 412, invalid: 0, expired: 0, reasons: {} }, last_error: null };
+
 // Alternate data sets for edge-case views. 'sync-error' shows the notice
 // banner; 'empty' is a fresh install: Google not set up and no records yet.
 function scenario(name) {
@@ -127,6 +144,9 @@ function scenario(name) {
     return {
       health: { ...health, configuration: 'degraded', last_sync_success: null, latest_health_write: null, last_webhook_received: null, data_freshness: {} },
       dashboard: blank, measurements: [], syncStatus: [], workouts: () => [],
+      coverage: (params) => ({ ...coverage(params), supported_data_types: [], types: [], summary: { days_without_value: 0, unknown_days: 7, incomplete_days: 0 } }),
+      webhookStatus: { last_notification_at: null, silence: { state: 'unconfigured', warning: false, never_received: true, since: null, threshold_seconds: 604800 },
+        counters: { since: null, valid: 0, invalid: 0, expired: 0, reasons: {} }, last_error: null },
       history: (params) => ({ ...history(params), total_pages: 1, earliest_date: null, days: history(params).days.map((d) => ({ ...d, value: null })) }),
     };
   }
@@ -168,4 +188,4 @@ const uploadBackgroundPng = () => syntheticPng(640, 400, (u, v) => [Math.round(3
 // Includes a script and an id marker: tests assert neither ever reaches the DOM.
 const uploadLogoSvg = () => Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" id="uploaded-svg-marker"><script>window.uploadedSvgRan=true</script><circle cx="24" cy="24" r="18" fill="none" stroke="#48d88c" stroke-width="5"/><path d="M15 24h18" stroke="#48d88c" stroke-width="5" stroke-linecap="round"/></svg>');
 
-module.exports = { NOW, TODAY, health, dashboard, history, measurements, syncStatus, workouts, chatAnswer, scenario, appearanceSettings, syntheticPng, uploadAvatarPng, uploadBackgroundPng, uploadLogoSvg };
+module.exports = { NOW, TODAY, health, dashboard, history, measurements, syncStatus, workouts, coverage, webhookStatus, chatAnswer, scenario, appearanceSettings, syntheticPng, uploadAvatarPng, uploadBackgroundPng, uploadLogoSvg };

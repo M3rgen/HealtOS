@@ -84,6 +84,10 @@ chmod 600 .env
 
 Your user must be able to run `docker` (member of the `docker` group, or use `sudo`).
 
+The maintainer's own VM is the exception: it is installed from the private mirror's `live`
+branch, which is `main` plus the private extension branches. Check out `live` there instead of
+`main`; updates in the [runbook](RUNBOOK.md) then pull `live`. See [BRANCHES.md](BRANCHES.md).
+
 ## 3. Fill in `.env`
 
 The Compose file always starts the app with `APP_ENV=production`. In that mode the app refuses to
@@ -138,6 +142,27 @@ Until Google is linked and the webhook prerequisites (including `GOOGLE_CLOUD_PR
 are complete, `/health` is not `healthy` and lists reasons such as `configuration_incomplete`; that
 is expected at this point. Logs: `docker compose logs -f app` (JSON lines, rotated
 at 5 × 20 MB per container).
+
+After migrations, the shell uses `exec` so uvicorn receives SIGTERM directly. Uvicorn
+allows active requests five seconds to drain; the app then cancels background jobs and
+awaits their transaction/report cleanup before closing HTTP clients. Compose gives the app
+an explicit 20-second stop grace period. Committed pages and their resume tokens survive;
+the next reconciliation resumes the interrupted window idempotently.
+
+Verify on the deployment host, both idle and during a scheduled reconciliation:
+
+```sh
+container=$(docker compose ps -q app)
+time docker compose stop app
+docker inspect -f '{{.State.ExitCode}}' "$container"
+docker compose logs --tail=100 app
+docker compose start app
+```
+
+Normal shutdown should take under ten seconds, exit with 0 (or handled 143), and log
+`Shutting down` and `Application shutdown complete`; exit 137 indicates SIGKILL. For the
+active-job check, confirm the interrupted reconciliation is cancelled in the protected
+`/api/sync/reconciliation` history and that the next run completes its saved window.
 
 ## 5. Open the dashboard through SSH
 

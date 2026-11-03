@@ -27,10 +27,15 @@ from app.models.identity import (
 )
 from app.models.manual import ManualMeasurement, ManualWorkout
 from app.models.manual_flags import ManualMeasurementFlagEvent
+from app.models.raw_rejections import (
+    RawHealthDataRejection,
+    RawRejectionAck,
+    RetrievalEventRejection,
+)
 from app.models.raw_versions import RawApiResponse, RawHealthDataEvent, RawHealthDataVersion
 from app.models.reconciliation import ReconciliationResult, ReconciliationRun
 from app.models.retrieval import RetrievalCheckpoint, RetrievalEvent, RetrievalReceipt
-from app.models.settings import AppearanceSettings
+from app.models.settings import AppearanceSettings, DisplayPreferences
 from app.models.state import (
     BackfillJob,
     FetchRound,
@@ -51,6 +56,7 @@ __all__ = [
     "ManualWorkout",
     "ActiveZoneMinute",
     "AppearanceSettings",
+    "DisplayPreferences",
     "BackfillJob",
     "Distance",
     "EnergyExpenditure",
@@ -66,9 +72,11 @@ __all__ = [
     "RawApiResponse",
     "RawHealthData",
     "RawHealthDataEvent",
+    "RawHealthDataRejection",
     "RawHealthDataIdentity",
     "RawHealthDataSupersession",
     "RawHealthDataVersion",
+    "RawRejectionAck",
     "RawSourceChain",
     "RawSourceChainEvent",
     "RawSourcePair",
@@ -78,6 +86,7 @@ __all__ = [
     "ReconciliationRun",
     "RetrievalCheckpoint",
     "RetrievalEvent",
+    "RetrievalEventRejection",
     "RetrievalReceipt",
     "ScalarMetric",
     "SleepSession",

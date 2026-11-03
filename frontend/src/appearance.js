@@ -29,7 +29,7 @@ const DEFAULT_GLYPH = '/assets/umay/umay-glyph.svg';
 const TEXT = {
   logo: { legend: 'Logo', hint: 'Üst çubukta ve tarayıcı sekmesinde görünür.' },
   umay: { legend: 'Umay', hint: 'Sohbet penceresinde ve karşılama ekranında görünür.' },
-  background: { legend: 'Arka plan', hint: 'Panellerin arkasındaki zemin; paneller her zaman okunaklı kalır.' },
+  background: { legend: 'Arka plan', hint: 'Panellerin arkasında görünür; paneller her zaman okunaklı kalır.' },
 };
 
 // Used when the manifest cannot be loaded or lists nothing usable.
@@ -40,10 +40,10 @@ const FALLBACK = {
     faviconIco: '/assets/presets/logo/yurt/favicon.ico',
     favicon16: '/assets/presets/logo/yurt/favicon-16.png', favicon32: '/assets/presets/logo/yurt/favicon-32.png',
     appleTouch: '/assets/presets/logo/yurt/apple-touch-icon.png' } },
-  { id: 'healthos', label: 'HealthOS (klasik)', builtin: true, files: {
+  { id: 'healthos', label: 'Klasik', builtin: true, files: {
     mark: '/assets/brand/healthos-mark-amber.svg', markMono: '/assets/brand/healthos-mark.svg',
     favicon: '/assets/brand/favicon.svg', faviconIco: '/assets/brand/favicon.ico', appleTouch: '/assets/brand/apple-touch-icon.png' } }],
-  umay: [{ id: 'umay', label: 'Umay', builtin: true, files: {
+  umay: [{ id: 'umay', label: 'Portre', builtin: true, files: {
     src512: '/assets/umay/umay.webp', src256: '/assets/umay/umay-256.webp', src64: '/assets/umay/umay-64.webp',
     src64x2: '/assets/umay/umay-64@2x.webp', glyph: DEFAULT_GLYPH } }],
   background: [{ id: 'warm-grain', label: 'Sıcak doku', builtin: true, files: {
@@ -233,7 +233,7 @@ function fileType(file) {
 export async function prepareUpload(kind, file) {
   const type = file && fileType(file);
   if (!type) throw new Error('Bu dosya türü desteklenmiyor. PNG, JPEG, WebP veya SVG yükle.');
-  if (!file.size) throw new Error('Dosya boş görünüyor.');
+  if (!file.size) throw new Error('Dosya boş.');
   if (file.size > MAX_BYTES) throw new Error('Dosya 2 MB’tan büyük. Daha küçük bir görsel seç.');
   const vector = type === 'image/svg+xml';
   // Only a sanity check; the markup itself is never inserted into the page.
@@ -246,7 +246,7 @@ export async function prepareUpload(kind, file) {
     const width = image.naturalWidth, height = image.naturalHeight;
     if (!vector) {
       if (width < MIN_SIDE[kind] || height < MIN_SIDE[kind]) throw new Error(`Görsel çok küçük; en az ${MIN_SIDE[kind]}×${MIN_SIDE[kind]} piksel olmalı.`);
-      if (width > MAX_SIDE || height > MAX_SIDE) throw new Error(`Görsel çok büyük; kenarlar en fazla ${MAX_SIDE} piksel olabilir.`);
+      if (width > MAX_SIDE || height > MAX_SIDE) throw new Error(`Görsel çok büyük; kenarları en fazla ${MAX_SIDE} piksel olabilir.`);
     }
     // Canvas output can fail (e.g. an SVG the browser refuses to rasterize); keep the original then.
     const derive = (size, fit, background) => square(image, size, fit, background).catch(() => original);

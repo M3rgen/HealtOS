@@ -3,7 +3,7 @@
 Screenshots every HealthOS view at the target viewports against a running Vite
 dev server, with every backend route answered by **synthetic** fixtures
 (`fixtures.cjs`; no account data). It fails when the main page can scroll,
-which is the top rule in `AGENTS.md`. Nothing here is part of `npm run build`.
+which is the top rule in `CONTRIBUTING.md`. Nothing here is part of `npm run build`.
 
 ## Run
 
@@ -43,5 +43,8 @@ hidden.
 - Umay runs on a mocked WebSocket that streams one Markdown answer.
 - Uses Playwright's bundled Chromium in new-headless mode (`channel: 'chromium'`)
   so the WebGL body model renders on the GPU.
+- The README images in `docs/media` come from
+  `--viewports 1440x900,390x844 --views overview,umay,metric-history,calendar,appearance`,
+  saved as lossless optimized PNGs.
 - If the frontend starts calling a new endpoint, add it to `mock()` in
   `shoot.cjs` and give it a fixture.

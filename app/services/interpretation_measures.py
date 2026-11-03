@@ -4,7 +4,7 @@ from collections import defaultdict
 from zoneinfo import ZoneInfo
 
 from app.core.timeutil import as_utc
-from app.google_health.data_types import REGISTRY, RecordKind
+from app.google_health.data_types import REGISTRY, WAKE_DATED_TYPES, RecordKind
 from app.parsers.common import parse_date, parse_datetime, payload_for
 from app.services.canonical_daily import bounds
 from app.services.finite_math import finite_difference
@@ -132,10 +132,12 @@ def measurement_summaries(inputs, query, *, max_summaries):
         stamp = as_utc(row.source_start_time)
         if stamp is None:
             continue
+        # A sleep summary counts on the day its sleep ended (WAKE_DATED_TYPES), like sleep.
+        dated = (as_utc(row.source_end_time) or stamp) if kind in WAKE_DATED_TYPES else stamp
         day = (
             parse_date(payload.get("date"))
             if spec.kind == RecordKind.daily
-            else stamp.astimezone(ZoneInfo(query.timezone)).date()
+            else dated.astimezone(ZoneInfo(query.timezone)).date()
         )
         if day is None:
             continue

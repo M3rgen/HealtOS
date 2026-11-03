@@ -10,6 +10,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
+from app.core.logging import RedactSecrets
 from app.db.base import Base
 
 # A developer .env with APP_UI_TOKEN must not put the shared test app behind the login;
@@ -17,14 +18,36 @@ from app.db.base import Base
 os.environ["APP_UI_TOKEN"] = ""
 
 
+# Production's default level (Settings.log_level). Importing app.main runs create_app(),
+# whose configure_logging() would otherwise set the root level only when that module is
+# collected: the same test would see INFO in the full suite and WARNING when run alone.
+ROOT_TEST_LEVEL = logging.INFO
+QUIET_TRANSPORT_LOGGERS = ("httpx", "httpcore")
+
+
+def _baseline_root() -> None:
+    root = logging.getLogger()
+    root.setLevel(ROOT_TEST_LEVEL)
+    # Drop configure_logging()'s stdout handler; pytest's capture handlers stay.
+    root.handlers = [
+        handler
+        for handler in root.handlers
+        if not any(isinstance(item, RedactSecrets) for item in handler.filters)
+    ]
+    for name in QUIET_TRANSPORT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 @pytest.fixture(autouse=True)
 def preserved_loggers() -> Iterator[None]:
-    """Undo alembic's logging setup after every test that runs a migration.
+    """Start every test from one logging baseline and undo its changes afterwards.
 
     migrations/env.py runs logging.config.fileConfig(), which disables every existing
-    logger and replaces the root handlers; later caplog tests would then see no records.
+    logger and replaces the root handlers; create_app() resets the root level and
+    handlers. Later caplog tests would then see no records or a different level.
     Snapshotting costs microseconds, so every test (unit or integration) is covered.
     """
+    _baseline_root()
     manager = logging.Logger.manager
     loggers = [logging.getLogger()] + [
         item for item in manager.loggerDict.values() if isinstance(item, logging.Logger)

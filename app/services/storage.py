@@ -24,7 +24,9 @@ from app.parsers import normalize
 from app.parsers.common import payload_hash, temporal
 from app.parsers.text import prepare_optional_text
 from app.services import source_chains
+from app.services.hollow_names import link_hollow_rows
 from app.services.identity import add_aliases, add_links, among, resolve_ids
+from app.services.raw_rejections import reject_unstorable
 from app.services.source_chains import record_evidence, record_sightings
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,8 @@ class StoreStats:
     inserted: int = 0
     updated: int = 0
     unchanged: int = 0
+    # Records jsonb cannot hold, kept in raw_health_data_rejections instead (never stored).
+    rejected: int = 0
     normalized: int = 0
     normalization_skipped: int = 0
     # Archived records a complete window re-fetch no longer returned (see app.sync.deletions).
@@ -116,6 +120,10 @@ async def store_records(
     ``raw_api_responses`` first, in this same transaction, and each new payload is linked
     to the last of them (``response_id``), so a crash keeps both or neither.
 
+    A record PostgreSQL jsonb cannot hold (U+0000, a lone surrogate, NaN/Infinity) is set
+    apart first (app/services/raw_rejections.py, ``StoreStats.rejected``), in this same
+    transaction; it is neither stored nor sanitized, and the rest of the page is stored.
+
     Records without a Google id are written onto the row that holds their identity
     (app/services/identity.py). The rows written onto are locked and checked against what
     the resolution read; new rows are created with ``ON CONFLICT DO NOTHING``. When another
@@ -136,18 +144,25 @@ async def store_records(
     response_id = response_ids[-1] if response_ids else None
     # When Google returned the records (the sources' sightings): the response's fetch time.
     fetched_at = responses[-1].fetched_at if responses else None
+    records, rejected = await reject_unstorable(
+        session, spec, records, source=origin, response_id=response_id
+    )
     digests = [payload_hash(record) for record in records]
     if session.get_bind().dialect.name != "postgresql":
         # One writer at a time (tests): nothing to collide with.
-        return await _store(
+        stats = await _store(
             session, spec, records, digests, origin, response_id, fetched_at, fetch_started
         )
+        stats.rejected = rejected
+        return stats
     for _ in range(WRITE_ATTEMPTS):
         try:
             async with session.begin_nested():
-                return await _store(
+                stats = await _store(
                     session, spec, records, digests, origin, response_id, fetched_at, fetch_started
                 )
+            stats.rejected = rejected
+            return stats
         except _Collision:
             event(logger, "RECORD_BATCH_RESOLVED_AGAIN", data_type=spec.name)
     raise RuntimeError(
@@ -302,6 +317,9 @@ async def _store(
     for model, values in normalized_values.items():
         values.sort(key=lambda row: (row.get("data_type", ""), row["google_data_point_id"]))
         await _upsert_normalized_many(session, model, values)
+    # A row archived under a hollow name before: held by the row of its record, once that row
+    # holds its payload (app/services/hollow_names.py).
+    await link_hollow_rows(session, spec, {key: seq[-1][2] for key, seq in by_id.items()}, now)
     if resolution.state is not None:
         # Late in the transaction: the sightings row of a source is the one row every writer
         # of the data type shares, so it is held for as short as possible.

@@ -16,6 +16,7 @@ from app.models.identity import RawHealthDataIdentity, RawHealthDataSupersession
 from app.models.state import RawHealthData
 from app.parsers.common import google_name
 from app.parsers.identity import reading, record_identity
+from app.services.hollow_names import holds_hollow_row
 from app.services.identity_schema import identity_tables_missing, verify_identity_schema
 from app.services.source_chains import Chains
 
@@ -107,7 +108,8 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
     """Aliases, supersession links, source chains, devices and decisions are consistent.
 
     Returns (aliases, errors, notes). Besides the key checks: no links form a cycle (in any
-    state), no link supersedes a record that carries its own Google id, every link joins two
+    state), no link supersedes a record that carries its own Google id (but a row of a hollow
+    name, by the row of its own record: app/services/hollow_names.py), every link joins two
     rows of one v2 key, and its two recorded fingerprints - and the rows' forms now - are one
     or were joined by recorded chain links (at any time: a later link may have given the
     holder a newer form); every identity-merged event still has its link. Every chain was
@@ -199,9 +201,14 @@ async def verify_identities(session: AsyncSession) -> tuple[int, list[str], list
     async for row in result:
         raw_id, holder_id, data_type, old_source, new_source = row[:5]
         old_json, new_json, old_deleted, new_deleted, old_seen, new_seen, held_aside = row[5:]
-        if google_name(old_json) is not None:
-            errors.append(f"supersession of raw row {raw_id} hides a record with a Google id")
         spec = spec_for(data_type)
+        if google_name(old_json) is not None:
+            if old_source == new_source and holds_hollow_row(spec, old_json, new_json):
+                # A row of a hollow name, held by the row of its own record (always in force).
+                superseded_rows.add(raw_id)
+                targets.add(holder_id)
+                continue
+            errors.append(f"supersession of raw row {raw_id} hides a record with a Google id")
         old, new = record_identity(spec, old_json), record_identity(spec, new_json)
         if old is None or new is None or old.match != new.match or not old.compatible(new):
             errors.append(f"supersession of raw row {raw_id} links two different records")

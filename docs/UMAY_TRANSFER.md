@@ -34,3 +34,8 @@ Sürüm 2 yorum eylemleri de aynı fişten geçer. Gönderilen her yorum özeti 
 Tarih aralığı, gerçekten gönderilen geçmiş taban kanıtını ve adayın tarih başvurularını
 kapsar. Sayfa tekrarları tekrar sayılır; alan adları dışında yöntem, kaynak, imleç veya
 ölçüm değerleri loglanmaz. Bu sağlık verileri mevcut köprü üzerinden OpenAI'ye gönderilir.
+
+Her turda kullanıcının mesajına ek bir bağlam bloğu da OpenAI'ye gider: en fazla 8 KiB,
+yalnız kullanıcının bu bağlantıda yazdığı sözlerden alıntılar (konu, açık sunum tercihi,
+son istekler ve yanıtlanmamış istekler; Umay'ın yanıtı veya araç verisi girmez). Blok
+yalnız sohbet bağlantısının belleğinde tutulur ve bağlantı kapanınca silinir.

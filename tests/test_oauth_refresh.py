@@ -20,7 +20,7 @@ from app.google_health.oauth import AccessToken, OAuthClient, OAuthError, TokenP
 @pytest.mark.parametrize("status", [200, 201, 299])
 @pytest.mark.parametrize(
     "refresh_field",
-    [{}, {"refresh_token": None}, {"refresh_token": ""}, {"refresh_token": " \töpaque \r\n"}],
+    [{}, {"refresh_token": None}, {"refresh_token": ""}, {"refresh_token": " \töpaque🧬 \r\n"}],
 )
 async def test_valid_lifetime_and_access_token_are_preserved(
     monkeypatch, lifetime, status, refresh_field
@@ -74,6 +74,11 @@ async def test_valid_lifetime_and_access_token_are_preserved(
         for value in (" ", "\t", "\r\n", " \t\r\n", "\u00a0\u2003")
     ]
     + [
+        ("refresh_token", template.format(char), "an invalid refresh")
+        for char in ("\ud800", "\udbff", "\udc00", "\udfff")
+        for template in ("{}synthetic-private", "synthetic{}-private", "synthetic-private{}")
+    ]
+    + [
         ("access_token", template.format(char), "an invalid access")
         for char in ("ö", "\U0001f9ec", "\ud800", "\udfff", "\r", "\n", "\0")
         + ("\x0b", "\x0c", "\x01", "\x1f", "\x7f")
@@ -81,7 +86,8 @@ async def test_valid_lifetime_and_access_token_are_preserved(
     ]
     + [("access_token", f"synthetic-private{end}", "an invalid access") for end in (" ", "\t")],
 )
-async def test_invalid_token_field_is_rejected_without_retry(field, value, reason):
+@pytest.mark.parametrize("grant", ["refresh", "exchange_code"])
+async def test_invalid_token_field_is_rejected_without_retry(field, value, reason, grant):
     handler = AsyncMock(
         return_value=httpx.Response(
             200,
@@ -96,8 +102,11 @@ async def test_invalid_token_field_is_rejected_without_retry(field, value, reaso
     )
     sleep = AsyncMock()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        with pytest.raises(OAuthError, match=f"^OAuth response contained {reason} token$"):
-            await OAuthClient(Settings(_env_file=None), http, sleep=sleep).refresh("synthetic")
+        client = OAuthClient(Settings(_env_file=None), http, sleep=sleep)
+        with pytest.raises(OAuthError, match=f"^OAuth response contained {reason} token$") as err:
+            await getattr(client, grant)("synthetic")
+    assert not err.value.transient
+    assert err.value.__cause__ is err.value.__context__ is None
     assert handler.await_count == 1
     sleep.assert_not_awaited()
 

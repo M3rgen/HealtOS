@@ -14,7 +14,7 @@ function valueLabel(metric, value) {
   if (value == null) return '—';
   if (metric === 'sleep') {
     const minutes = Math.round(value / 60);
-    return `${Math.floor(minutes / 60)} sa ${minutes % 60} dk`;
+    return minutes < 60 ? `${minutes} dk` : `${Math.floor(minutes / 60)} sa ${minutes % 60} dk`;
   }
   return `${number(value, metric === 'heart' ? 1 : 0)} ${metric === 'heart' ? 'bpm' : 'adım'}`;
 }

@@ -134,12 +134,10 @@ async def test_partial_adjacent_and_overlapping_windows_preserve_gaps(api, sessi
     assert (await day(api))["retrieval"] == "completed_empty"
 
 
-async def test_second_precision_leaves_a_real_second_gap(api, sessions):
+async def test_second_precision_rounds_out_to_cover_the_full_day(api, sessions):
     await fetch(
         sessions, start=START + timedelta(microseconds=999999), end=END - timedelta(microseconds=1)
     )
-    assert (await day(api))["retrieval"] == "incomplete"
-    await fetch(sessions, start=END - timedelta(seconds=1))
     assert (await day(api))["retrieval"] == "completed_empty"
 
 

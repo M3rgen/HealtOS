@@ -100,7 +100,7 @@ The 1024² `skin-pores-height.png` (370 KB) height/bump reference was never load
 body{background:#181814 url(/assets/bg/grain-tile.webp) repeat}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:url(/assets/bg/vignette.webp) center/100% 100% no-repeat}
-/* The pseudo-element is position:fixed, so it can never add page scroll (AGENTS.md: no page scrolling). */
+/* The pseudo-element is position:fixed, so it can never add page scroll (CONTRIBUTING.md: no page scrolling). */
 
 /* Empty states */
 .empty-illustration{width:160px;height:120px;color:var(--amber)}

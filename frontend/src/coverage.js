@@ -5,12 +5,13 @@ const labels = {
   completed_with_records: 'Kayıtla tamamlandı',
   completed_empty: 'Google boş döndü',
   incomplete: 'Çekim yarım',
+  not_attempted: 'Hiç çekilmedi',
   unknown: 'Çekimin tamamlandığı bilinmiyor',
 };
 const reasons = {
   no_time_filter: 'Bu türün zaman filtresi yok; günlük kanıt üretilemez.',
-  returned_dates_unknown: 'Dönen bazı kayıtların günü belirlenemiyor; boş dönüş denemez.',
-  civil_start_offset_envelope: 'Civil başlangıç filtresi; fiziksel gün için saat farkı sınırları korunur.',
+  returned_dates_unknown: 'Dönen bazı kayıtların günü belirlenemiyor; boş dönüş sayılamaz.',
+  civil_start_offset_envelope: 'Filtre yerel başlangıç saatine göre; fiziksel gün için saat dilimi farkı kadar pay bırakılır.',
   lower_bound_filter: 'Google filtresinin yalnız başlangıç sınırı var.',
   open_day: 'Gün henüz kapanmadı; tam gün sayılmaz.',
 };
@@ -83,7 +84,7 @@ export function setupCoverage({ request, getZone, getToday, escape }) {
     $('coverage-retry').hidden = true;
     $('coverage-results').setAttribute('aria-busy', 'true');
     const all = [];
-    const totals = { days_without_value: 0, unknown_days: 0, incomplete_days: 0 };
+    const totals = { days_without_value: 0, unknown_days: 0, incomplete_days: 0, not_attempted_days: 0 };
     try {
       let offset = 0;
       do {
@@ -92,7 +93,7 @@ export function setupCoverage({ request, getZone, getToday, escape }) {
         if (current !== sequence) return;
         knownTypes = result.supported_data_types;
         all.push(...result.types);
-        for (const key of Object.keys(totals)) totals[key] += result.summary[key];
+        for (const key of Object.keys(totals)) totals[key] += result.summary[key] ?? 0;
         offset = result.next_offset;
         $('coverage-status').textContent = `${all.length} veri türü alındı…`;
       } while (offset != null);
@@ -101,7 +102,7 @@ export function setupCoverage({ request, getZone, getToday, escape }) {
         ...knownTypes.map(name => new Option(name, name)));
       $('coverage-type').value = selection;
       // The report covers only the selected type (steps by default); say which.
-      const summary = `${type || 'Tüm türler'}: ${totals.days_without_value} değeri olmayan · ${totals.unknown_days} bilinmeyen · ${totals.incomplete_days} yarım tür/gün`;
+      const summary = `${type || 'Tüm türler'}: ${totals.days_without_value} değeri olmayan · ${totals.unknown_days} bilinmeyen · ${totals.incomplete_days} yarım · ${totals.not_attempted_days} hiç çekilmemiş tür/gün`;
       $('coverage-summary').textContent = summary;
       $('coverage-status').textContent = `${start} – ${end} · ${zone} · ${summary}`;
       render(all);

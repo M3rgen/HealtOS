@@ -111,14 +111,17 @@ async def manual(sessions, value, at=T0, metric="weight"):
         return row.id
 
 
-async def snapshot(session):
-    """All columns, including archive history and manual events, before and after builds."""
+async def snapshot(session, newer=()):
+    """All columns, including archive history and manual events, before and after builds.
+
+    ``newer`` names tables created after the revision a migration test downgrades to.
+    """
     from app.db.base import Base
 
     return {
         name: sorted(repr(tuple(row)) for row in (await session.execute(select(table))).all())
         for name, table in Base.metadata.tables.items()
-        if name != "derived_days"
+        if name != "derived_days" and name not in newer
     }
 
 

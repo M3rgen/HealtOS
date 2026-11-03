@@ -1,4 +1,10 @@
-"""Both coverage readers reject invalid numbers without repairing archived records."""
+"""Both coverage readers reject invalid numbers without repairing archived records.
+
+A parsed NaN/Infinity cannot reach the archive: jsonb cannot hold it, so the write path sets it
+apart (raw_health_data_rejections) and coverage sees only what is archived.
+"""
+
+import math
 
 import pytest
 from derived_records import BAND, PHONE, point, snapshot, store
@@ -11,6 +17,7 @@ from test_retrieval_coverage_api import PATH, QUERY, fetch
 from test_retrieval_coverage_api import api as api
 
 from app.google_health.data_types import REGISTRY
+from app.models.raw_rejections import RawHealthDataRejection
 from app.models.raw_versions import RawHealthDataVersion
 from app.models.state import RawHealthData
 from app.services.codex_health import read_health
@@ -93,18 +100,28 @@ async def test_final_unit_presence_preserves_archive(
         await store(sessions, kind, seed)
     else:
         current.pop("name")
-    await store(sessions, kind, current)
+    stats = await store(sessions, kind, current)
+    rejected = isinstance(value, float) and not math.isfinite(value)
+    assert stats.rejected == int(rejected)
     present = value in (0, "-0", "0e99999", "1234.56789", "5e-321", "1e308") or (
         value in ("1e309", 10**309) if kind == "height" else value == "5e-324"
     )
     async with sessions() as session:
         before = await snapshot(session)
         versions = (await session.scalars(select(RawHealthDataVersion))).all()
-        assert len(versions) == int(corrected)
-        if corrected:
-            assert versions[0].raw_json == seed
+        if rejected:
+            # Set apart, not written: a correction leaves the stored seed as it was.
+            assert len(versions) == 0
+            assert (await session.scalars(select(RawHealthDataRejection))).one().ordinal == 0
+            raw = (await session.scalars(select(RawHealthData))).all()
+            assert [row.raw_json for row in raw] == ([seed] if corrected else [])
+            present = corrected
+        else:
+            assert len(versions) == int(corrected)
+            if corrected:
+                assert versions[0].raw_json == seed
     card, report = await reports(api, kind)
-    assert_values(card, report, int(present), int(not present))
+    assert_values(card, report, int(present), int(not present and not rejected))
     assert card["retrieval"]["state"] == report["days"][0]["retrieval"] == "unknown"
     async with sessions() as session:
         assert await snapshot(session) == before

@@ -62,11 +62,11 @@ const VIEWS = {
   },
   sports: async (page) => {
     await page.locator('[data-page="sports"]').click();
-    await page.locator('#workout-rows tr').first().waitFor();
+    await page.locator('#workout-rows .workout-day').first().waitFor();
   },
   'sports-editor': async (page) => {
     await page.locator('[data-page="sports"]').click();
-    await page.locator('#workout-rows tr').first().waitFor();
+    await page.locator('#workout-rows .workout-day').first().waitFor();
     await page.locator('#workout-add').click();
   },
   appearance: async (page) => {
@@ -155,6 +155,8 @@ async function mock(page, base, problems, scenario) {
       if (method === 'PUT') appearance = { selection: route.request().postDataJSON(), updated_at: new Date().toISOString() };
       return json(route, appearance);
     }
+    if (p === '/api/sync/coverage') return json(route, call(data.coverage, q));
+    if (p === '/api/webhooks/status') return json(route, data.webhookStatus);
     if (p === '/sync/status') return json(route, data.syncStatus);
     if (p === '/sync/all') return json(route, { status: 'accepted', data_types: ['steps'] }, 202);
     if (/^\/(api|sync|auth|docs|health|google-health)(\/|$)/.test(p)) { problems.push(`unmocked ${method} ${p}`); return json(route, { detail: 'preview: not mocked' }, 404); }

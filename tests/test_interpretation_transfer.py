@@ -194,7 +194,7 @@ async def test_pressure_sparse_data_and_voice_protocol_without_model(pressure, r
 
 
 def test_protocol_keeps_evidence_rules_and_leaves_the_voice_to_the_persona():
-    # Tone belongs to the maintainer's persona (ROADMAP 3.2); the protocol keeps rules only.
+    # Tone belongs to the maintainer's persona; the protocol keeps rules only.
     protocol = INSTRUCTIONS.split("Sağlık yorum protokolü:\n", 1)[1]
     for phrase in ("Sesini", "maddelere", "analiz dayatma", "gündelik"):
         assert phrase not in protocol

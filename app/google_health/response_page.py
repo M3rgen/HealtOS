@@ -43,6 +43,17 @@ class InvalidPaginationResponseError(InvalidResponseError):
         super().__init__("Google Health response has an invalid pagination token type")
 
 
+class UnstorablePaginationResponseError(InvalidResponseError):
+    """A string continuation that cannot cross the hash and checkpoint boundary.
+
+    Keep this separate from the JSON type error and expired request tokens. The
+    original response belongs in the archive, never in an error or a checkpoint.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Google Health response has an unstorable pagination token")
+
+
 class InvalidCollectionResponseError(InvalidResponseError):
     """A different endpoint's collection cannot prove this endpoint is empty.
 
@@ -100,5 +111,12 @@ def _next_page_token(value: object) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
+        # PostgreSQL text cannot store NUL; strict UTF-8 cannot encode surrogates.
+        # JSON decoding combines valid escaped surrogate pairs into a scalar, so
+        # those remain valid opaque tokens. Never trim or repair a continuation.
+        # Inspect code points rather than encoding: UnicodeEncodeError retains the
+        # private input in its attributes and must not enter an exception chain.
+        if any(char == "\x00" or "\ud800" <= char <= "\udfff" for char in value):
+            raise UnstorablePaginationResponseError()
         return value if value != "" else None
     raise InvalidPaginationResponseError()

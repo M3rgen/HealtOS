@@ -218,6 +218,9 @@ def describe_result(arguments: object, data: dict, success: bool) -> dict:
         for metric in data.get("metrics", []):
             for row in metric.get("source_regimes", []):
                 add_dates(row, ("first_date", "last_date"), metadata_dates)
+            # Gap periods (one-metric cards) also send dates; count them as metadata.
+            for row in (metric.get("retrieval") or {}).get("gaps") or []:
+                add_dates(row, ("start_date", "end_date"), metadata_dates)
     dates.extend(profile_dates)
     return {
         "action": action,

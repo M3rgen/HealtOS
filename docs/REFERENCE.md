@@ -21,6 +21,10 @@ A fully self-hosted, subscription-free, read-only archive of health and fitness 
   [Raw record versions](#raw-record-versions)).
 - Raw and normalized UPSERTs plus their page checkpoint commit in one transaction.
 - Backfill progress is stored per data type and time window, including the next page token.
+- A page whose `nextPageToken` repeats one of the same attempt is stored like any page (records,
+  responses, deduplication), but its token is never saved as a checkpoint and the window's
+  watermark does not advance; the fetch then fails with `repeated_page_token` and resumes from
+  the previous token.
 - Incremental sync deliberately overlaps previous checkpoints to catch late or enriched data.
 - Webhooks trigger retrieval; they are not treated as the dataset. Reconciliation repairs missed notifications.
 - A webhook `DELETE` notification never deletes archive rows. The follow-up read and webhook audit record are retained.
@@ -498,6 +502,8 @@ never marked.
   the deleted session is inside both the query and the marked range. Outside webhooks, a
   scheduled window only marks sessions that started at least 12 hours after its start and 14 hours
   before its end; the rest is covered by the daily 7-day reconciliation.
+- A round that set a record apart as unstorable ([records jsonb cannot hold](#records-jsonb-cannot-hold))
+  marks nothing; the next round of the window without one does.
 - A record whose time was moved upstream out of the window that is re-fetched looks deleted from
   that window and is marked until a fetch covering its new time returns it again (and unmarks it).
   For a move of more than 7 days that is the weekly 90-day reconciliation.
@@ -924,6 +930,36 @@ FROM raw_health_data_supersessions s JOIN raw_health_data n ON n.id = s.new_raw_
 WHERE s.old_google_data_point_id = 'synthetic:…';
 ```
 
+### Hollow Google names
+
+A Google `name` whose data point id is empty (`users/…/dataTypes/<type>/dataPoints/`) names the
+data type, not a record. `respiratory-rate-sleep-summary` arrives so: every sleep's summary under
+one name. Such a record is identified by the name plus `@` and its own UTC time
+(`app/parsers/common.py`, `source_id`): the start of its interval, or a sample's time. For a
+sleep summary that time is the end of the sleep it describes (in the archive it equals a sleep
+session's end, or falls inside a session that holds several summaries; one response returns
+them all together, so they are separate records, not revisions). The identity is never a
+calendar day: sleep by day after a night shift, sleep across midnight and two sleeps of one day
+are each their own row; a revised summary of the same sleep is a new version of its row. A
+hollow name without any time keeps the bare name.
+
+Before this, every summary was written onto the one row of the bare name: that row holds the
+last sleep it received and the earlier sleeps are its [versions](#raw-record-versions). It is
+never written, deleted or rewritten. When the row of its own sleep holds exactly its payload,
+the write path links the old row to it (`app/services/hollow_names.py`; reason `hollow-name`,
+one fingerprint on both sides, so always in force): readers count the sleep once, and a
+complete fetch that returns the sleep does not mark the old row deleted. Without such a row
+(Google no longer returns that sleep, or returns another value) the old row counts on its own.
+`verify` accepts this link and still refuses any other link that hides a record with a Google
+id. The sleeps held only in versions are not copied into new rows: Google still returns them
+(the next `health-mirror reconcile --days N` stores each as its own row, with its response), and
+a derived copy would be a second row of the same record.
+
+**Dating.** Sleep and sleep summaries (`WAKE_DATED_TYPES`, `app/google_health/data_types.py`)
+belong to the local day the sleep ended (the wake day): coverage (`retrieval_coverage`) and
+Umay's physiology reader count a summary there, wherever the sleep began. Two sleeps that end
+on one day are one value day and two records.
+
 ## Raw record versions
 
 Google re-sends records with a different payload when it recomputes them (HRV, calories, heart-rate
@@ -1062,6 +1098,8 @@ CLI and hand-written SQL alike (`health-mirror verify` checks that the guards ar
 | Reconciler checkpoints and counts, deferred deletions, fetch round starts | `identity_reconcile_state`, `identity_deferred_deletions`, `fetch_rounds` | bookkeeping (no row deleted) |
 | Signed webhook bodies | `webhook_events.raw_body` | the exact bytes Google posted; `payload_hash` is their SHA-256, checked by `verify` |
 | Webhook batches and elements | `webhook_events`, `webhook_notifications`, `webhook_batch_items` | no `DELETE`/`TRUNCATE`; the received payload (`payload_hash`, `raw_json`, a set `raw_body`) is frozen, processing state is not; batch items append-only. `raw_json` is NULL when jsonb cannot hold the signed body (U+0000, an unpaired surrogate, a non-finite number): the bytes are in `raw_body` and such an element is rejected |
+| Google records jsonb cannot hold, set apart instead of stored ([below](#records-jsonb-cannot-hold)) | `raw_health_data_rejections` | append-only (trigger); one row per record of one stored exchange, linked to its `raw_api_responses` row, with the parsed record (`element_json`, ASCII escapes) |
+| The maintainer's acknowledgement of rejected records; rejected records per retrieval page | `raw_rejection_acks`, `retrieval_event_rejections` | append-only (trigger) |
 | Manual measurements and workouts | `manual_measurements`, `manual_workouts` | append-only: the UI only adds entries; a correction is a new entry (for the same measurement time the newest entry wins) |
 | Test-entry flags on manual measurements (`mark` / `unmark`) | `manual_measurement_flag_events` | append-only (trigger); the latest per measurement is current, the measurement is unchanged |
 
@@ -1115,6 +1153,46 @@ sha256sum page.json                                      # equals body_sha256
 
 `export-response` refuses (exit 1) when the stored bytes no longer match their SHA-256.
 
+### Records jsonb cannot hold
+
+PostgreSQL `jsonb` holds neither U+0000 nor an unpaired surrogate nor a non-finite number, all of
+which Google's JSON can carry (`\u0000`, `\ud800`, `NaN`, `1e400`). One such record used to fail
+its page on every attempt, so its data type never advanced. `store_records` now checks every
+record first (the same check as the webhook ingest, `app/google_health/jsonb.py`) and sets such a
+record apart, in the page's transaction, in **`raw_health_data_rejections`** (migration
+`20261102_0023`): `data_type`, `source`, `context_id`, `response_id` (the page's
+`raw_api_responses` row, which holds the bytes as sent; no foreign key), `ordinal` (its place
+among the page's records), `reason` (`jsonb_unrepresentable`), `element_json` (the parsed record
+with ASCII escapes: nothing replaced, `NaN`/`Infinity` written as such) and its SHA-256
+`element_sha256`. The rest of the page is stored and the next page is requested. Nothing is
+sanitized and nothing already archived is touched: a stored record whose new payload is rejected
+keeps its stored payload. One row per record of one stored exchange (`UNIQUE (response_id,
+ordinal)`); responses are never merged, so every re-fetch adds its exchange and its rejection.
+Without an exchange (a caller with parsed records only) `(data_type, source, ordinal,
+element_sha256)` keeps a repeat out. A page that rolls back takes its rejections with it.
+
+- A round that rejected a record marks no source deletions: the rejected record may be an
+  archived one sent again, and the round cannot show it was returned. The next round of the window
+  without a rejection marks what Google no longer sends.
+- Retrieval receipts: a rejected record stays in `returned_count` and `returned_times` (Google
+  returned it, so coverage does not call its day empty) and is not added to `unplaced_count`; the
+  number per page (or failed outcome) is in `retrieval_event_rejections`.
+- `/health` is `degraded` with reason `rejected_google_records` while a rejected record is not
+  acknowledged; `rejected_records` counts distinct records (data type and `element_sha256`) not
+  yet acknowledged. It never hides a worse state.
+
+```sh
+health-mirror rejections                 # newest first, metadata only, with the ack in force (JSON)
+health-mirror rejections --element 7     # the parsed record of rejection 7 on stdout
+health-mirror export-response 12345      # the exchange it came from, byte for byte
+health-mirror rejections --ack 7         # every rejection up to 7 was looked at
+```
+
+`--ack` appends to `raw_rejection_acks` (append-only; it only moves forward, a lower id writes
+nothing). The same record rejected again later stays acknowledged; a new record turns `/health`
+`degraded` again. A rejected record is not in `raw_health_data`: dashboards and Umay do not see it.
+How to represent such a value in the archive is a separate decision (RUNBOOK).
+
 ### Source deletion events
 
 `source_deleted_at` on a record is its current state. Every change of it is also appended, by
@@ -1145,7 +1223,7 @@ above, and why it is allowed:
 | batch/element processing (`app/services/webhook_processing.py`) | `webhook_events`, `webhook_notifications` | operational: `status`, counters, `last_error`, `processed_at`, `failure_count`, `element_count`, filling a missing `raw_body`/`signature_verified_at` once; payload frozen by trigger |
 | test-entry flag and its removal (`app/services/manual_flags.py`) | `manual_measurement_flag_events` | inserts only; `manual_measurements` is only read |
 | `signature_verified_at` backfill (migration `0003`) | `webhook_events` | operational, fills a NULL |
-| sync state, backfill jobs, reliability state, appearance, OAuth token rotation | `sync_state`, `backfill_jobs`, `reliability_state`, `appearance_settings`, `oauth_tokens` | operational metadata, not received data |
+| sync state, backfill jobs, reliability state, appearance, display preferences, OAuth token rotation | `sync_state`, `backfill_jobs`, `reliability_state`, `appearance_settings`, `display_preferences`, `oauth_tokens` | operational metadata, not received data |
 | normalized UPSERTs | `heart_rate`, `steps`, … | derived, see below |
 | `downgrade()` of migrations | — | refuses while versions, responses or events exist (`-x allow-version-loss=1` after a backup) |
 
@@ -1225,7 +1303,7 @@ docker compose exec -T app health-mirror webhook-readiness
 docker compose exec -T app health-mirror webhook-status
 ```
 
-If durable elements remain failed after a transient outage, retry only pending webhook work with:
+After deploying a fix or recovering from an outage, retry stored `pending` and `failed` elements:
 
 **Operates only on already verified stored webhook batches:**
 
@@ -1233,8 +1311,8 @@ If durable elements remain failed after a transient outage, retry only pending w
 docker compose exec -T app health-mirror webhook-replay-pending
 ```
 
-This command does not fabricate a webhook, change health data, or ask Google to resend anything.
-It reuses already verified, stored batches and the normal read-only Google Health query path.
+Despite its name, this command retries `failed` elements too; completed elements are not re-fetched.
+It reuses verified batches and read-only Google queries; no SQL reset or Google resend is needed.
 A live re-delivery of a signed body that was first verified more than 24 hours earlier is accepted
 (HTTP 204) but not processed again (`WEBHOOK_REPLAY_IGNORED`); the operator command above is not
 limited.

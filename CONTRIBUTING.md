@@ -2,6 +2,27 @@
 
 Focused fixes, documentation improvements, and reproducible bug reports are welcome. Before starting a large change, open an issue describing the problem and proposed scope.
 
+## Project rules
+
+Every change keeps these rules; a pull request that breaks one is not merged.
+
+1. **One screen, no page scrolling.** This is the highest-priority interface rule (see
+   [Interface requirements](#interface-requirements)); the overflow checks in `tests/browser` must
+   stay green.
+2. **Raw data is preserved.** No record received from Google is deleted or overwritten; a source
+   deletion is only marked with `source_deleted_at`. Migrations are not destructive: no `DROP`
+   outside `downgrade()`.
+3. **Interface on loopback only.** The UI and API stay bound to `127.0.0.1`; the public tunnel
+   passes only `POST /webhooks/google-health`.
+4. **No new external services.** No new SaaS, telemetry, or CDN. Umay, the assistant, sends the
+   records it is asked to analyze to OpenAI and keeps no persistent memory; both stay documented.
+5. **No secrets or personal data** in commits, issues, or screenshots (see
+   [Commit hygiene](#commit-hygiene) and [Use synthetic examples](#use-synthetic-examples)).
+6. **Natural Turkish interface text.** Write "Eşitleme", not "Senkronizasyon". The assistant is
+   called Umay; tool and model names are not shown to users.
+7. **Version pins stay.** `uv.lock`, image digests, and SHA-pinned Actions change only in a
+   separate, deliberate dependency update.
+
 ## Make a change
 
 1. Fork the repository and create a branch.
@@ -15,6 +36,7 @@ Focused fixes, documentation improvements, and reproducible bug reports are welc
 ```sh
 make verify          # ruff check + format check, configuration and documentation-link verifier, pytest, pyright
 make test-browser    # browser checks: cd frontend && npm run test:browser
+cd frontend && npx vite build && cd ..   # frontend build check for interface changes
 ```
 
 `make verify` is what CI runs, using `uv run --frozen --extra dev`. It needs no database or network.
@@ -23,9 +45,9 @@ with `cd frontend && npx playwright install chromium`. Run them for every interf
 desktop and mobile sizes. `make compose-smoke` exercises the full Docker stack in an isolated
 project when you change Compose, the Dockerfile, migrations, or the backup scripts.
 
-`scripts/verify_configuration.py` also fails on a broken relative link or heading anchor in
-`README.md`, `AGENTS.md`, `CONTRIBUTING.md`, or `docs/`, so fix links in the same change that moves
-a file or renames a heading.
+`scripts/verify_configuration.py` also fails on a broken relative link or heading anchor in any
+Markdown file at the repository root or in `docs/`, so fix links in the same change that moves a
+file or renames a heading.
 
 ## Commit hygiene
 

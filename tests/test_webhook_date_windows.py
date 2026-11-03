@@ -16,8 +16,10 @@ from test_webhook_status_http import receiver as receiver
 from app.core.config import Settings
 from app.google_health.client import GoogleHealthClient
 from app.google_health.data_types import REGISTRY, QueryWindowError, query_iso
+from app.models.retrieval import RetrievalReceipt
 from app.models.state import WebhookBatchItem, WebhookEvent, WebhookNotification
 from app.parsers.common import payload_hash
+from app.services.webhook_metadata import notification_windows
 
 
 def bounded(kind, start, end):
@@ -63,22 +65,62 @@ async def fetching_receiver(receiver, sessions):
 
 @pytest.mark.parametrize("state", ["fresh", "legacy", "pending", "failed"])
 @pytest.mark.parametrize(
-    "kind,start,end",
+    "kind,intervals,error",
     [
-        ("exercise", "0001-01-01T00:00:00Z", "0001-01-01T01:00:00Z"),
-        ("exercise", "9999-12-30T23:00:00Z", "9999-12-31T12:00:00Z"),
-        ("sleep", "9999-12-31T22:00:00Z", "9999-12-31T23:59:59Z"),
-        ("daily-resting-heart-rate", "9999-12-28T12:00:00Z", "9999-12-31T12:00:00Z"),
-        ("calories-in-heart-rate-zone", "9999-12-01T00:00:00Z", "9999-12-31T23:59:59Z"),
+        (
+            kind,
+            bounded(kind, start, end)["data"]["intervals"],
+            "notification query window exceeds the representable date range",
+        )
+        for kind, start, end in [
+            ("exercise", "0001-01-01T00:00:00Z", "0001-01-01T01:00:00Z"),
+            ("exercise", "9999-12-30T23:00:00Z", "9999-12-31T12:00:00Z"),
+            ("sleep", "9999-12-31T22:00:00Z", "9999-12-31T23:59:59Z"),
+            ("weight", "9999-12-31T23:59:59Z", "9999-12-31T23:59:59.000001Z"),
+            ("daily-resting-heart-rate", "9999-12-28T12:00:00Z", "9999-12-31T12:00:00Z"),
+            ("calories-in-heart-rate-zone", "9999-12-01T00:00:00Z", "9999-12-31T23:59:59Z"),
+        ]
+    ]
+    + [
+        (
+            "steps",
+            intervals,
+            "notification physicalTimeInterval must have valid startTime before endTime",
+        )
+        for physical in [
+            None,
+            [],
+            {},
+            *({bound: "2026-08-17T10:00:00Z"} for bound in ("startTime", "endTime")),
+            *(
+                {bound: value, other: "2026-08-17T10:00:00Z"}
+                for bound, other in [("startTime", "endTime"), ("endTime", "startTime")]
+                for value in [
+                    None,
+                    42,
+                    "private-invalid-date",
+                    "0001-01-01T00:00:00+00:01",
+                    "9999-12-31T23:59:59-00:01",
+                ]
+            ),
+            {"startTime": "2026-08-17T10:00:00Z", "endTime": "2026-08-17T10:00:00Z"},
+            {"startTime": "2026-08-17T10:01:00Z", "endTime": "2026-08-17T10:00:00Z"},
+        ]
+        for intervals in [
+            [{"physicalTimeInterval": physical}],
+            notification()["data"]["intervals"] + [{"physicalTimeInterval": physical}],
+            [{"physicalTimeInterval": physical}] + notification()["data"]["intervals"],
+        ]
     ],
 )
-async def test_unrepresentable_windows_are_terminal_rejections(
-    fetching_receiver, sessions, state, kind, start, end
+async def test_invalid_windows_are_terminal_rejections(
+    fetching_receiver, sessions, state, kind, intervals, error
 ):
     r = fetching_receiver
     enable(r)
-    good, bad = notification(), bounded(kind, start, end)
-    payload = [good, bad]
+    good, bad = notification(), notification(kind)
+    bad["data"]["intervals"] = intervals
+    payload = [bad, good]
     raw = json.dumps(payload, indent=2).encode() + b"\n"
     digest = hashlib.sha256(raw).hexdigest()
     prepared = state in {"pending", "failed"}
@@ -107,11 +149,11 @@ async def test_unrepresentable_windows_are_terminal_rejections(
                             intervals=data["intervals"],
                             raw_json=item,
                             is_valid=True,
-                            status="completed" if ordinal == 1 else state,
+                            status="completed" if ordinal == 2 else state,
                             attempt_count=3,
                             sync_attempt_count=2,
                             sync_success_count=1,
-                            last_error=None if ordinal == 1 else "old processing failure",
+                            last_error=None if ordinal == 2 else "old processing failure",
                         )
                     )
                 await session.flush()
@@ -134,11 +176,7 @@ async def test_unrepresentable_windows_are_terminal_rejections(
         assert batch.signature_verified_at.replace(tzinfo=UTC) == r.current.now
         assert batch.processed_at is not None and batch.failure_count == 1
         assert rejected.status == "rejected" and not rejected.is_valid
-        assert (
-            rejected.validation_error
-            == batch.last_error
-            == ("notification query window exceeds the representable date range")
-        )
+        assert rejected.validation_error == batch.last_error == error
         assert rejected.last_error is None
         assert rejected.raw_json == bad and rejected.intervals == bad["data"]["intervals"]
         assert (rejected.sync_attempt_count, rejected.sync_success_count) == (
@@ -171,6 +209,8 @@ async def test_unrepresentable_windows_are_terminal_rejections(
         batch = await session.get(WebhookEvent, digest)
         assert batch.raw_body == raw and batch.raw_json == payload
         assert bad_row.raw_json == bad and good_row.raw_json == good
+        receipts = (await session.scalars(select(RetrievalReceipt))).all()
+        assert (len(receipts), bad_row.status) == (0 if prepared else 1, "rejected")
     counters = (await r.status.snapshot())["counters"]["reasons"]
     assert counters["notification_rejected"] == 1
     assert counters.get("processing_failed", 0) == counters.get("batch_processing_failed", 0) == 0
@@ -270,3 +310,19 @@ def test_daily_filter_rejects_unrepresentable_exclusive_date():
         REGISTRY["daily-resting-heart-rate"].filter_for(
             "9999-12-31T00:00:00Z", "9999-12-31T23:59:59Z"
         )
+
+
+@pytest.mark.parametrize("intervals", [[], [{}], [None, 42, {}], [{"otherInterval": {}}]])
+async def test_absent_physical_intervals_keep_default_window(receiver, intervals):
+    item = notification()
+    item["data"]["intervals"] = intervals
+    assert (await receiver.post(json.dumps(item).encode())).status_code == 204
+    await receiver.finish()
+    assert receiver.incremental.calls == [("steps", None, None)]
+
+
+def test_valid_physical_intervals_keep_covering_range():
+    intervals = [notification(minute=m)["data"]["intervals"][0] for m in (3, 0)] + [{}]
+    assert notification_windows(REGISTRY["steps"], intervals) == [
+        (datetime(2026, 8, 17, 10, tzinfo=UTC), datetime(2026, 8, 17, 10, 4, tzinfo=UTC))
+    ]

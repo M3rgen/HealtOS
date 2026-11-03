@@ -59,7 +59,10 @@ def webhook_status() -> None:
 
 
 def webhook_replay_pending() -> None:
-    """Retry durable pending webhook elements without asking Google to resend them."""
+    """Retry stored pending and failed webhook elements without a Google resend.
+
+    Reuse verified archived batches; completed elements are not fetched again.
+    """
 
     runtime = context.runtime()
 

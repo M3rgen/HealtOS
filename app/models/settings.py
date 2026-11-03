@@ -14,3 +14,18 @@ class AppearanceSettings(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     selection: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class DisplayPreferences(TimestampMixin, Base):
+    """Single row (id=1) holding the display preferences (time zone, model rotation).
+
+    `schema_version` says which shape `preferences` has, so a later shape can read or
+    upgrade an older row instead of misreading it.
+    """
+
+    __tablename__ = "display_preferences"
+    __table_args__ = (CheckConstraint("id = 1", name="singleton"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    preferences: Mapped[dict] = mapped_column(JSON, nullable=False)

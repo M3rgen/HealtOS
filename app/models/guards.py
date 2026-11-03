@@ -1,8 +1,8 @@
 """Every protective trigger of the archive and its evidence tables.
 
 Each of those revisions defines its own triggers in its model module (raw_versions, identity_guards,
-manual_flags, retrieval, webhook_status); this joins them for ``health-mirror verify``
-(app/services/raw_history_verification.py).
+manual_flags, retrieval, webhook_status, raw_rejections); this joins them for
+``health-mirror verify`` (app/services/raw_history_verification.py).
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from app.models import (
     derived_invalidation,
     identity_guards,
     manual_flags,
+    raw_rejections,
     raw_versions,
     retrieval,
     webhook_status,
@@ -23,6 +24,7 @@ _MODULES = (
     retrieval,
     derived_invalidation,
     webhook_status,
+    raw_rejections,
 )
 
 # trigger -> (table, CREATE TRIGGER statement), including 0020's daily type filters.

@@ -310,7 +310,7 @@ def check_codex_bridge_binding() -> list[str]:
     return errors
 
 
-DOCUMENTATION_GLOBS = ("README.md", "AGENTS.md", "CONTRIBUTING.md", "docs/**/*.md")
+DOCUMENTATION_GLOBS = ("*.md", "docs/**/*.md")
 FENCED_BLOCK = re.compile(r"^ {0,3}(`{3,}|~{3,}).*?^ {0,3}\1[ \t]*$", re.MULTILINE | re.DOTALL)
 INLINE_CODE = re.compile(r"(`+)(?!`).+?(?<!`)\1", re.DOTALL)
 # `](target)` covers links, images and badges nested in links; an optional title follows.

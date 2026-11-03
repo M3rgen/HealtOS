@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 
 from pythonjsonlogger.json import JsonFormatter
@@ -28,6 +29,31 @@ def configure_logging(level: str = "INFO") -> None:
     # resumable pagination tokens, so keep transport logging to warnings/errors.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+MAX_CHAIN = 6
+_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
+
+
+def error_diagnostics(exc: BaseException) -> dict[str, str]:
+    """Value-free failure diagnostics for log records: class names and SQLSTATE only.
+
+    Exception text, arguments and SQL parameters can carry raw health records, so only
+    the cause/context chain's class names and the database's five-character code leave.
+    """
+    names: list[str] = []
+    current: BaseException | None = exc
+    while current is not None and len(names) < MAX_CHAIN:
+        names.append(type(current).__name__)
+        # MAX_CHAIN also bounds a cyclic chain.
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    result = {"error_chain": " < ".join(names)}
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if isinstance(sqlstate, str) and _SQLSTATE.fullmatch(sqlstate):
+        result["sqlstate"] = sqlstate
+    return result
 
 
 def event(logger: logging.Logger, name: str, **fields: object) -> None:

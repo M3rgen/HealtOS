@@ -2,6 +2,7 @@
 const assert = require('node:assert/strict');
 const { BASE, launch, run, until } = require('./lib.cjs');
 const { mock, tabTo, active, visibleFocus, contained, scrollKey } = require('./helpers/accessibility.cjs');
+const fx = require('../../frontend/preview/fixtures.cjs');
 
 const sizes = [{width: 1280, height: 800}, {width: 390, height: 844}, {width: 360, height: 640}];
 const press = async (page, selector, key = 'Enter', reverse = false) => {
@@ -357,8 +358,10 @@ run(async () => {
       const errors = []; page.on('pageerror', error => errors.push(error.message));
       const state = await mock(page);
       // Before load: main.js starts its 60 s dashboard poll during start-up, and only timers
-      // created after install() follow the fake clock.
-      await page.clock.install();
+      // created after install() follow the fake clock. Start at the fixtures' NOW: the monthly
+      // history shows only the days elapsed so far, so a real early-month date leaves too few
+      // rows for its End-key scroll check.
+      await page.clock.install({time: new Date(fx.NOW)});
       await page.goto(BASE);
       await page.waitForFunction(() => document.querySelectorAll('#history-rows tr').length === 7 && 'appearanceReady' in document.documentElement.dataset);
       // DOM order follows the visible menu, in both directions.

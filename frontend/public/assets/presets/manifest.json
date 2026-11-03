@@ -18,7 +18,7 @@
     },
     {
       "id": "healthos",
-      "label": "HealthOS (klasik)",
+      "label": "Klasik",
       "builtin": true,
       "files": {
         "mark": "/assets/brand/healthos-mark-amber.svg",
@@ -102,7 +102,7 @@
   "umay": [
     {
       "id": "umay",
-      "label": "Umay",
+      "label": "Portre",
       "builtin": true,
       "files": {
         "src512": "/assets/umay/umay.webp",
@@ -114,7 +114,7 @@
     },
     {
       "id": "umay-alt",
-      "label": "Umay · afiş",
+      "label": "Afiş",
       "builtin": true,
       "files": {
         "src512": "/assets/umay/umay-alt.webp",
@@ -123,7 +123,7 @@
     },
     {
       "id": "flat",
-      "label": "Umay · sade amblem",
+      "label": "Sade amblem",
       "builtin": true,
       "files": {
         "src512": "/assets/presets/umay/flat/umay.webp",
@@ -135,7 +135,7 @@
     },
     {
       "id": "engraved",
-      "label": "Umay · gravür madalyon",
+      "label": "Gravür madalyon",
       "builtin": true,
       "files": {
         "src512": "/assets/presets/umay/engraved/umay.webp",

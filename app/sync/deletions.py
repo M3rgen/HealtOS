@@ -262,7 +262,7 @@ def deletion_scope(
     """
     if not spec.time_filtered or spec.access_method != AccessMethod.list:
         return None
-    start, end = query_time(start), query_time(end)
+    start, end = query_time(start), query_time(end, upper=True)
     if spec.kind == RecordKind.daily:
         start_date = date.fromisoformat(start.isoformat()[:10])
         end_date = date.fromisoformat(end.isoformat()[:10])

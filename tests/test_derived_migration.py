@@ -77,6 +77,7 @@ async def test_upgrade_and_downgrade_preserve_all_existing_triggers(tmp_path, mo
         command.upgrade(config, "20261025_0019")
         from derived_records import T0, manual, raw_mutation, snapshot, steps, store
 
+        from app.models import raw_rejections
         from app.models.state import WebhookEvent
         from app.models.webhook_status import WebhookStatusEvent
         from app.services.manual_flags import record_flag
@@ -98,8 +99,16 @@ async def test_upgrade_and_downgrade_preserve_all_existing_triggers(tmp_path, mo
                 )
             )
             session.add(WebhookStatusEvent(reason="signature_valid", occurred_at=T0))
+        # Tables of later migrations (20261102_0022, 0023) do not exist at the 0019 target.
+        newer = {"display_preferences", *raw_rejections.TABLES}
+        # 0023's guards are expected at head only; verify names them missing at 0019.
+        later = {name: sql for name, (_, sql) in raw_rejections.SQLITE_TRIGGER_SQL.items()}
+        at_0019 = [
+            f"protective trigger missing: {table}.{name}"
+            for name, (table, _) in raw_rejections.SQLITE_TRIGGER_SQL.items()
+        ]
         async with sessions() as session:
-            archive = await snapshot(session)
+            archive = await snapshot(session, newer)
         # Sorted: 0021 rebuilds both webhook tables on SQLite, moving their triggers last.
         triggers = text("SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name")
         with engine.connect() as connection:
@@ -110,10 +119,17 @@ async def test_upgrade_and_downgrade_preserve_all_existing_triggers(tmp_path, mo
             else:
                 command.upgrade(config, revision)
             async with sessions() as session:
-                assert await snapshot(session) == archive
-                assert await verify_guards(session) == []
+                assert await snapshot(session, newer) == archive
+                assert await verify_guards(session) == (
+                    at_0019 if revision == "20261025_0019" else []
+                )
             with engine.connect() as connection:
-                assert connection.execute(triggers).all() == legacy
+                stored = connection.execute(triggers).all()
+            if revision == "head":
+                assert sorted(stored) == sorted([*legacy, *later.items()])
+                assert [row for row in stored if row[0] not in later] == legacy
+            else:
+                assert stored == legacy
         command.check(config)
         command.downgrade(config, "20261025_0017")
         with engine.connect() as connection:

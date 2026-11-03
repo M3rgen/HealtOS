@@ -93,7 +93,7 @@ def create_app() -> FastAPI:
         yield
         event(logger, "APPLICATION_STOPPING")
         if scheduler:
-            scheduler.shutdown(wait=False)
+            await scheduler.shutdown_and_wait()
             runtime.scheduler = None
         await runtime.shutdown()
 

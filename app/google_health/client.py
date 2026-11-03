@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import random
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from app.core.config import Settings
-from app.core.logging import event
+from app.core.logging import error_diagnostics, event
 from app.core.provenance import current_context_id, current_source, provenance
 from app.google_health import strict_json
 from app.google_health.capture import CapturedResponse, ResponseArchive, kept_headers, safe_query
@@ -33,6 +34,7 @@ from app.google_health.response_page import (  # noqa: F401 - re-exported error 
     InvalidPaginationResponseError,
     InvalidResponseError,
     NonStandardResponseConstantError,
+    UnstorablePaginationResponseError,
     page_values,
 )
 
@@ -78,6 +80,9 @@ class Page:
     # is the response the data points were read from. Stored with the records
     # (app.services.storage.store_page), in the same transaction.
     responses: tuple[CapturedResponse, ...] = ()
+    # Set by iter_pages when next_page_token repeats a continuation of this attempt.
+    # The records are stored; the token is never committed as a checkpoint.
+    cyclic: bool = False
 
 
 class GoogleHealthClient:
@@ -135,7 +140,7 @@ class GoogleHealthClient:
             )
         else:
             params: dict[str, str | int] = {"pageSize": effective_page_size}
-            if filter_expression := spec.filter_for(_iso(start), _iso(end)):
+            if filter_expression := spec.filter_for(_iso(start), _iso(end, upper=True)):
                 params["filter"] = filter_expression
             if spec.access_method == AccessMethod.reconcile:
                 params["dataSourceFamily"] = "users/me/dataSourceFamilies/all-sources"
@@ -219,11 +224,23 @@ class GoogleHealthClient:
         assert self.archive is not None
         try:
             await self.archive.keep(responses)
-        except Exception:
-            logger.exception(
-                "Google Health responses could not be archived",
-                extra={"event": "RESPONSE_ARCHIVE_FAILED", "count": len(responses)},
-            )
+        except Exception as exc:
+            # Database errors can include raw response bodies and request parameters.
+            # Keep the exception, traceback and cause chain out of the LogRecord.
+            error_type = type(exc).__name__
+            diagnostics = error_diagnostics(exc)
+        else:
+            return
+        # Leave the handler before logging: only the detached class name is needed.
+        logger.error(
+            "Google Health responses could not be archived",
+            extra={
+                "event": "RESPONSE_ARCHIVE_FAILED",
+                "count": len(responses),
+                "error_type": error_type,
+                **diagnostics,
+            },
+        )
 
     async def _request(
         self,
@@ -523,18 +540,36 @@ def _success_payload(response: httpx.Response, body: bytes) -> dict:
 
 
 def _has_error_code(body: bytes, expected: str) -> bool:
+    """Require the code in a supported Google error-envelope field.
+
+    A positive match permits discarding a committed continuation, so unrelated
+    fields, partial-word message fragments and unknown envelope shapes cannot
+    count as evidence. Accepted: the code as a whole word of ``error.message``,
+    ``details[].reason`` (google.rpc.ErrorInfo) or
+    ``details[].fieldViolations[].reason`` (google.rpc.BadRequest). Keep the
+    supported paths shallow: arbitrary JSON nesting must never make
+    classification recurse, even when the parser accepts the body.
+    """
     try:
-        payload: object = strict_json.loads_object(body, allow_error=True)
+        payload = strict_json.loads_object(body, allow_error=True)
     except strict_json.StrictJsonError:
+        # Ambiguous, malformed or excessively deep JSON stays an ordinary HTTP
+        # failure. The caller has already captured the original response bytes.
         return False
-
-    def contains(value: object) -> bool:
-        if isinstance(value, str):
-            return value == expected or expected in value
-        if isinstance(value, dict):
-            return any(contains(item) for item in value.values())
-        if isinstance(value, list):
-            return any(contains(item) for item in value)
+    error = payload.get("error")
+    if not isinstance(error, dict):
         return False
-
-    return contains(payload)
+    message = error.get("message")
+    if isinstance(message, str) and re.search(rf"\b{re.escape(expected)}\b", message):
+        return True
+    details = error.get("details")
+    if not isinstance(details, list):
+        return False
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        violations = detail.get("fieldViolations")
+        items = [detail, *(violations if isinstance(violations, list) else [])]
+        if any(isinstance(item, dict) and item.get("reason") == expected for item in items):
+            return True
+    return False

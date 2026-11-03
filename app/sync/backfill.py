@@ -272,12 +272,13 @@ class BackfillService:
                                 session, spec, page, source="backfill", fetch_started=run_started
                             )
                             job = await session.get(BackfillJob, job_id)
-                            job.page_token = page.next_page_token
+                            if not page.cyclic:  # A repeated token is never a resume point.
+                                job.page_token = page.next_page_token
                             job.records_downloaded += len(page.data_points)
                             await receipt.page(session, page)
                         receipt.committed(page)
                     except BaseException as failure:
-                        receipt.unstored = page
+                        receipt.received = page
                         # Also on cancellation: what Google sent is kept.
                         await self.client.keep_after(page.responses, failure)
                         raise

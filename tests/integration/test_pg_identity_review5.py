@@ -7,11 +7,13 @@ import asyncio
 import threading
 import time
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 from alembic import command
 from identity_records import HEART, T0, fitbit, heart, legacy, store
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
 
 from app.parsers.identity import source_fingerprint
 from app.services.identity import verify_identities, verify_views
@@ -19,6 +21,38 @@ from app.services.identity_backfill import identity_backfill
 from app.services.identity_decisions import decide_sources
 
 HOUR = timedelta(hours=1)
+IDENTITY_REVISION = "20261021_0012"
+BUILD_DELETED_INDEX = (
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_raw_health_data_source_deleted "
+    "ON raw_health_data (data_type, google_data_point_id) WHERE source_deleted_at IS NOT NULL"
+)
+INSERT_RAW = text(
+    "INSERT INTO raw_health_data (id, google_data_point_id, data_type, "
+    "raw_json, payload_hash, first_seen_at, last_seen_at, "
+    "is_quarantined, created_at, updated_at) VALUES (gen_random_uuid(), "
+    "gen_random_uuid()::text, 'steps', '{}', 'x', now(), now(), false, now(), now())"
+)
+
+
+def _wait_until(condition, description: str) -> None:
+    # A deadlock guard, not an assertion about the speed of a migration or writer.
+    deadline = time.monotonic() + 60
+    while not condition():
+        assert time.monotonic() < deadline, f"Timed out waiting for {description}"
+        time.sleep(0.05)
+
+
+def _build_waits_for(engine, builder: int, writer: int) -> bool:
+    with engine.connect() as connection:
+        return connection.scalar(
+            text(
+                "SELECT :writer = ANY(pg_blocking_pids(:builder)) AND EXISTS ("
+                "SELECT 1 FROM pg_locks WHERE pid = :builder "
+                "AND relation = 'raw_health_data'::regclass "
+                "AND mode = 'ShareUpdateExclusiveLock' AND granted)"
+            ),
+            {"builder": builder, "writer": writer},
+        )
 
 
 async def _verify_notes(database_url: str) -> list[str]:
@@ -54,63 +88,87 @@ def test_the_deleted_index_is_built_concurrently_and_never_blocks_a_writer(
     lock: at millions of rows a writer waited. It is built CONCURRENTLY first, outside the
     transaction: a writer inserting meanwhile is not blocked; next to a snapshot held as long
     as a dump's (REPEATABLE READ) it is not started (nothing invalid is left behind), the
-    upgrade goes on, verify names the index and the statement builds it later."""
+    upgrade goes on, verify names the index and the statement builds it later.
+
+    Exercise 0012 alone: later migrations may deliberately need a dump-blocked lock.
+    Start the writer after the busy-session check, then observe the concurrent build
+    waiting for that transaction. A second insert must commit while it still waits.
+    """
     command.upgrade(alembic_config, "20261020_0011")
     engine = create_engine(_sync_url(database_url))
     try:
-        dump = engine.connect().execution_options(isolation_level="REPEATABLE READ")
-        dump.execute(text("SELECT count(*) FROM raw_health_data"))  # holds its snapshot
-        time.sleep(5.5)  # open for a while, like a dump
         alembic_config.cmd_opts = Namespace(x=["lock-timeout=1s"])
-        started = time.monotonic()
-        command.upgrade(alembic_config, "head")
-        assert time.monotonic() - started < 20
-        dump.rollback()
-        dump.close()
-        assert _index_valid(engine) is None
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with engine.connect().execution_options(isolation_level="REPEATABLE READ") as dump:
+                dump.execute(text("SELECT count(*) FROM raw_health_data"))
+                pid = dump.scalar(text("SELECT pg_backend_pid()"))
+
+                def snapshot_visible():
+                    with engine.connect() as connection:
+                        return connection.scalar(
+                            text(
+                                "SELECT backend_xmin IS NOT NULL FROM pg_stat_activity "
+                                "WHERE pid = :pid"
+                            ),
+                            {"pid": pid},
+                        )
+
+                _wait_until(snapshot_visible, "the dump snapshot")
+                worker.submit(command.upgrade, alembic_config, IDENTITY_REVISION).result(timeout=60)
+                # Check before closing the dump: the upgrade skipped the build without
+                # waiting for the snapshot to be released, and left no invalid index.
+                assert _index_valid(engine) is None
         notes = asyncio.run(_verify_notes(database_url))
         assert any("ix_raw_health_data_source_deleted is" in note for note in notes)
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-            connection.execute(
-                text(
-                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_raw_health_data_source_deleted "
-                    "ON raw_health_data (data_type, google_data_point_id) "
-                    "WHERE source_deleted_at IS NOT NULL"
-                )
-            )
-        assert _index_valid(engine) is True
+            connection.execute(text(BUILD_DELETED_INDEX))
+        _wait_until(lambda: _index_valid(engine) is True, "the manually built valid index")
         command.downgrade(alembic_config, "20261020_0011")
-        # Without a dump, and with a writer inserting all along: built, valid, writer unblocked.
-        stop = threading.Event()
-        inserted: list[float] = []  # seconds each insert took
+        ready, release = threading.Event(), threading.Event()
+        builder_pids = []
 
-        def write() -> None:
-            with engine.connect() as connection:
-                while not stop.is_set():
-                    begun = time.monotonic()
-                    connection.execute(
-                        text(
-                            "INSERT INTO raw_health_data (id, google_data_point_id, data_type, "
-                            "raw_json, payload_hash, first_seen_at, last_seen_at, "
-                            "is_quarantined, created_at, updated_at) VALUES (gen_random_uuid(), "
-                            "gen_random_uuid()::text, 'steps', '{}', 'x', now(), now(), false, "
-                            "now(), now())"
-                        )
-                    )
-                    connection.commit()
-                    inserted.append(time.monotonic() - begun)
-                    time.sleep(0.01)
+        def before_build(connection, cursor, statement, parameters, context, executemany):
+            if statement == BUILD_DELETED_INDEX:
+                builder_pids.append(connection.scalar(text("SELECT pg_backend_pid()")))
+                ready.set()
+                assert release.wait(60), "Writer did not reach the concurrent build"
 
-        writer = threading.Thread(target=write)
-        writer.start()
+        # Alembic creates its own engine. Observe its real statement, after the safety
+        # check, without replacing any migration SQL or its busy-session decision.
+        event.listen(Engine, "before_cursor_execute", before_build)
         try:
             alembic_config.cmd_opts = None
-            command.upgrade(alembic_config, "head")
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                upgrade = worker.submit(command.upgrade, alembic_config, IDENTITY_REVISION)
+                try:
+                    assert ready.wait(60), "Migration did not start the concurrent index"
+                    with engine.connect() as writer:
+                        writer.execute(text("SET LOCAL lock_timeout = '60s'"))
+                        writer_pid = writer.scalar(text("SELECT pg_backend_pid()"))
+                        writer.execute(INSERT_RAW)
+                        release.set()
+                        _wait_until(
+                            lambda: _build_waits_for(engine, builder_pids[0], writer_pid),
+                            "the concurrent build to wait for the writer",
+                        )
+                        # The builder holds its table lock now. It must allow another
+                        # insert, and cannot finish until this writer commits.
+                        assert not upgrade.done()
+                        writer.execute(INSERT_RAW)
+                        writer.commit()
+                    upgrade.result(timeout=60)
+                    _wait_until(lambda: _index_valid(engine) is True, "the migrated valid index")
+                    with engine.connect() as connection:
+                        assert connection.scalar(text("SELECT count(*) FROM raw_health_data")) == 2
+                finally:
+                    release.set()
+                    if builder_pids and not upgrade.done():
+                        with engine.connect() as connection:
+                            connection.execute(
+                                text("SELECT pg_cancel_backend(:pid)"), {"pid": builder_pids[0]}
+                            )
         finally:
-            stop.set()
-            writer.join()
-        assert _index_valid(engine) is True
-        assert inserted and max(inserted) < 5
+            event.remove(Engine, "before_cursor_execute", before_build)
     finally:
         alembic_config.cmd_opts = None
         engine.dispose()

@@ -21,9 +21,11 @@ from app.google_health.data_types import (
     query_time,
 )
 from app.google_health.pagination import PaginationPaused
+from app.models.raw_rejections import RetrievalEventRejection
 from app.models.retrieval import RetrievalCheckpoint, RetrievalEvent, RetrievalReceipt
 from app.models.state import BackfillJob, SyncState, fetch_round_start
 from app.parsers.common import parse_date, parse_datetime, payload_for, temporal
+from app.services.raw_rejections import rejected_count
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +42,8 @@ def query_scope(spec: DataTypeSpec, start: datetime, end: datetime):
     if spec.access_method == AccessMethod.rollup:
         start, end = _minute_aligned_range(start, end)
         return query_time(start), query_time(end), None, "rollup_start"
-    expression = spec.filter_for(query_iso(start), query_iso(end))
-    start, end = query_time(start), query_time(end)
+    expression = spec.filter_for(query_iso(start), query_iso(end, upper=True))
+    start, end = query_time(start), query_time(end, upper=True)
     if spec.kind == RecordKind.daily:
         first, stop = start.date(), end.date()
         if stop <= first or end.time() != time.min:
@@ -98,7 +100,9 @@ class ReceiptWriter:
         self.lane, self.owner = lane, owner
         self.token = token_hash(token)
         self.id = uuid.uuid4()
-        self.unstored: Page | None = None
+        # Received but not proven by a page event: a page whose store failed, or a
+        # cyclic page whose records were stored without extending the chain.
+        self.received: Page | None = None
 
     async def begin(self, session=None, *, started_at: datetime | None = None) -> None:
         if session is None:
@@ -154,7 +158,23 @@ class ReceiptWriter:
         session.add(event)
         return event
 
+    @staticmethod
+    async def count_rejected(session, event: RetrievalEvent, page: Page | None) -> None:
+        """Rejected records stay in returned_count/returned_times (Google returned them)
+        and never count as unplaced; their number is kept beside the event."""
+        count = rejected_count(page.data_points) if page else 0
+        if count:
+            if event.id is None:
+                await session.flush()
+            session.add(RetrievalEventRejection(event_id=event.id, rejected_count=count))
+
     async def page(self, session, page: Page) -> None:
+        if page.cyclic:
+            # A repeated continuation must not become a chain link or resume pointer:
+            # the checkpoint keeps the previous page, so a resume can still prove the
+            # window. The failure outcome reports what this response returned.
+            self.received = page
+            return
         times, missing = returned_times(self.spec, page)
         next_token = token_hash(page.next_page_token)
         event = self.event(
@@ -170,6 +190,7 @@ class ReceiptWriter:
         # Flush also locks/writes SyncState or BackfillJob before the pointer, so
         # concurrent page transactions leave the job token and pointer consistent.
         await session.flush()
+        await self.count_rejected(session, event, page)
         from app.services.storage import dialect_insert
 
         statement = dialect_insert(session, RetrievalCheckpoint.__table__)
@@ -183,7 +204,8 @@ class ReceiptWriter:
         )
 
     def committed(self, page: Page) -> None:
-        self.token = token_hash(page.next_page_token)
+        if not page.cyclic:
+            self.token = token_hash(page.next_page_token)
 
     async def reset(self) -> datetime:
         """Commit the new first-page boundary, checkpoint and receipt together.
@@ -224,18 +246,19 @@ class ReceiptWriter:
             return
 
         async def write():
-            times, missing = returned_times(self.spec, self.unstored) if self.unstored else ([], 0)
+            times, missing = returned_times(self.spec, self.received) if self.received else ([], 0)
             async with self.sessions.begin() as session:
-                self.event(
+                outcome = self.event(
                     session,
                     "cancelled" if isinstance(failure, asyncio.CancelledError) else "failed",
                     error_type=type(failure).__name__[:100],
                     # A failed store still received these records. Only `page` events
                     # prove persistence; readers never use failure counts as empty proof.
-                    returned_count=len(self.unstored.data_points) if self.unstored else 0,
+                    returned_count=len(self.received.data_points) if self.received else 0,
                     returned_times=times,
                     unplaced_count=missing,
                 )
+                await self.count_rejected(session, outcome, self.received)
 
         task = asyncio.create_task(write())
         try:

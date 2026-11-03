@@ -1,7 +1,6 @@
 """Validate notification metadata and query coverage without changing raw values."""
 
-import math
-import re
+import json
 from datetime import datetime, timedelta
 
 from sqlalchemy import String
@@ -11,9 +10,11 @@ from app.google_health.data_types import (
     AccessMethod,
     DataTypeSpec,
     QueryWindowError,
-    RecordKind,
     query_iso,
 )
+from app.google_health.jsonb import UNPARSED_BODY as UNPARSED_BODY
+from app.google_health.jsonb import jsonb_storable as jsonb_storable
+from app.google_health.jsonb import storable_text as storable_text
 from app.models.state import WebhookEvent, WebhookNotification
 from app.parsers.common import parse_datetime
 
@@ -22,16 +23,47 @@ INDEX_FIELDS = {
     "healthUserId": "health_user_id",
     "operation": "operation",
 }
-# PostgreSQL text and jsonb hold neither U+0000 nor an unpaired surrogate.
-_UNSTORABLE_TEXT = re.compile("[\x00\ud800-\udfff]")
 UNREPRESENTABLE = (
     "notification element cannot be stored as jsonb (U+0000, unpaired surrogate or "
     "non-finite number); it is kept only in the signed batch raw_body"
 )
+UNPARSEABLE = (
+    "notification body could not be parsed as JSON; it is kept only in the signed batch raw_body"
+)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject ambiguous objects before any notification metadata can be projected.
+
+    The JSON decoder calls this for each object with escapes already decoded.
+    Scope the seen keys to that object: siblings in a batch may share keys.
+    Equal values still discard signed evidence and must also be rejected.
+    """
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def parse_webhook_body(raw: bytes) -> object:
+    """Share the delivery and body-only replay decision, including ambiguous JSON.
+
+    Reject the entire body when any object repeats a key; element boundaries and
+    metadata must never come from a last-value-wins interpretation. The caller
+    verifies the signature before archiving the original bytes as UNPARSED_BODY.
+    """
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_object)
+    except (ValueError, RecursionError, OverflowError, MemoryError):
+        # Includes bad encodings, integer limits and excessive nesting. Do not retain
+        # parser exception text: it may contain private values from the signed body.
+        return UNPARSED_BODY
 
 
 class NotificationWindowError(ValueError):
-    """A notification's full query coverage is outside the supported date range."""
+    """A notification's full query coverage is invalid or unrepresentable."""
 
 
 def index_limit(field: str) -> int:
@@ -43,35 +75,6 @@ def index_limit(field: str) -> int:
         assert isinstance(column_type, String) and column_type.length is not None
         limits.append(column_type.length)
     return min(limits)
-
-
-def storable_text(value: str) -> bool:
-    return _UNSTORABLE_TEXT.search(value) is None
-
-
-def jsonb_storable(value: object) -> bool:
-    """Whether jsonb can hold a parsed value; json.loads also accepts NaN and 1e400.
-
-    Iterative so it sets no depth limit of its own: json.loads and canonical_json (C, one
-    recursion level per nesting) already accept depths where a recursive Python walk, at
-    two frames per level, raises RecursionError and would fail the ingest.
-    """
-    pending = [value]
-    while pending:
-        item = pending.pop()
-        if isinstance(item, str):
-            if not storable_text(item):
-                return False
-        elif isinstance(item, float):
-            if not math.isfinite(item):
-                return False
-        elif isinstance(item, dict):
-            if not all(storable_text(key) for key in item):
-                return False
-            pending.extend(item.values())
-        elif isinstance(item, list):
-            pending.extend(item)
-    return True
 
 
 def notification_data(item: object) -> dict | None:
@@ -136,7 +139,8 @@ def notification_windows(
 
     Never clamp a covering window or use the default window when date arithmetic
     fails: that would acknowledge a notification without fetching its full coverage.
-    Missing physical intervals retain the existing incremental-window behavior.
+    Missing physical intervals retain the existing incremental-window behavior;
+    explicitly supplied physical intervals must all be valid, even alongside valid ones.
     """
     start, end = _physical_range(intervals)
     if start is None or end is None:
@@ -153,10 +157,10 @@ def notification_windows(
             if spec.access_method == AccessMethod.rollup:
                 # Rollups also widen the upper bound to a complete minute.
                 _minute_aligned_range(cursor, window_end)
-            if spec.kind == RecordKind.daily:
-                # Validate the civil-date ceiling used by the actual Google filter,
-                # including its exclusive upper date, before starting any window.
-                spec.filter_for(query_iso(cursor), query_iso(window_end))
+            else:
+                # Validate second and civil-date ceilings before any fetch, including
+                # a final subsecond bound whose next second is unrepresentable.
+                spec.filter_for(query_iso(cursor), query_iso(window_end, upper=True))
             windows.append((cursor, window_end))
             cursor = window_end
     except (OverflowError, QueryWindowError) as exc:
@@ -171,13 +175,28 @@ def _physical_range(intervals: object) -> tuple[datetime | None, datetime | None
         return None, None
     ranges = []
     for item in intervals:
-        physical = item.get("physicalTimeInterval", {}) if isinstance(item, dict) else {}
-        if not isinstance(physical, dict):
+        # Absence alone permits the default window. A supplied null, empty object
+        # or malformed bound must never turn into a partial or default fetch.
+        if not isinstance(item, dict) or "physicalTimeInterval" not in item:
             continue
-        start = parse_datetime(physical.get("startTime"))
-        end = parse_datetime(physical.get("endTime"))
-        if start and end and start < end:
-            ranges.append((start, end))
+        ranges.append(_physical_interval(item["physicalTimeInterval"]))
     if not ranges:
         return None, None
     return min(start for start, _ in ranges), max(end for _, end in ranges)
+
+
+def _physical_interval(physical: object) -> tuple[datetime, datetime]:
+    """Validate a supplied interval without including any raw values in the error.
+
+    parse_datetime returns None for missing, non-string and malformed bounds,
+    including local timestamps whose UTC conversion overflows. Keep that parser's
+    contract; only notification coverage requires both bounds and strict ordering.
+    """
+    if isinstance(physical, dict):
+        start = parse_datetime(physical.get("startTime"))
+        end = parse_datetime(physical.get("endTime"))
+        if start is not None and end is not None and start < end:
+            return start, end
+    raise NotificationWindowError(
+        "notification physicalTimeInterval must have valid startTime before endTime"
+    )

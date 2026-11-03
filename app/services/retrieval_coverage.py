@@ -1,8 +1,11 @@
 """Read bounded daily retrieval evidence, separately from present eligible values.
 
-This endpoint does not change the schema-1 Umay coverage card. Unknown history stays
-unknown. A completed attempt must have a first-page root, a contiguous token chain,
-a durable last page and an appended completion outcome. Mutable job tables are not read.
+Unknown history stays unknown. A completed attempt must have a first-page root, a
+contiguous token chain, a durable last page and an appended completion outcome. Mutable
+job tables are not read. A day that no attempt touched is ``not_attempted`` only when it
+begins after the first receipt was written (``receipt_horizon``): from then on every
+Google read leaves a receipt, so the absence of one is evidence. Earlier days stay
+``unknown``.
 """
 
 from __future__ import annotations
@@ -17,7 +20,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
 from app.core.timeutil import as_utc
-from app.google_health.data_types import CIVIL_AFTER, CIVIL_BEFORE, DataTypeSpec, RecordKind
+from app.google_health.data_types import (
+    CIVIL_AFTER,
+    CIVIL_BEFORE,
+    WAKE_DATED_TYPES,
+    DataTypeSpec,
+    RecordKind,
+)
 from app.models.eligibility import raw_counted
 from app.models.identity import plan_each_query
 from app.models.retrieval import RetrievalEvent as Event
@@ -228,7 +237,26 @@ async def evidence(session: AsyncSession, name: str, window: Window):
     return result, times
 
 
-def daily_evidence(spec, day, window, attempts, times):
+async def receipt_horizon(session: AsyncSession) -> datetime | None:
+    """When retrieval evidence began: the earliest receipt of any type, or None."""
+    first = await session.scalar(select(func.min(Receipt.started_at)))
+    return as_utc(first) if first is not None else None
+
+
+def unattempted(day, window, horizon) -> str:
+    """The state of a closed day no attempt touched: ``not_attempted`` only when every
+    filter that could have reached it (the civil envelope included) lies after the
+    horizon; otherwise nothing proves it was never read."""
+    if horizon is None:
+        return "unknown"
+    earliest = min(
+        datetime.combine(day, time.min, window.zone).astimezone(UTC),
+        datetime.combine(day, time.min, UTC),
+    )
+    return "not_attempted" if earliest - CIVIL_BEFORE >= horizon else "unknown"
+
+
+def daily_evidence(spec, day, window, attempts, times, receipts_since=None):
     physical_start = datetime.combine(day, time.min, window.zone).astimezone(UTC)
     physical_stop = datetime.combine(day + timedelta(days=1), time.min, window.zone).astimezone(UTC)
     daily = spec.kind == RecordKind.daily
@@ -291,6 +319,8 @@ def daily_evidence(spec, day, window, attempts, times):
         reason = "civil_start_offset_envelope"
     if day >= window.today:
         return "incomplete" if attempted else "unknown", None, "open_day"
+    if not attempted:
+        return unattempted(day, window, receipts_since), None, reason
     if covers(ranges, wanted_left, wanted_right):
         if returned:
             return (
@@ -302,7 +332,7 @@ def daily_evidence(spec, day, window, attempts, times):
             return "completed_empty", 0, reason
         if ambiguous:
             return "unknown", None, "returned_dates_unknown"
-    return "incomplete" if attempted else "unknown", None, reason
+    return "incomplete", None, reason
 
 
 async def presence(session, spec, window):
@@ -311,7 +341,8 @@ async def presence(session, spec, window):
     if spec.kind == RecordKind.daily:
         lower = datetime.combine(window.first, time.min, UTC)
         upper = datetime.combine(window.end + timedelta(days=1), time.min, UTC)
-    column = Raw.source_end_time if spec.name == "sleep" else Raw.source_start_time
+    # Sleep and its summaries count on the local day the sleep ended (WAKE_DATED_TYPES).
+    column = Raw.source_end_time if spec.name in WAKE_DATED_TYPES else Raw.source_start_time
     condition = (Raw.data_type == spec.name, column >= lower, column < upper)
     metric = next((metric for metric in METRICS if metric.data_type == spec.name), None)
     model = NORMALIZED.get(metric.read) if metric else None
@@ -397,18 +428,20 @@ async def coverage_report(
     limit = min(limit, max(1, 62 // len(days)))
     selected = names[offset : offset + limit]
     types = []
-    missing = unknown = incomplete = 0
+    missing = unknown = incomplete = not_attempted = 0
+    horizon = await receipt_horizon(session)
     for name in selected:
         spec = specs[name]
         attempts, times = await evidence(session, name, window)
         values, sources, exclusions = await presence(session, spec, window)
         entries = []
         for day in days:
-            state, returned, reason = daily_evidence(spec, day, window, attempts, times)
+            state, returned, reason = daily_evidence(spec, day, window, attempts, times, horizon)
             closed = day < window.today
             missing += closed and spec.time_filtered and day not in values
             unknown += closed and state == "unknown"
             incomplete += closed and state == "incomplete"
+            not_attempted += closed and state == "not_attempted"
             entries.append(
                 {
                     "date": day.isoformat(),
@@ -443,11 +476,14 @@ async def coverage_report(
             "days_without_value": missing,
             "unknown_days": unknown,
             "incomplete_days": incomplete,
+            "not_attempted_days": not_attempted,
             "basis": "type_days_in_page",
         },
+        "receipts_since": horizon.isoformat() if horizon else None,
         "next_offset": offset + len(selected) if offset + len(selected) < len(names) else None,
         "note": "Değer varlığı çekim kanıtından ayrıdır. Kaynaklar birleştirilmez. "
-        "Fişsiz geçmiş bilinmiyor; bugün kapalı gün değildir. "
+        "Fişsiz geçmiş bilinmiyor; fişler başladıktan sonra hiç dokunulmayan gün "
+        "çekilmedi demektir. Bugün kapalı gün değildir. "
         "Dönen kayıtlar dışlananları da içerir; sayılar ölçüm sıklığı değildir.",
     }
     if (

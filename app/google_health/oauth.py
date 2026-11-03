@@ -243,7 +243,15 @@ class OAuthClient:
         # Missing/null fields keep the existing offline credential. All other JSON
         # types must be strings, including false/zero and empty containers; accepting
         # a candidate access token could hide an unusable refresh-token rotation.
-        if refresh_token is not None and not isinstance(refresh_token, str):
+        # Storage encodes strings as strict UTF-8. Inspect code points instead of
+        # encoding: UnicodeEncodeError would retain the private token even if its
+        # traceback were suppressed. JSON decoding already combines valid escaped
+        # surrogate pairs into a scalar; only remaining surrogate code points fail.
+        # Do not normalize opaque tokens or change missing/null/empty behavior.
+        if refresh_token is not None and (
+            not isinstance(refresh_token, str)
+            or any("\ud800" <= char <= "\udfff" for char in refresh_token)
+        ):
             raise OAuthError(
                 "OAuth response contained an invalid refresh token",
                 transient=False,

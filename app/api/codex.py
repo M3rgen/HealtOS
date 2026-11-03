@@ -15,6 +15,8 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
 from app.core.auth import request_authenticated
+from app.services.chat_context import ConversationWindow
+from app.services.chat_tools import HealthQueries, ToolCall, ToolResult
 from app.services.codex_chat import EFFORT, MODEL, CodexRPC, JsonObject
 from app.services.codex_health import read_health
 from app.services.health_transfer import HealthTransfer, describe_result, neutral_receipt
@@ -137,8 +139,10 @@ class ChatRelay:
         self.active = False
         self.cancel_requested = False
         self.turn_id: str | None = None
-        self.pending: dict[int, PendingAction] = {}
+        self.pending: dict[int, tuple[PendingAction, HealthTransfer | None]] = {}
         self.transfer: HealthTransfer | None = None
+        self.context = ConversationWindow()
+        self.tools = HealthQueries()
 
     async def publish_transfer(self) -> None:
         if self.transfer:
@@ -163,7 +167,7 @@ class ChatRelay:
         request_id = await self.rpc.request(
             "turn/interrupt", {"threadId": self.thread_id, "turnId": turn_id}
         )
-        self.pending[request_id] = "interrupt"
+        self.pending[request_id] = ("interrupt", self.transfer)
         self.cancel_requested = False
 
     async def interrupt_on_close(self) -> None:
@@ -190,6 +194,9 @@ class ChatRelay:
 
     async def cancel(self) -> None:
         self.cancel_requested = self.active
+        if self.active:
+            self.context.cancelled = True
+            self.tools.cancel()
         if self.active and self.turn_id:
             await self.interrupt(self.turn_id)
         if self.active:
@@ -209,6 +216,7 @@ class ChatRelay:
             return
         self.transfer = HealthTransfer()
         self.turn_id = None
+        self.context.begin(body.text)
         await self.publish_transfer()
         request_id = await self.rpc.request(
             "turn/start",
@@ -218,13 +226,14 @@ class ChatRelay:
                     {
                         "type": "text",
                         "text": turn_context(body.timezone) + body.text,
-                    }
+                    },
+                    {"type": "text", "text": self.context.render()},
                 ],
                 "model": MODEL,
                 "effort": EFFORT,
             },
         )
-        self.pending[request_id] = "start"
+        self.pending[request_id] = ("start", self.transfer)
         self.active = True
         self.cancel_requested = False
         await self.send("working", "Umay düşünüyor…")
@@ -244,10 +253,16 @@ class ChatRelay:
     async def on_response(self, message: JsonObject) -> None:
         """Reply to one of our own requests (turn/start or turn/interrupt)."""
         request_id: Any = message.get("id")  # an id we never issued simply matches nothing
-        action = self.pending.pop(request_id, None)
+        pending = self.pending.pop(request_id, None)
+        if pending is None or pending[1] is not self.transfer or not self.active:
+            return
+        action = pending[0]
         if "error" in message:
             if action == "start":
+                self.tools.cancel()
+                self.pending.clear()
                 self.active = False
+                self.context.finish("failed")
                 await self.finish_transfer("failed")
             await self.send("error", message["error"].get("message", "Umay isteği tamamlayamadı."))
         elif action == "start":
@@ -258,15 +273,42 @@ class ChatRelay:
 
     async def on_server_request(self, message: JsonObject, method: str, params: JsonObject) -> None:
         """Codex asks us to do something; only this thread's health tool is allowed."""
+        if not self.tools.claim(message["id"]):
+            return
         if (
             method != "item/tool/call"
             or params.get("threadId") != self.thread_id
             or not self.active
+            or self.context.cancelled
+            or self.transfer is None
+            or (params.get("turnId") and self.turn_id and params["turnId"] != self.turn_id)
+            or self.tools.full
         ):
             await self.rpc.reject(message)
             return
         await self.send("working", "Sağlık arşivi sorgulanıyor…")
-        data, success = await run_health_tool(params)
+        self.tools.start(ToolCall(message["id"], params, self.transfer), run_health_tool(params))
+
+    async def on_tool_result(self, task: asyncio.Task[ToolResult]) -> bool:
+        """Reap exactly once; invalidated queries never send or amend a receipt.
+
+        Returns whether a result reached the bridge, which counts as chat activity.
+        """
+        call = self.tools.tasks.pop(task)
+        current = call.valid and self.active and call.transfer is self.transfer
+        try:
+            data, success = task.result()
+        except asyncio.CancelledError:
+            return False
+        except Exception:
+            if current:
+                raise
+            return False
+        if not current:
+            return False
+        params = call.params
+        if params.get("turnId") and self.turn_id and params["turnId"] != self.turn_id:
+            return False
         serialized = json.dumps(data, ensure_ascii=False)
         try:
             receipt = describe_result(params.get("arguments"), json.loads(serialized), success)
@@ -278,7 +320,7 @@ class ChatRelay:
         try:
             await self.rpc.send(
                 {
-                    "id": message["id"],
+                    "id": call.request_id,
                     "result": {
                         "success": success,
                         "contentItems": [{"type": "inputText", "text": serialized}],
@@ -286,27 +328,38 @@ class ChatRelay:
                 }
             )
         except Exception as exc:
-            if self.transfer:
-                self.transfer.failed_sends += 1
+            call.transfer.failed_sends += 1
             await self.finish_transfer(
                 "disconnected" if isinstance(exc, ConnectionClosed) else "failed"
             )
             raise
-        if self.transfer:
-            self.transfer.calls.append(receipt)
-            await self.publish_transfer()
+        call.transfer.calls.append(receipt)
+        await self.publish_transfer()
+        return True
 
     async def on_notification(self, method: str, params: JsonObject) -> None:
+        if not self.active:
+            return
+        event_turn = params.get("turnId") or params.get("turn", {}).get("id")
+        if event_turn and self.turn_id and event_turn != self.turn_id:
+            return
         if method == "item/agentMessage/delta":
+            if params["delta"].strip():
+                self.context.received_response = True
             await self.websocket.send_json(
                 {"type": "delta", "id": params["itemId"], "text": params["delta"]}
             )
         elif method == "item/completed" and params.get("item", {}).get("type") == "agentMessage":
             item = params["item"]
+            if item["text"].strip():
+                self.context.received_response = True
             await self.websocket.send_json(
                 {"type": "message", "id": item["id"], "text": item["text"]}
             )
         elif method == "turn/completed":
+            self.tools.cancel()
+            self.pending.clear()
+            self.context.finish(params["turn"]["status"])
             self.active = False
             self.cancel_requested = False
             self.turn_id = None
@@ -332,37 +385,54 @@ async def relay(websocket: WebSocket, rpc: CodexRPC, thread_id: str) -> None:
         _read(websocket, rpc, "browser"): "browser",
         _read(websocket, rpc, "codex"): "codex",
     }
+    deadline = asyncio.get_running_loop().time() + chat.timeout
     try:
         while True:
             done, _ = await asyncio.wait(
-                readers, timeout=chat.timeout, return_when=asyncio.FIRST_COMPLETED
+                {*readers, *chat.tools.tasks},
+                timeout=max(0, deadline - asyncio.get_running_loop().time()),
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            if not done:
+            # A ready query result must not outlive the socket inactivity deadline.
+            if not done or asyncio.get_running_loop().time() >= deadline:
+                chat.tools.cancel()
                 await chat.finish_transfer("timed_out")
                 await chat.send(
                     "error",
                     "Umay yanıtı zaman aşımına uğradı. Sohbeti yeniden bağlayıp deneyebilirsin.",
                 )
                 return
-            for task in done:
+            # Socket control messages take precedence over query results ready in the
+            # same wait. Browser cancellation wins even if both sockets are readable.
+            for task in sorted(done & readers.keys(), key=lambda task: readers[task] != "browser"):
                 source = readers.pop(task)
-                message = task.result()
+                message: Any = task.result()
                 readers[_read(websocket, rpc, source)] = source
                 if source == "browser":
                     await chat.on_browser(message)
                 else:
                     await chat.on_codex(message)
+                deadline = asyncio.get_running_loop().time() + chat.timeout
+            for task in done & chat.tools.tasks.keys():
+                if await chat.on_tool_result(task):
+                    # A delivered result is activity: the model now works on its answer.
+                    deadline = asyncio.get_running_loop().time() + chat.timeout
     except (WebSocketDisconnect, ConnectionClosed):
+        chat.tools.cancel()
         await chat.finish_transfer("disconnected")
         raise
     except Exception:
+        chat.tools.cancel()
         await chat.finish_transfer("failed")
         raise
     finally:
+        chat.tools.cancel()
+        chat.context.clear()
         for task in readers:
             task.cancel()
         await asyncio.gather(*readers, return_exceptions=True)
         await chat.interrupt_on_close()
+        await chat.tools.close()
         await chat.finish_transfer("disconnected")
 
 

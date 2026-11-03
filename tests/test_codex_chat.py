@@ -13,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 from app.api import codex
 from app.models.state import RawHealthData
 from app.services import codex_chat, codex_health
+from app.services.chat_context import SUMMARY_LABEL
 from app.services.codex_chat import CodexRPC
 from app.services.codex_health import ArchiveQuery, read_health
 
@@ -218,7 +219,7 @@ async def test_relay_tools_streaming_followup_and_cancel(monkeypatch):
     monkeypatch.setattr(codex, "read_health", health)
     task = asyncio.create_task(codex.relay(browser, rpc, "site-thread"))
     try:
-        await browser.incoming.put({"text": "Uykumu incele"})
+        await browser.incoming.put({"text": "Uykumu incele. Kısa ve düz anlat."})
         start = await take(rpc.outgoing)
         assert start["params"]["threadId"] == "site-thread"
         assert (await take(browser.outgoing))["type"] == "working"
@@ -272,6 +273,10 @@ async def test_relay_tools_streaming_followup_and_cancel(monkeypatch):
         await browser.incoming.put({"text": "Peki geçen ay?"})
         followup = await take(rpc.outgoing)
         assert followup["params"]["threadId"] == "site-thread"
+        summary = json.loads(followup["params"]["input"][1]["text"].removeprefix(SUMMARY_LABEL))
+        assert summary["topic_hints"][0]["quote"] == "Uykumu incele."
+        assert summary["explicit_preferences"]["length"]["quote"] == "Kısa ve düz anlat."
+        assert summary["recent_requests"][0]["outcome"] == "response_received"
         await take(browser.outgoing)
         await browser.incoming.put({"type": "cancel"})
         assert (await take(browser.outgoing))["text"] == "Yanıt durduruluyor…"
@@ -378,7 +383,8 @@ async def test_relay_guards_input_tools_errors_and_closing_interrupt(monkeypatch
         third = await take(rpc.outgoing)
         await take(browser.outgoing)
         await rpc.incoming.put({"id": third["id"], "result": {"turn": {"id": "turn-3"}}})
-        await asyncio.sleep(0.05)
+        await rpc.incoming.put({"id": "barrier", "method": "unsupported", "params": {}})
+        assert (await take(rpc.outgoing))["id"] == "barrier"
     finally:
         await browser.incoming.put(WebSocketDisconnect())
         with pytest.raises(WebSocketDisconnect):
@@ -397,6 +403,25 @@ async def test_relay_times_out_an_idle_chat(monkeypatch):
     assert message["type"] == "error"
     assert "zaman aşımına" in message["text"]
     assert rpc.outgoing.empty()
+
+
+async def test_health_tool_propagates_cancellation_and_cleans_up(monkeypatch):
+    entered, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def health(_arguments):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(codex, "read_health", health)
+    task = asyncio.create_task(codex.run_health_tool({"tool": "health_archive", "arguments": {}}))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned.is_set()
 
 
 def test_unavailable_bridge_warns_once_per_outage(monkeypatch, caplog):

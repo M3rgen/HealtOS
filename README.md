@@ -48,14 +48,25 @@ Missing measurements stay missing; they never become zero. Google health-data en
 
 ## A closer look
 
-![HealtOS desktop dashboard with synthetic demonstration records](docs/media/dashboard-desktop.png)
+![HealtOS desktop dashboard with profile, data connection, daily cards and the last seven days, all synthetic](docs/media/dashboard-desktop.png)
 
-<sub>Actual application interface, captured with synthetic demonstration records. No personal health records are included. The anatomical model is a generic reference.</sub>
+<table>
+<tr>
+<td width="50%" valign="top"><img src="docs/media/umay-chat-desktop.png" alt="Umay chat bubble open over the dashboard, answering with a weekly summary and a small table" /><br /><sub><b>Umay.</b> The optional chat bubble answers from your archive and shows a per-turn receipt of what was sent.</sub></td>
+<td width="50%" valign="top"><img src="docs/media/metric-history.png" alt="Step history dialog with a 30-day bar chart, daily values and pagination" /><br /><sub><b>Metric history.</b> Steps, sleep and resting heart rate in 30-day pages; missing days stay empty.</sub></td>
+</tr>
+<tr>
+<td width="50%" valign="top"><img src="docs/media/date-picker.png" alt="Date picker open from the header, showing October 2026 with the current day selected" /><br /><sub><b>Date picker.</b> Open any earlier day from the header; the cards and the seven-day table follow it.</sub></td>
+<td width="50%" valign="top"><img src="docs/media/appearance-dialog.png" alt="Appearance dialog with logo and Umay presets, a live preview and an upload tile" /><br /><sub><b>Appearance.</b> Logo, Umay portrait and background presets, or your own image. Presets follow you across devices; uploads stay in the browser.</sub></td>
+</tr>
+</table>
+
+<sub>Actual application interface, captured with the synthetic preview harness in <code>frontend/preview</code> (desktop 1440×900, mobile 390×844). No personal health records are included. The anatomical model is a generic reference.</sub>
 
 <details>
 <summary>See the mobile layout</summary>
 
-<p align="center"><img src="docs/media/dashboard-mobile.png" alt="HealtOS mobile dashboard with synthetic records" width="390" /></p>
+<p align="center"><img src="docs/media/dashboard-mobile.png" alt="HealtOS mobile dashboard with synthetic records" width="360" />&nbsp;<img src="docs/media/umay-chat-mobile.png" alt="Umay chat on a phone with a synthetic weekly summary" width="360" /></p>
 
 </details>
 
@@ -206,6 +217,7 @@ docker compose exec app health-mirror verify
 | [Deployment](docs/DEPLOYMENT.md) | Installing on a Debian VM: Compose, SSH-tunnel access, webhook tunnel, backups, Umay bridge. |
 | [Runbook](docs/RUNBOOK.md) | Updates, migrations, key rotation, restore drills and diagnosing a quiet webhook. |
 | [Development](docs/DEVELOPMENT.md) | Native setup, validation commands and repository map. |
+| [Branches](docs/BRANCHES.md) | `dev`, `main`, extension branches and `live`: what is published and what is installed. |
 | [Umay interpretation](docs/UMAY_INTERPRETATION.md) | Baselines, analysis, sleep, intraday, session and relationship tools, and their budgets (Turkish). |
 | [Umay transfer receipts](docs/UMAY_TRANSFER.md) | What each chat turn sends to the model and how it is counted. |
 | [Performance budget](docs/PERFORMANCE_BUDGET.md) | Initial JS/CSS size ceilings enforced after `vite build` (Turkish). |

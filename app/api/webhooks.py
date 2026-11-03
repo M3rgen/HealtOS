@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hmac
-import json
 import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -14,6 +13,7 @@ from app.core.config import Settings
 from app.core.logging import event
 from app.google_health.webhook import WebhookVerificationError
 from app.services.runtime import Runtime
+from app.services.webhook_metadata import UNPARSED_BODY, parse_webhook_body
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["webhooks"])
@@ -67,11 +67,9 @@ async def google_health_webhook(
     except HTTPException:
         await runtime.webhook_status.record("body_rejected")
         raise
-    try:
-        payload = json.loads(raw)
-    except (ValueError, UnicodeDecodeError) as exc:
-        await runtime.webhook_status.record("invalid_json")
-        raise HTTPException(400, "Invalid JSON payload") from exc
+    payload = parse_webhook_body(raw)
+    # An unparsed body continues through signature verification: only authenticated
+    # failures may enter the body-only archive and count as invalid_json (400 below).
     if payload == {"type": "verification"}:
         await runtime.webhook_status.record("challenge")
         return Response(status_code=201)
@@ -104,4 +102,7 @@ async def google_health_webhook(
     )
     if result.should_process:
         runtime.spawn(runtime.webhook_processor.process_batch(result.batch_hash))
+    if payload is UNPARSED_BODY:
+        await runtime.webhook_status.record("invalid_json")
+        raise HTTPException(400, "Invalid JSON payload")
     return Response(status_code=204)

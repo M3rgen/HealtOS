@@ -32,14 +32,41 @@ def google_name(record: object) -> str | None:
     return None
 
 
+def hollow_name(name: str | None) -> bool:
+    """A Google name whose data point id is empty (``.../dataPoints/``): it names the data
+    type, not a record. Google returns ``respiratory-rate-sleep-summary`` records so, every
+    sleep under the same name; the name alone would write each night onto the last one."""
+    return name is not None and name.endswith("/")
+
+
+def hollow_anchor(spec: DataTypeSpec, record: object) -> str | None:
+    """The record's own time, which identifies a record with a hollow name: its start (a
+    sample's time; for these sleep summaries the end of the sleep they describe), in UTC.
+    A changed end of an interval is a revision of the same record, not another one."""
+    if not isinstance(record, dict):
+        return None
+    start, end, _ = temporal(spec, record)
+    moment = start or end
+    return moment.astimezone(UTC).isoformat() if moment is not None else None
+
+
 def source_id(spec: DataTypeSpec, record: object) -> str:
     """The record's Google id, or its v1 synthetic id (see app/parsers/identity.py for v2).
 
     v1 is frozen: rows stored under it keep it forever, and a record without a v2 alias is
     looked up by it first, so changing this function would re-archive every such record.
+
+    A hollow name (``hollow_name``) is the name plus ``@`` and the record's own time
+    (``hollow_anchor``): one row per sleep, wherever the day or the hour of that sleep lies.
+    A row archived under the bare name before (one, holding the last sleep) keeps it; the
+    write path links it to the row of its sleep (app/services/storage.py).
     """
     name = google_name(record)
     if name is not None:
+        if hollow_name(name):
+            anchor = hollow_anchor(spec, record)
+            if anchor is not None:
+                return f"{name}@{anchor}"
         return name
     identity: dict[str, Any] = {"dataType": spec.name}
     if isinstance(record, dict):

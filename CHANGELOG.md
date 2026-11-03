@@ -4,6 +4,77 @@ All notable changes to HealtOS are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Releases before 0.2.1 were not recorded
 in this file.
 
+## Unreleased
+
+### Upgrade notes
+
+- Migrations `20261102_0022` and `20261102_0023` run automatically when the app starts and only
+  add tables: no existing table is altered or referenced by a foreign key, so they take no lock on
+  existing tables and a running `pg_dump` neither blocks nor fails them. No existing row is read or
+  changed.
+- `20261102_0022` adds the single-row `display_preferences` table (operational metadata, not
+  received data); its downgrade drops it, and each browser falls back to its local copy.
+- `20261102_0023` adds three append-only tables; its downgrade refuses while any of them holds a
+  row.
+
+### Fixed
+
+- A page that repeats an earlier `nextPageToken` of the same fetch no longer loses its records:
+  they are stored in `raw_health_data` with their Google responses, deduplicated as usual, while
+  the repeated token is never saved as a checkpoint, `last_successful_sync` does not advance and
+  the fetch still fails with `repeated_page_token`. Sync and backfill behave the same; no
+  migration ([docs/RUNBOOK.md](docs/RUNBOOK.md), “Kapsama ve çekim fişleri”).
+- One Google record that PostgreSQL `jsonb` cannot hold (`\u0000`, an unpaired surrogate,
+  `NaN`/`Infinity`, an overflowing number) no longer blocks its whole data type. The page used to
+  roll back on every attempt, so that type never advanced. Such a record is now set apart in
+  `raw_health_data_rejections` (never sanitized, nothing already stored is touched; its bytes stay
+  in the page's `raw_api_responses` row, one row per exchange as before), the rest of the page is
+  stored and the next page is requested. A round with a rejected record marks no source
+  deletions; the next round without one does. Retrieval receipts keep the number of rejected
+  records apart from `unplaced_count`. `/health` reports `degraded` with
+  `rejected_google_records` until the maintainer runs `health-mirror rejections --ack <id>`; a
+  record rejected again later stays acknowledged, a new one turns it `degraded` again
+  ([docs/RUNBOOK.md](docs/RUNBOOK.md), “jsonb'nin tutamadığı Google kayıtları”).
+- Sleep summaries (`respiratory-rate-sleep-summary`) are no longer written onto one another.
+  Google returns every such record under one name whose data point id is empty
+  (`.../dataPoints/`), so each sleep overwrote the last and the archive held one row whose
+  earlier sleeps were only versions. A record with such a hollow name is now identified by the
+  name and its own time (the end of the sleep it describes): one row per sleep, never per
+  calendar day, so sleep by day, sleep across midnight and two sleeps of one day are each a
+  record. Coverage and Umay date them, like sleep, by the local day the sleep ended. The old row
+  and its versions are kept unchanged; once the row of its own sleep holds the same payload,
+  an append-only `hollow-name` supersession hides it, so the sleep counts once. No migration;
+  the next complete fetch of a window (`health-mirror reconcile --days N`) stores every sleep
+  Google still returns as its own row ([docs/REFERENCE.md](docs/REFERENCE.md#hollow-google-names)).
+
+### Changed
+
+- Durations under one hour read “45 dk” instead of “0 sa 45 dk” in the workout duration, the
+  sleep card, the last-7-days table and the metric history.
+- Clearer interface text in the appearance dialog (System › Appearance › Özelleştir): a shorter
+  intro that says the presets are shared across devices, Umay presets without the repeated
+  “Umay ·” prefix, “Klasik”, consistent hints and error messages; “Beden modeli otomatik dönsün”
+  in the panel; a typo and an English leftover fixed in the coverage reasons.
+- README screenshots retaken from the current interface with synthetic preview data: desktop and
+  mobile dashboard, plus new images of Umay's chat (desktop and mobile), the metric history, the
+  date picker and the appearance dialog.
+
+### Added
+
+- Coverage says why a day has no value. Umay's `coverage` card (schema 2) reads the retrieval
+  receipts: per metric it counts closed days by retrieval state and splits the days without a
+  value into `empty_response` (Google returned nothing), `returned_without_value`,
+  `not_retrieved` (never requested since receipts began), `incomplete` and `unknown`; narrowed
+  to one metric it lists the gap periods. `GET /api/sync/coverage` and the Kapsama panel gain
+  `not_attempted` (“Hiç çekilmedi”) and `receipts_since`. Older history stays `unknown`; no
+  migration ([docs/RUNBOOK.md](docs/RUNBOOK.md), “Kapsama ve çekim fişleri”).
+- The time zone choice and the body model rotation under System › Appearance (Görünüm) are
+  shared across devices: they are read from and written to `GET`/`PUT /api/settings/display`
+  (migration `20261102_0022`). The record carries a `schema_version`; a row written by a newer
+  version is neither misread nor overwritten (409). The browser's `localStorage` stays an offline
+  copy: the first paint does not wait for the server, and a change made while the server is
+  unreachable applies in that browser and is sent on the next contact.
+
 ## 0.2.1 — 2026-10-31
 
 Covers everything merged since 0.2 (`4828135`), mainly Gitea #31 and #32.

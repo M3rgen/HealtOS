@@ -29,7 +29,7 @@ async def test_retry_after_preserves_checkpoint_and_allows_resume(sessions, lane
     old, record = point(kind="steps"), point(kind="steps")
     good = json.dumps({"dataPoints": [record], "nextPageToken": "saved"}).encode()
     wires = [good, b" retry \n", b" rejected \n"]
-    calls, sleeps, waiting = [], [], asyncio.Event()
+    calls, sleeps = [], []
 
     def handler(request):
         calls.append(request.url.params.get("pageToken"))
@@ -45,8 +45,11 @@ async def test_retry_after_preserves_checkpoint_and_allows_resume(sessions, lane
     async def sleep(delay):
         sleeps.append(delay)
         if delay:
-            waiting.set()
-            await asyncio.Event().wait()
+            # Cancel at the retry boundary, independently of database/runner speed.
+            # An excessive Retry-After must fail before reaching this sleep.
+            assert header == "60" and delay == 60
+            task.cancel()
+            await asyncio.sleep(0)
 
     async with sessions.begin() as session:
         await store_records(session, REGISTRY["steps"], [old])
@@ -55,11 +58,8 @@ async def test_retry_after_preserves_checkpoint_and_allows_resume(sessions, lane
     google.sleep = sleep
     task = asyncio.create_task(runner.run(google))
     try:
-        if header == "60":
-            await asyncio.wait_for(waiting.wait(), 5)
-            task.cancel()
         with pytest.raises(asyncio.CancelledError if header == "60" else GoogleHealthError) as err:
-            await asyncio.wait_for(task, 5)
+            await asyncio.wait_for(task, 60)  # deadlock guard, not a speed limit
         if header != "60":
             assert is_transient(err.value)
             assert error_summary(err.value) == f"RetryDeferredError (http_{status})"
@@ -86,7 +86,7 @@ async def test_retry_after_preserves_checkpoint_and_allows_resume(sessions, lane
         assert [r.attempt for r in rows] == [0, 0, 1]
         assert rows[-1].headers["retry-after"] == header
         assert all(r.complete and r.body_sha256 == hashlib.sha256(r.body).hexdigest() for r in rows)
-        await asyncio.wait_for(runner.run(google), 5)
+        await asyncio.wait_for(runner.run(google), 60)
         assert calls[-1] == "saved"
     finally:
         task.cancel()

@@ -41,5 +41,8 @@ REASONS = (
     "interval-shape-change",
     "growing-interval",
     "duplicate",
+    # A row archived under a hollow Google name, held by the row of its own record
+    # (app/services/hollow_names.py).
+    "hollow-name",
 )
 MERGED_EVENT = "identity-merged"

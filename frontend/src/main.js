@@ -15,6 +15,7 @@ import { describeSyncError } from './sync-errors.js';
 import { setupCoverage } from './coverage.js';
 import { setupWebhookStatus } from './webhook-status.js';
 import { setupBodyLoader } from './body-loader.js';
+import { createDisplayPreferences } from './display-preferences.js';
 
 renderIcons();
 setupAppearance();
@@ -27,8 +28,12 @@ const escape = value =>
   );
 const num = (value, digits = 0) =>
   value == null ? '—' : Number(value).toLocaleString('tr-TR', { maximumFractionDigits: digits });
-const duration = seconds =>
-  seconds == null ? '—' : `${Math.floor(Math.round(seconds / 60) / 60)} sa ${Math.round(seconds / 60) % 60} dk`;
+// "45 dk", not "0 sa 45 dk": the hour part is shown only when there is one.
+const duration = (seconds) => {
+  if (seconds == null) return '—';
+  const minutes = Math.round(seconds / 60);
+  return minutes < 60 ? `${minutes} dk` : `${Math.floor(minutes / 60)} sa ${minutes % 60} dk`;
+};
 const metrics = {
   height: ['Boy', 'cm'],
   weight: ['Kilo', 'kg'],
@@ -36,20 +41,6 @@ const metrics = {
   muscle: ['Kas oranı', '%'],
 };
 const states = { empty: 'Kayıt yok', partial: 'Devam ediyor', complete: 'Kayıt var', missing: 'Eksik ölçüm' };
-function readPreference(key, fallback) {
-  try {
-    return localStorage.getItem(key) ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-function writePreference(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    /* Restricted browser storage still allows using the app. */
-  }
-}
 const validZone = value => {
   if (!value) return false;
   try {
@@ -68,8 +59,18 @@ const deviceZone = (() => {
   }
 })();
 const resolveZone = choice => (choice === 'auto' ? deviceZone : choice);
-let zoneChoice = readPreference('healtos.timezone.v2', 'auto');
-if (zoneChoice !== 'auto' && !validZone(zoneChoice)) zoneChoice = 'auto';
+const displayNote = $('display-preferences-note');
+const displayText = {
+  saved: displayNote.textContent,
+  saving: 'Tercih kaydediliyor…',
+  offline: 'Sunucuya ulaşılamadı; tercih bu tarayıcıda saklandı, bağlantı gelince gönderilecek.',
+};
+const display = createDisplayPreferences({
+  validZone,
+  onStatus: status => (displayNote.textContent = displayText[status]),
+});
+const stored = display.read();
+let zoneChoice = stored.timezone ?? 'auto';
 let zone = resolveZone(zoneChoice);
 let data = null,
   health = null,
@@ -78,12 +79,14 @@ let data = null,
   activePage = 'overview',
   poll = null;
 let selectedDate = null;
-const motion = readPreference('healtos.motion', 'true') === 'true';
 $('timezone').querySelector('option[value="auto"]').textContent = `Cihaz saati (${deviceZone})`;
-if (![...$('timezone').options].some(option => option.value === zoneChoice))
-  $('timezone').add(new Option(zoneChoice, zoneChoice));
-$('timezone').value = zoneChoice;
-$('model-motion').checked = motion;
+function showZoneChoice() {
+  if (![...$('timezone').options].some(option => option.value === zoneChoice))
+    $('timezone').add(new Option(zoneChoice, zoneChoice));
+  $('timezone').value = zoneChoice;
+}
+showZoneChoice();
+$('model-motion').checked = stored.motion ?? true;
 const body = setupBodyLoader($('body-model'), { getMotion: () => $('model-motion').checked });
 const shortDate = value =>
   new Intl.DateTimeFormat('tr-TR', { timeZone: zone, day: 'numeric', month: 'short' }).format(new Date(value));
@@ -480,16 +483,33 @@ $('refresh-system').addEventListener('click', async () => {
   await refresh();
   await loadSystem();
 });
-$('timezone').addEventListener('change', async () => {
-  zoneChoice = $('timezone').value;
+const saveDisplay = () => display.write({ timezone: zoneChoice, motion: $('model-motion').checked });
+async function zoneChanged() {
   zone = resolveZone(zoneChoice);
-  writePreference('healtos.timezone.v2', zoneChoice);
   await refresh();
   if (activePage === 'system') await loadSystem();
   if (activePage === 'sports') await workouts.update();
+}
+// Preferences saved on another device; null leaves this browser's choice in place.
+async function applyDisplay(preferences) {
+  if (!preferences) return;
+  const motion = preferences.motion ?? true;
+  if ($('model-motion').checked !== motion) {
+    $('model-motion').checked = motion;
+    body.updateMotion();
+  }
+  if ((preferences.timezone ?? 'auto') === zoneChoice) return;
+  zoneChoice = preferences.timezone ?? 'auto';
+  showZoneChoice();
+  await zoneChanged();
+}
+$('timezone').addEventListener('change', async () => {
+  zoneChoice = $('timezone').value;
+  saveDisplay();
+  await zoneChanged();
 });
 $('model-motion').addEventListener('change', () => {
-  writePreference('healtos.motion', String($('model-motion').checked));
+  saveDisplay();
   body.updateMotion();
 });
 setupChat(() => zone);
@@ -515,9 +535,13 @@ const workouts = setupWorkouts({
 });
 const coveragePanel = setupCoverage({ request, getZone: () => zone, getToday: today, escape });
 const webhookPanel = setupWebhookStatus({ request, getZone: () => zone });
+// Asked in parallel with the first refresh, so the first paint never waits for it.
+const firstDisplaySync = display.sync();
 await refresh();
+await applyDisplay(await firstDisplaySync);
 poll = setInterval(async () => {
   if (!document.hidden && !$('measurement-dialog').open) {
+    await applyDisplay(await display.sync());
     await refresh();
     if (activePage === 'system') await loadSystem();
     if (activePage === 'sports') await workouts.update();

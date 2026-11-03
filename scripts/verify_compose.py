@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 PROJECT_NAME = f"health-mirror-smoke-{os.getpid()}-{secrets.token_hex(4)}"
-EXPECTED_REVISION = "20261031_0021"
+EXPECTED_REVISION = "20261102_0023"
 HOST_PORT = "18080"
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP_DIR = ROOT / f".compose-smoke-backups-{os.getpid()}"

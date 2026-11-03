@@ -21,6 +21,7 @@ from app.cli.identity_commands import DATA_TYPES_OPTION as DATA_TYPES_OPTION
 from app.cli.identity_commands import identity_backfill as identity_backfill
 from app.cli.identity_commands import identity_decide as identity_decide
 from app.cli.identity_commands import identity_sources as identity_sources
+from app.cli.rejection_commands import rejections as rejections
 from app.cli.sync_commands import _chains_to_review as _chains_to_review
 from app.cli.sync_commands import backfill as backfill
 from app.cli.sync_commands import probe as probe
@@ -66,6 +67,7 @@ for _command in (
     responses,
     export_response,
     probe,
+    rejections,
 ):
     app.command()(_command)
 

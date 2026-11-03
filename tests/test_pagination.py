@@ -5,13 +5,14 @@ import pytest
 from app.google_health import pagination
 from app.google_health.client import InvalidPageTokenError, Page
 from app.google_health.data_types import REGISTRY
-from app.google_health.pagination import PaginationPaused, iter_pages
+from app.google_health.pagination import PaginationPaused, RepeatedPageTokenError, iter_pages
 
 
 class FakeClient:
     def __init__(self, pages):
         self.pages = iter(pages)
         self.tokens = []
+        self.kept = []
 
     async def list_data_points(self, spec, start, end, token):
         self.tokens.append(token)
@@ -19,6 +20,9 @@ class FakeClient:
         if isinstance(item, Exception):
             raise item
         return item
+
+    async def keep_after(self, responses, failure):
+        self.kept.append((responses, failure))
 
 
 @pytest.mark.asyncio
@@ -30,13 +34,37 @@ async def test_pagination_follows_every_token():
     assert client.tokens == [None, "next"]
 
 
-@pytest.mark.asyncio
-async def test_pagination_rejects_repeated_token(monkeypatch):
-    monkeypatch.setattr(pagination, "MAX_PAGES_PER_CALL", 2)
-    client = FakeClient([Page([], "same"), Page([], "same")])
+@pytest.mark.parametrize(
+    "initial,tokens",
+    [(None, [" A ", "A", " A "]), (None, ["A", "B", "A"]), ("A", ["A"]), ("A", ["B", "A"])],
+)
+async def test_pagination_yields_cyclic_page_then_raises(monkeypatch, initial, tokens):
+    # The budget ends exactly at the cyclic page: a cycle is still a failure, not a pause.
+    monkeypatch.setattr(pagination, "MAX_PAGES_PER_CALL", len(tokens))
+    client = FakeClient([Page([{"index": i}], t) for i, t in enumerate(tokens)])
     now = datetime.now(UTC)
-    with pytest.raises(RuntimeError, match="repeated"):
-        _ = [page async for page in iter_pages(client, REGISTRY["steps"], now, now)]
+    accepted = []
+    with pytest.raises(RepeatedPageTokenError) as caught:
+        async for page in iter_pages(client, REGISTRY["steps"], now, now, initial):
+            accepted.append(page)
+    assert [p.next_page_token for p in accepted] == tokens
+    assert [p.data_points for p in accepted] == [[{"index": i}] for i in range(len(tokens))]
+    assert [p.cyclic for p in accepted] == [False] * (len(tokens) - 1) + [True]
+    # One request per page; the repeated continuation is never requested.
+    assert client.tokens == [initial, *tokens[:-1]]
+    # The consumer stores the cyclic page in its own transaction: nothing archived here.
+    assert client.kept == []
+    assert caught.value.__cause__ is caught.value.__context__ is None
+
+
+async def test_pagination_does_not_raise_when_consumer_stops_at_cyclic_page():
+    client = FakeClient([Page([{"index": 0}], "A"), Page([{"index": 1}], "A")])
+    now = datetime.now(UTC)
+    pages = iter_pages(client, REGISTRY["steps"], now, now)
+    assert not (await anext(pages)).cyclic
+    assert (await anext(pages)).cyclic
+    await pages.aclose()
+    assert client.tokens == [None, "A"] and client.kept == []
 
 
 @pytest.mark.asyncio
@@ -77,9 +105,10 @@ async def test_budget_bounds_requests_and_seen_tokens(monkeypatch, limit, termin
     assert len(client.tokens) == limit and len(seen) <= limit
 
 
-async def test_token_reset_does_not_refill_budget(monkeypatch):
+@pytest.mark.parametrize("reset_token", ["fresh", "expired"])
+async def test_token_reset_does_not_refill_budget(monkeypatch, reset_token):
     monkeypatch.setattr(pagination, "MAX_PAGES_PER_CALL", 2)
-    client = FakeClient([Page([], "expired"), InvalidPageTokenError(), Page([], "fresh")])
+    client = FakeClient([Page([], "expired"), InvalidPageTokenError(), Page([], reset_token)])
     resets = []
 
     async def reset():

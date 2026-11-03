@@ -1,4 +1,4 @@
-"""Coverage card of the ``health_archive`` tool (``coverage`` action, schema 1).
+"""Coverage card of the ``health_archive`` tool (``coverage`` action, schema 2).
 
 Per metric it answers one question: on how many *closed* civil days of the window do the
 records every reader counts (app/models/eligibility.py; manual measurements flagged as test
@@ -8,9 +8,10 @@ more:
 * a day with a value is not a fully measured day (``sampling.basis = "presence_only"``): ten
   minutes of steps make a value day. The dashboard's ``status: "complete"`` only says that
   five fields are not null; it is not coverage and is not used here;
-* a day without a value is "no value" (``days_without_value``), never zero, and never "Google
-  returned nothing": this schema-1 card leaves retrieval receipts to the HTTP report
-  (app/services/retrieval_coverage.py), so ``retrieval.state`` is always ``"unknown"``;
+* a day without a value is "no value" (``days_without_value``), never zero. Why it has none
+  comes from retrieval receipts alone (app/services/coverage_retrieval.py): Google returned
+  nothing, returned records without a value, was never asked, was asked incompletely, or
+  unknown (before receipts). Mutable job tables are never retrieval evidence;
 * today is still filling up: it is never a closed day and is reported as ``partial_today``.
 
 Distinct source streams (a phone and a band, a Google and a manual weight) are separate
@@ -27,7 +28,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -46,14 +47,16 @@ from app.services.current_weight import current_weight
 from app.services.dashboard import dashboard_data
 from app.services.manual_flags import excluded_measurement_ids
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 # UTF-8 JSON, as app/api/codex.py sends it; larger cards are refused, never clipped.
 COVERAGE_BUDGET_BYTES = 12 * 1024
 # Exclusion classes never overlap: a record counts in the first one it matches.
 EXCLUSION_POLICY = "first_match: quarantined > without_raw_record > source_deleted > superseded"
 NOTE = (
     "Değeri olan gün tam ölçülmüş gün değildir; değeri olmayan gün sıfır değil, değer yok "
-    "demektir. Çekimin eksiksizliği bilinmiyor. Bugün kapalı günlere katılmaz. Kaynak "
+    "demektir. Değersiz günün nedeni yalnız çekim fişinden okunur: empty_response Google boş "
+    "döndü, not_retrieved hiç istenmedi, incomplete eksik çekim, unknown fişlerden önce. "
+    "Bugün kapalı günlere katılmaz. Kaynak "
     "akışları ayrı satırlardır, toplanmaz. Dışlamalar kayıt sayısıdır, gün değil; her kayıt "
     "yalnız ilk uyan sınıfta sayılır, toplamları örtüşmez. null: bilinmiyor."
 )
@@ -105,13 +108,26 @@ class Sampling(BaseModel):
     longest_gap_seconds: None = None
 
 
+class Gap(BaseModel):
+    start_date: date
+    end_date: date
+    days: int
+    state: str  # one of app.services.coverage_retrieval.WITHOUT_VALUE
+
+
 class Retrieval(BaseModel):
-    state: Literal["unknown"] = "unknown"
-    completed_with_records_days: None = None
-    completed_empty_days: None = None
-    incomplete_days: None = None
-    not_attempted_days: None = None
+    """Closed days by retrieval state, then the days without a value by why."""
+
+    state: Literal["receipts", "unknown"] = "unknown"
+    completed_with_records_days: int | None = None
+    completed_empty_days: int | None = None
+    incomplete_days: int | None = None
+    not_attempted_days: int | None = None
     unknown_days: int
+    without_value: dict[str, int] | None = None
+    # Only when the card is narrowed to one metric; left out of the JSON otherwise.
+    gaps: list[Gap] | None = Field(default=None, exclude_if=lambda value: value is None)
+    gaps_omitted: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Exclusions(BaseModel):
@@ -151,13 +167,14 @@ class MetricCoverage(BaseModel):
 
 
 class CoverageCard(BaseModel):
-    schema_version: Literal["1"] = SCHEMA_VERSION
+    schema_version: Literal["2"] = SCHEMA_VERSION
     start_date: date
     end_date: date
     timezone: str
     computed_at: datetime
     requested_days: int
     closed_days: int
+    retrieval_receipts_since: datetime | None  # the first receipt; earlier days are unknown
     metrics: list[MetricCoverage]
     reason_codes: list[str]
     note: str = NOTE
@@ -446,8 +463,13 @@ async def coverage_card(
     timezone: str,
     data_type: str | None = None,
 ) -> CoverageCard:
+    # Imported here: the receipt reader builds on this module's readers.
+    from app.services.coverage_retrieval import metric_retrieval
+    from app.services.retrieval_coverage import receipt_horizon
+
     zone = ZoneInfo(timezone)
     window = Window(start_date, end_date, datetime.now(zone).date(), zone)
+    horizon = await receipt_horizon(session)
     metrics = [
         metric
         for metric in METRICS
@@ -467,7 +489,7 @@ async def coverage_card(
         streams: dict[str, Stream] = {}
         invalid: int | None = None
         manual_dropped = 0
-        codes = ["presence_only", "retrieval_unknown"]
+        codes = ["presence_only"]
         if metric.data_type is not None:
             streams, invalid = await _google_streams(session, metric, window)
         if metric.manual is not None:
@@ -491,6 +513,10 @@ async def coverage_card(
         regimes.sort(key=lambda regime: (regime.first_date, regime.source))
         value_days = sum(day < window.today for day in days)
         partial_today = window.today in days
+        retrieval, retrieval_codes = await metric_retrieval(
+            session, metric, window, days, horizon, gaps=len(metrics) == 1
+        )
+        codes += retrieval_codes
         if not value_days and not partial_today:
             codes.append("no_value_in_window")
         if len(regimes) > 1:
@@ -503,7 +529,7 @@ async def coverage_card(
                 days_without_value=closed - value_days,
                 partial_today=partial_today,
                 sampling=Sampling(sample_count=sum(regime.record_count for regime in regimes)),
-                retrieval=Retrieval(unknown_days=closed),
+                retrieval=Retrieval(**retrieval),
                 exclusions=Exclusions(
                     **await _exclusions(session, metric, window),
                     manually_excluded=manual_dropped,
@@ -513,7 +539,11 @@ async def coverage_card(
                 reason_codes=codes,
             )
         )
-    codes = ["retrieval_receipts_unavailable", "daily_status_not_coverage"]
+    codes = ["daily_status_not_coverage"]
+    if horizon is None:
+        codes.insert(0, "retrieval_receipts_unavailable")
+    elif len(metrics) > 1:
+        codes.append("retrieval_gaps_need_data_type")
     if closed < requested:
         codes.append("today_partial_excluded")
     return CoverageCard(
@@ -523,6 +553,7 @@ async def coverage_card(
         computed_at=datetime.now(UTC),
         requested_days=requested,
         closed_days=closed,
+        retrieval_receipts_since=horizon,
         metrics=cards,
         reason_codes=codes,
     )

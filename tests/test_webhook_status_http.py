@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from operator import attrgetter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -13,8 +14,13 @@ import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import FastAPI
+from pythonjsonlogger.json import JsonFormatter
+from raw_response_records import body as google_body
+from raw_response_records import client as google_client
+from raw_response_records import steps, stored
 from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sync_ownership_records import service, snapshot
 from test_webhook_route import Incremental, notification
 from test_webhook_status import START, configured
 
@@ -22,6 +28,7 @@ from app.api import webhooks
 from app.core.auth import SessionStore, UITokenMiddleware
 from app.core.host_validation import HostValidationMiddleware
 from app.core.request_limits import WriteLimits
+from app.google_health.client import GoogleHealthError
 from app.google_health.webhook import WebhookSignatureVerifier
 from app.models.state import OAuthToken, WebhookEvent, WebhookNotification
 from app.models.webhook_status import WebhookStatusEvent
@@ -268,6 +275,89 @@ async def test_processing_failure_and_rejection_do_not_count_as_verification_fai
     assert "user" not in json.dumps(final, default=str)
 
 
+@pytest.mark.parametrize("kind", ["ordinary", "sqlalchemy", "google"])
+async def test_processing_errors_are_private_and_retry_preserves_archive(
+    receiver, sessions, caplog, kind
+):
+    marker = "synthetic-private-health-record"
+    record = steps(42, name=f"users/me/dataTypes/steps/dataPoints/{marker}")
+    failure = {
+        "ordinary": RuntimeError(marker),
+        "sqlalchemy": OperationalError(
+            "INSERT INTO raw_health_data (raw_json) VALUES (:raw_json)",
+            {"raw_json": record},
+            RuntimeError("synthetic database failure"),
+        ),
+        "google": GoogleHealthError(f"HTTP 503 {marker}"),
+    }[kind]
+    summary = type(failure).__name__ + (" (http_503)" if kind == "google" else "")
+    wire = google_body(steps(41, name=record["name"]), record, token="resume")
+    replies = iter([httpx.Response(200, content=wire), failure, httpx.Response(200, json={})])
+
+    def respond(request):
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            try:
+                raise ValueError(f"{marker} context")
+            except ValueError as context:
+                raise reply from context
+        return reply
+
+    google = google_client(respond, sessions)
+    receiver.processor.incremental = service(sessions, google)
+    body = b" [ " + json.dumps(notification()).encode() + b" ]\n"
+    digest = hashlib.sha256(body).hexdigest()
+    counts = attrgetter("attempt_count", "sync_attempt_count", "sync_success_count")
+    caplog.set_level("INFO")
+    async with google.http:
+        assert (await receiver.post(body)).status_code == 204
+        await receiver.finish()
+        async with sessions() as session:
+            element = await session.scalar(select(WebhookNotification))
+            batch = await session.get(WebhookEvent, digest)
+            assert element.status == "failed" and element.processed_at is None
+            assert counts(element) == (1, 1, 0)
+            assert element.last_error == batch.last_error == summary
+            assert batch.failure_count == 1 and batch.processed_at is None
+            archive = batch.signature_verified_at, element.element_hash, element.raw_json
+        before = await snapshot(sessions)
+        responses = [row.body for row in await stored(sessions)]
+        assert responses == [wire]
+        response = await receiver.client.get(
+            "/api/webhooks/status", headers={"Authorization": "Bearer synthetic-ui"}
+        )
+        assert response.status_code == 200 and marker not in response.text
+        assert response.json()["counters"]["reasons"]["processing_failed"] == 1
+        assert response.json()["last_error"]["code"] == "processing_failed"
+        (log,) = [r for r in caplog.records if getattr(r, "event", "") == "WEBHOOK_ELEMENT_FAILED"]
+        assert log.exc_info is log.exc_text is log.stack_info is None
+        assert log.args == () and log.getMessage() == "Webhook notification processing failed"
+        assert log.error_type == type(failure).__name__
+        assert log.error_code == ("http_503" if kind == "google" else None)
+        assert log.error_chain == type(failure).__name__ + " < ValueError"
+        assert not any(isinstance(value, BaseException) for value in vars(log).values())
+        assert marker not in repr([r.__dict__ for r in caplog.records])
+        assert marker not in "\n".join(JsonFormatter().format(r) for r in caplog.records)
+        result = await receiver.processor.process_pending(recover_running=False)
+        assert result.completed_elements == 1 and result.failed_elements == 0
+    async with sessions() as session:
+        element = await session.scalar(select(WebhookNotification))
+        batch = await session.get(WebhookEvent, digest)
+        assert element.status == "completed" and element.processed_at is not None
+        assert counts(element) == (2, 2, 1)
+        assert element.last_error is batch.last_error is None
+        assert batch.failure_count == 0 and batch.processed_at is not None
+        assert (batch.signature_verified_at, element.element_hash, element.raw_json) == archive
+        assert batch.raw_body == body and batch.raw_json == [notification()]
+    final = await snapshot(sessions)
+    for table in ("raw_health_data", "raw_health_data_versions"):
+        assert final[table] == before[table] and before[table]
+    after = await stored(sessions)
+    assert [row.body for row in after][: len(responses)] == responses
+    assert all(row.body_sha256 == hashlib.sha256(row.body).hexdigest() for row in after)
+    assert (await receiver.status.snapshot())["counters"]["reasons"]["processing_failed"] == 1
+
+
 async def test_ingestion_failure_is_separate_and_cannot_reset_silence(receiver):
     receiver.current.now += timedelta(days=8)
     receiver.app.state.runtime.webhook_processor = SimpleNamespace(
@@ -325,6 +415,7 @@ async def test_unavailable_status_is_safe_and_diagnostics_outage_preserves_deliv
 
 async def test_non_signature_request_failures_have_their_own_codes(receiver):
     assert (await receiver.post(b"not-json")).status_code == 400
+    await receiver.finish()
     receiver.app.state.settings.google_health_webhook_max_body_bytes = 2
     assert (await receiver.post(b"{} ")).status_code == 413
     receiver.app.state.settings.google_health_webhook_authorization = "CHANGE_ME"
@@ -332,7 +423,8 @@ async def test_non_signature_request_failures_have_their_own_codes(receiver):
     status = await receiver.status.snapshot()
     for code in ("invalid_json", "body_rejected", "receiver_unconfigured"):
         assert status["counters"]["reasons"][code] == 1
-    assert status["counters"]["valid"] == status["counters"]["invalid"] == 0
+    # Malformed signed JSON is now verified and archived before its controlled 400.
+    assert status["counters"]["valid"] == 1 and status["counters"]["invalid"] == 0
     assert status["silence"]["state"] == "unconfigured"
 
 
@@ -386,7 +478,7 @@ async def test_limits_do_not_advance_verified_delivery_or_start_work(
     key_requests = receiver.current.key_requests
     receiver.current.now += timedelta(hours=1)
     monkeypatch.setattr(
-        webhooks, "json", SimpleNamespace(loads=Mock(side_effect=AssertionError("JSON parsed")))
+        webhooks, "parse_webhook_body", Mock(side_effect=AssertionError("JSON parsed"))
     )
     monkeypatch.setattr(
         receiver.app.state.runtime.webhook_verifier,

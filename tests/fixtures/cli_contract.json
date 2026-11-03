@@ -1,5 +1,5 @@
 {
-  "root_help": "                                                                                \n Usage: root [OPTIONS] COMMAND [ARGS]...                                        \n                                                                                \n Operate the Personal Health Data Mirror.                                       \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --install-completion          Install completion for the current shell.      │\n│ --show-completion             Show completion for the current shell, to copy │\n│                               it or customize the installation.              │\n│ --help                        Show this message and exit.                    │\n╰──────────────────────────────────────────────────────────────────────────────╯\n╭─ Commands ───────────────────────────────────────────────────────────────────╮\n│ status                  Show synchronization and backfill status.            │\n│ backfill                Start or resume the historical backfill and wait for │\n│                         completion.                                          │\n│ sync                    Run incremental synchronization for one or every     │\n│                         configured data type.                                │\n│ reconcile               Re-read a recent window across every mirrored data   │\n│                         type.                                                │\n│ webhook-readiness       Report secret-safe Google Health subscriber          │\n│                         prerequisites.                                       │\n│ webhook-status          Show secret-safe local webhook receipt and           │\n│                         processing status.                                   │\n│ webhook-replay-pending  Retry durable pending webhook elements without       │\n│                         asking Google to resend them.                        │\n│ verify                  Check archive guards, payload and body hashes,       │\n│                         version history, and sync errors.                    │\n│ history                 List every stored version of raw records (oldest     │\n│                         first) as JSON.                                      │\n│ import-versions         Add payload versions (and whole records) that only   │\n│                         survive in old dumps.                                │\n│ identity-backfill       Decide source chains, add v2 aliases and link        │\n│                         duplicate rows of a record (idempotent).             │\n│ identity-decide         Decide what the reconciler left open: two sources    │\n│                         are one device, or two devices.                      │\n│ identity-sources        List a data type's source fingerprints: spans,       │\n│                         devices, chains (with review state),                 │\n│                         pairs kept apart, the owner's decisions, and what    │\n│                         the chain rule leaves open.                          │\n│ responses               List stored Google responses (newest first, metadata │\n│                         only) as JSON.                                       │\n│ export-response         Write one stored Google response body byte for byte  │\n│                         (metadata goes to stderr).                           │\n│ probe                   Probe accessible Google Health types without         │\n│                         archiving records or a backfill.                     │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+  "root_help": "                                                                                \n Usage: root [OPTIONS] COMMAND [ARGS]...                                        \n                                                                                \n Operate the Personal Health Data Mirror.                                       \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --install-completion          Install completion for the current shell.      │\n│ --show-completion             Show completion for the current shell, to copy │\n│                               it or customize the installation.              │\n│ --help                        Show this message and exit.                    │\n╰──────────────────────────────────────────────────────────────────────────────╯\n╭─ Commands ───────────────────────────────────────────────────────────────────╮\n│ status                  Show synchronization and backfill status.            │\n│ backfill                Start or resume the historical backfill and wait for │\n│                         completion.                                          │\n│ sync                    Run incremental synchronization for one or every     │\n│                         configured data type.                                │\n│ reconcile               Re-read a recent window across every mirrored data   │\n│                         type.                                                │\n│ webhook-readiness       Report secret-safe Google Health subscriber          │\n│                         prerequisites.                                       │\n│ webhook-status          Show secret-safe local webhook receipt and           │\n│                         processing status.                                   │\n│ webhook-replay-pending  Retry stored pending and failed webhook elements     │\n│                         without a Google resend.                             │\n│ verify                  Check archive guards, payload and body hashes,       │\n│                         version history, and sync errors.                    │\n│ history                 List every stored version of raw records (oldest     │\n│                         first) as JSON.                                      │\n│ import-versions         Add payload versions (and whole records) that only   │\n│                         survive in old dumps.                                │\n│ identity-backfill       Decide source chains, add v2 aliases and link        │\n│                         duplicate rows of a record (idempotent).             │\n│ identity-decide         Decide what the reconciler left open: two sources    │\n│                         are one device, or two devices.                      │\n│ identity-sources        List a data type's source fingerprints: spans,       │\n│                         devices, chains (with review state),                 │\n│                         pairs kept apart, the owner's decisions, and what    │\n│                         the chain rule leaves open.                          │\n│ responses               List stored Google responses (newest first, metadata │\n│                         only) as JSON.                                       │\n│ export-response         Write one stored Google response body byte for byte  │\n│                         (metadata goes to stderr).                           │\n│ probe                   Probe accessible Google Health types without         │\n│                         archiving records or a backfill.                     │\n│ rejections              Eşitlemede reddedilen Google kayıtlarını listele,    │\n│                         onayla ya da dışa aktar.                             │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
   "commands": {
     "status": {
       "help": "                                                                                \n Usage: root status [OPTIONS]                                                   \n                                                                                \n Show synchronization and backfill status.                                      \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
@@ -85,7 +85,7 @@
       "parameters": []
     },
     "webhook-replay-pending": {
-      "help": "                                                                                \n Usage: root webhook-replay-pending [OPTIONS]                                   \n                                                                                \n Retry durable pending webhook elements without asking Google to resend them.   \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "help": "                                                                                \n Usage: root webhook-replay-pending [OPTIONS]                                   \n                                                                                \n Retry stored pending and failed webhook elements without a Google resend.      \n                                                                                \n Reuse verified archived batches; completed elements are not fetched again.     \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --help          Show this message and exit.                                  │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
       "parameters": []
     },
     "verify": {
@@ -537,6 +537,53 @@
           "multiple": false,
           "type": "<IntRange 1<=x<=365>",
           "help": null,
+          "is_flag": false
+        }
+      ]
+    },
+    "rejections": {
+      "help": "                                                                                \n Usage: root rejections [OPTIONS]                                               \n                                                                                \n Eşitlemede reddedilen Google kayıtlarını listele, onayla ya da dışa aktar.     \n                                                                                \n╭─ Options ────────────────────────────────────────────────────────────────────╮\n│ --limit          <int range> [1<=x<=10000]  En yeni kaç kayıt listelenir.    │\n│                                             [default: 20]                    │\n│ --ack            <int range> [x>=1]         Bu numaraya kadar (dahil)        │\n│                                             reddedilenlere bakıldı; /health  │\n│                                             bunun için uyarmaz.              │\n│ --element        <int range> [x>=1]         Bu numaralı kaydın kendisini     │\n│                                             standart çıktıya yaz.            │\n│ --help                                      Show this message and exit.      │\n╰──────────────────────────────────────────────────────────────────────────────╯\n\n",
+      "parameters": [
+        {
+          "name": "limit",
+          "opts": [
+            "--limit"
+          ],
+          "secondary_opts": [],
+          "default": 20,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange 1<=x<=10000>",
+          "help": "En yeni kaç kayıt listelenir.",
+          "is_flag": false
+        },
+        {
+          "name": "ack",
+          "opts": [
+            "--ack"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange x>=1>",
+          "help": "Bu numaraya kadar (dahil) reddedilenlere bakıldı; /health bunun için uyarmaz.",
+          "is_flag": false
+        },
+        {
+          "name": "element",
+          "opts": [
+            "--element"
+          ],
+          "secondary_opts": [],
+          "default": null,
+          "required": false,
+          "nargs": 1,
+          "multiple": false,
+          "type": "<IntRange x>=1>",
+          "help": "Bu numaralı kaydın kendisini standart çıktıya yaz.",
           "is_flag": false
         }
       ]

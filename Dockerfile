@@ -37,4 +37,4 @@ RUN chmod +x /app/scripts/*.sh \
 
 USER healthmirror
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host ${APP_HOST:-127.0.0.1} --port ${APP_PORT:-8000} --no-access-log"]
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host ${APP_HOST:-127.0.0.1} --port ${APP_PORT:-8000} --no-access-log --timeout-graceful-shutdown 5"]

@@ -1,16 +1,26 @@
 import asyncio
 import json
 import logging
+import os
+import shutil
+import socket
+import tempfile
 import traceback
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from pythonjsonlogger.json import JsonFormatter
+from raw_response_records import client as archive_client
+from rejected_page_records import UNSTORABLE_TOKENS, client_rejects
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import Settings
 from app.google_health.client import GoogleHealthClient, GoogleHealthError, InvalidPageTokenError
 from app.google_health.data_types import REGISTRY
 from app.google_health.oauth import AccessToken, TokenProvider
+from app.google_health.response_page import UnstorablePaginationResponseError
 from app.sync.errors import error_summary, is_transient
 
 
@@ -413,7 +423,13 @@ async def test_reference_catalog_list_omits_unsupported_time_filter():
 @pytest.mark.parametrize("kind", ["steps", "floors", "total-calories"])
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(None, None), ("null", None), ('""', None), ('" opaque \\t"', " opaque \t")]
+    [
+        (None, None),
+        ("null", None),
+        ('""', None),
+        ('" opaque \\t"', " opaque \t"),
+        ('" \\ud83d\\ude80 Türkçe \\t"', " 🚀 Türkçe \t"),
+    ]
     + [
         (value, GoogleHealthError)
         for value in "false true 0 1 -1 1.5 [] {}".split()
@@ -424,10 +440,14 @@ async def test_reference_catalog_list_omits_unsupported_time_filter():
     ],
 )
 async def test_next_page_token_requires_string_or_terminal_form(kind, raw, expected):
-    payload = {} if raw is None else {"nextPageToken": json.loads(raw)}
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
-    ) as http:
+    wire = b"{}" if raw is None else ('{"nextPageToken":' + raw + "}").encode()
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=wire)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GoogleHealthClient(Settings(), Tokens(), http)
         start = datetime(2026, 8, 1, tzinfo=UTC)
         if expected is GoogleHealthError:
@@ -443,36 +463,70 @@ async def test_next_page_token_requires_string_or_terminal_form(kind, raw, expec
         else:
             page = await client.list_data_points(REGISTRY[kind], start, start)
             assert page.next_page_token == expected
+            if expected:
+                await client.list_data_points(REGISTRY[kind], start, start, page_token=expected)
+                # The second request must carry the exact opaque continuation.
+                request = requests[-1]
+                params = (
+                    json.loads(request.content) if request.method == "POST" else request.url.params
+                )
+                assert params["pageToken"] == expected
+
+
+@pytest.mark.parametrize("kind", ["steps", "floors", "total-calories"])
+@pytest.mark.parametrize("token", UNSTORABLE_TOKENS)
+async def test_unstorable_continuation_is_rejected_at_response_boundary(kind, token, caplog):
+    raw = json.dumps({"nextPageToken": token}).encode()
+    await client_rejects(kind, raw, UnstorablePaginationResponseError, caplog)
 
 
 @pytest.mark.parametrize("end", [" ", "\t", "\x0b", "\x0c"])
 async def test_header_rejected_by_h11_is_not_retried_or_quoted(end, caplog):
-    """MockTransport skips header validation: send through a real loopback h11 stack."""
+    """MockTransport skips header validation: send through a real h11 stack.
+
+    A Unix socket keeps the real HTTP/1.1 path without TCP, so the test also runs in
+    sandboxes that forbid binding 127.0.0.1 (the Codex runner allows sockets in TMPDIR).
+    A plain listening socket is drained after the request instead of an asyncio server,
+    so the count is deterministic and no accepted socket outlives the test.
+    """
     token = "synthetic-private-token" + end
-    connections = []
-
-    async def accept(reader, writer):
-        connections.append(writer)
-        await reader.read()
-        writer.close()
-
-    server = await asyncio.start_server(accept, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    settings = Settings(
-        _env_file=None,
-        google_health_base_url=f"http://127.0.0.1:{port}",
-        google_api_min_request_interval_seconds=0,
-        google_api_max_retries=3,
-    )
-    sleeps = []
-    async with server, httpx.AsyncClient() as http:
-        google = GoogleHealthClient(settings, Tokens(), http, sleep=lambda d: _record(sleeps, d))
-        with pytest.raises(GoogleHealthError) as caught:
-            await google.get_identity(access_token=token)
-        logging.getLogger("synthetic.backfill").exception("failed", exc_info=caught.value)
+    # Short path: macOS limits Unix socket paths to 104 bytes.
+    socket_dir = tempfile.mkdtemp(prefix="h11-", dir=tempfile.gettempdir())
+    socket_path = os.path.join(socket_dir, "s")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connections = 0
+    try:
+        listener.bind(socket_path)
+        listener.listen(8)
+        listener.setblocking(False)
+        settings = Settings(
+            _env_file=None,
+            google_health_base_url="http://healthos.invalid",
+            google_api_min_request_interval_seconds=0,
+            google_api_max_retries=3,
+        )
+        sleeps = []
+        transport = httpx.AsyncHTTPTransport(uds=socket_path)
+        async with httpx.AsyncClient(transport=transport) as http:
+            google = GoogleHealthClient(
+                settings, Tokens(), http, sleep=lambda d: _record(sleeps, d)
+            )
+            with pytest.raises(GoogleHealthError) as caught:
+                await google.get_identity(access_token=token)
+            logging.getLogger("synthetic.backfill").exception("failed", exc_info=caught.value)
+        while True:
+            try:
+                accepted, _ = listener.accept()
+            except BlockingIOError:
+                break
+            accepted.close()
+            connections += 1
+    finally:
+        listener.close()
+        shutil.rmtree(socket_dir, ignore_errors=True)
     assert str(caught.value) == "Google Health request was rejected before sending"
     assert caught.value.__cause__ is caught.value.__context__ is None
-    assert not is_transient(caught.value) and sleeps == [] and len(connections) <= 1
+    assert not is_transient(caught.value) and sleeps == [] and connections <= 1
     rendered = "".join(traceback.format_exception(caught.value)) + caplog.text
     assert "synthetic-private" not in rendered and "Illegal header" not in rendered
 
@@ -496,3 +550,52 @@ async def test_deeply_nested_json_is_invalid_json_not_a_crash(opening):
     assert error_summary(caught.value) == "GoogleHealthError (invalid_json)"
     assert caught.value.__cause__ is caught.value.__context__ is None
     assert not is_transient(caught.value) and len(calls) == 1
+
+
+@pytest.mark.parametrize("sql", [False, True])
+@pytest.mark.parametrize("status", [200, 201, 400, 503])
+async def test_archive_failure_is_private_and_preserves_outcome(
+    sessions, monkeypatch, caplog, sql, status
+):
+    # The app lifespan raises the root logger to INFO for the rest of the session, so
+    # capture every level explicitly: 503 also logs RETRYING, whatever ran before.
+    caplog.set_level(logging.DEBUG)
+    marker = "synthetic-private-archive"
+    error = ValueError(marker)
+    if sql:
+        error = OperationalError(marker, {"body": marker}, error)
+    error.__cause__ = RuntimeError(marker)
+    caller = asyncio.current_task()
+
+    async def fail_insert(*_):
+        if status == 201:
+            caller.cancel()
+            await asyncio.sleep(0)
+        raise error
+
+    google = archive_client(
+        lambda _: httpx.Response(status, json={"healthUserId": marker}), sessions
+    )
+    google.sleep = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr("app.services.responses.insert_responses", fail_insert)
+    async with google.http:
+        if status == 200:
+            assert await google.get_identity() == {"healthUserId": marker}
+        else:
+            expected = GoogleHealthError if status == 400 else asyncio.CancelledError
+            with pytest.raises(expected) as caught:
+                await google.get_identity()
+            assert type(caught.value) is expected
+    event = "RESPONSE_ARCHIVE_FAILED"
+    (record,) = [r for r in caplog.records if getattr(r, "event", None) == event]
+    assert record.levelno == logging.ERROR
+    assert record.count == 1 and record.error_type == type(error).__name__
+    chain = "OperationalError < RuntimeError" if sql else "ValueError < RuntimeError"
+    assert record.error_chain == chain and not hasattr(record, "sqlstate")
+    assert record.getMessage() == "Google Health responses could not be archived"
+    assert record.args == () and record.exc_info is record.exc_text is record.stack_info is None
+    # Privacy holds for every record, including the retry notice on 503.
+    for logged in caplog.records:
+        assert not any(isinstance(value, BaseException) for value in vars(logged).values())
+        assert marker not in repr(vars(logged)) + JsonFormatter().format(logged)
+    assert marker not in caplog.text

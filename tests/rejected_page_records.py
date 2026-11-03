@@ -15,8 +15,9 @@ from retrieval_records import END, START, Runner, point
 from sqlalchemy import select
 
 from app.core.timeutil import as_utc
-from app.google_health.client import GoogleHealthError
+from app.google_health.client import GoogleHealthError, UnstorablePaginationResponseError
 from app.google_health.data_types import REGISTRY
+from app.google_health.pagination import RepeatedPageTokenError
 from app.models.retrieval import RetrievalCheckpoint, RetrievalEvent, RetrievalReceipt
 from app.models.state import BackfillJob, JobStatus, RawHealthData, SyncState
 from app.services.storage import store_records
@@ -25,14 +26,29 @@ from app.sync.errors import error_summary, is_transient
 LANES = ["sync", "backfill"]
 KINDS = ["steps", "floors", "total-calories"]
 ENCODINGS = ["identity", "gzip", "deflate", "raw-deflate"]
+UNSTORABLE_TOKENS = [
+    json.loads('"private-marker HTTP 503 INVALID_PAGE_TOKEN' + escape + '"')
+    for escape in (r"\ud800", r"\udfff", r"\u0000")
+]
 
 
 async def rejected_page(
-    sessions, lane, first_page, status, token, location, caplog, kind="steps", rejection=None
+    sessions,
+    lane,
+    first_page,
+    status,
+    token,
+    location,
+    caplog,
+    kind="steps",
+    rejection=None,
+    repeated=None,
 ):
-    """Reject one page twice in a lane, then resume from the saved page and complete.
+    """Reject pages in a lane, then resume from the last accepted page and complete.
 
-    ``rejection`` is ``(raw, encoding, error_type)`` for a 200 body the client rejects.
+    ``rejection`` is ``(raw, encoding, error_type)`` for a body the client rejects.
+    A ``repeated`` continuation is not a rejected body: its records are stored once
+    (and deduplicated on the retry), while the checkpoint stays on the last page.
     """
     compression, token = (token[:2], token[2]) if isinstance(token, tuple) else (None, token)
     runner = Runner(sessions, lane, kind=kind)
@@ -47,10 +63,14 @@ async def rejected_page(
         await store_records(session, REGISTRY[kind], [old])
         session.add(SyncState(data_type=kind, last_successful_sync=START))
     key = "rollupDataPoints" if kind == "total-calories" else "dataPoints"
-    good = json.dumps({key: [first], "nextPageToken": "saved"}).encode()
+    cycle = repeated == "cycle"
+    attempts = 1 if cycle else 2
+    initial_token = "private-marker HTTP 503 INVALID_PAGE_TOKEN"
+    saved_token = initial_token + (" B" if cycle else "") if repeated else "saved"
+    good = json.dumps({key: [first], "nextPageToken": saved_token}).encode()
     payload = {
         key: [] if compression and token is None else [rejected],
-        "nextPageToken": None if status == 206 else token,
+        "nextPageToken": initial_token if repeated else (None if status == 206 else token),
     }
     bad = ("  " + json.dumps(payload) + "\n").encode()
     if status != 200:
@@ -60,12 +80,14 @@ async def rejected_page(
             else bad
         )
     prefix = [] if first_page else [(200, good)]
+    if cycle:
+        prefix.insert(0, (200, json.dumps({"nextPageToken": initial_token}).encode()))
     if rejection is not None:
         raw, encoding, error_type = rejection
         bad = compressed(raw, encoding)
     if compression:
         bad = compressed(bad, *compression)
-    exchanges = iter(prefix + [(503, b"retry"), (status, bad)] * 2 + [(200, b"{}")])
+    exchanges = iter(prefix + [(503, b"retry"), (status, bad)] * attempts + [(200, b"{}")])
     calls, streams = [], []
 
     def handler(request):
@@ -85,23 +107,29 @@ async def rejected_page(
 
     google = client(handler, sessions, google_api_max_retries=1)
     google.http.follow_redirects = True
-    saved = None if first_page else "saved"
+    saved = None if first_page else saved_token
     summary = f"GoogleHealthError (http_{status})"
     message = f"Google Health API returned HTTP {status}"
     if status == 200:
         summary = "InvalidPaginationResponseError (invalid_response)"
         message = "Google Health response has an invalid pagination token type"
+        if isinstance(token, str):
+            summary = error_summary(UnstorablePaginationResponseError())
+            message = "Google Health response has an unstorable pagination token"
     if compression:  # Bytes after the deflate stream: deterministic, never retried.
         summary = "GoogleHealthError (invalid_encoding)"
         message = "Google Health response has trailing bytes after its encoded content"
-    if rejection is not None:
+    if rejection is not None and status == 200:
         summary = error_summary(error_type())
         message = str(error_type())
+    if repeated:
+        summary, message = error_summary(RepeatedPageTokenError()), str(RepeatedPageTokenError())
     try:
-        for attempt in (1, 2):
-            with pytest.raises(GoogleHealthError) as caught:
+        for attempt in range(1, attempts + 1):
+            with pytest.raises(RepeatedPageTokenError if repeated else GoogleHealthError) as caught:
                 await runner.run(google)
             assert str(caught.value) == message
+            assert not is_transient(caught.value)
             assert caught.value.__cause__ is caught.value.__context__ is None
             async with sessions() as session:
                 state = await session.get(SyncState, kind)
@@ -117,32 +145,44 @@ async def rejected_page(
                 )
                 records = list(await session.scalars(select(RawHealthData)))
             assert as_utc(state.last_successful_sync) == START
-            assert job.status == JobStatus.failed and job.records_downloaded == int(not first_page)
+            downloaded = int(not first_page) + (attempt if repeated else 0)
+            assert job.status == JobStatus.failed and job.records_downloaded == downloaded
             assert job.last_error == summary
             assert (job.last_page_token if lane == "sync" else job.page_token) == saved
             if lane == "backfill":
                 assert job.completed_at is None and job.retry_count == attempt
-            assert [e.kind for e in events] == ["page"] * bool(prefix) + ["failed"] * attempt
+            assert [e.kind for e in events] == ["page"] * len(prefix) + ["failed"] * attempt
             assert not any(e.last_page for e in events)
+            # A stored cyclic page has no page event; its outcome reports what it returned.
+            failed = [e.returned_count for e in events if e.kind == "failed"]
+            assert failed == [int(bool(repeated))] * attempt
             if first_page:
                 assert checkpoint is None
             else:
-                assert checkpoint.event_id == events[0].id
-                assert checkpoint.next_token_hash == hashlib.sha256(b"saved").hexdigest()
+                assert checkpoint.event_id == events[len(prefix) - 1].id
+                assert (
+                    checkpoint.next_token_hash == hashlib.sha256(saved_token.encode()).hexdigest()
+                )
             assert len(receipts) == attempt and receipts[0].starts_first
             if attempt == 2:
                 assert receipts[1].starts_first == first_page
                 assert receipts[1].parent_event_id == (None if first_page else events[0].id)
-            assert {r.google_data_point_id for r in records} == {
-                r["name"] for r in ([old] if first_page else [old, first])
-            }
+            kept = [old] if first_page else [old, first]
+            kept += [rejected] if repeated else []
+            names = sorted(r.google_data_point_id for r in records)
+            assert names == sorted(r["name"] for r in kept)
+            if repeated:
+                (cyclic,) = [r for r in records if r.google_data_point_id == rejected["name"]]
+                assert cyclic.raw_json == rejected
             assert all(r.source_deleted_at is None for r in records)
-        assert calls == ([None] * 4 if first_page else [None] + ["saved"] * 4)
+        assert calls == ([None] if prefix else []) + ([initial_token] if cycle else []) + [
+            saved
+        ] * (2 * attempts)
         assert all(s.close_calls == 1 and s.closed.is_set() for s in streams)
         rows = await stored(sessions)
-        assert [r.body for r in rows] == [wire for _, wire in prefix] + [b"retry", bad] * 2
-        assert [r.status_code for r in rows] == [s for s, _ in prefix] + [503, status] * 2
-        assert [r.attempt for r in rows] == ([0] if prefix else []) + [0, 1] * 2
+        assert [r.body for r in rows] == [wire for _, wire in prefix] + [b"retry", bad] * attempts
+        assert [r.status_code for r in rows] == [s for s, _ in prefix] + [503, status] * attempts
+        assert [r.attempt for r in rows] == [0] * len(prefix) + [0, 1] * attempts
         assert all(r.complete and r.body_sha256 == hashlib.sha256(r.body).hexdigest() for r in rows)
         assert all(r.body_size == len(r.body) and r.data_type == kind for r in rows)
         assert all(

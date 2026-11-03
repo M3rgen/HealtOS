@@ -63,7 +63,7 @@ async function mock(page, problems) {
 
       // Select presets: mouse for Umay, keyboard (arrow within the radio group) for background.
       await openDialog();
-      await page.locator('#appearance-dialog label.preset-tile', { hasText: 'Umay · afiş' }).click();
+      await page.locator('#appearance-dialog label.preset-tile', { hasText: 'Afiş' }).click();
       await page.locator('input[name="appearance-background"]:checked').focus();
       await page.keyboard.press('ArrowRight');
       await page.locator('input[name="appearance-background"][value="fine-grain"]:checked').waitFor();

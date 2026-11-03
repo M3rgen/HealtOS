@@ -1,5 +1,6 @@
 """Page-budget pauses preserve the production archive and durable continuation chain."""
 
+import json
 import uuid
 
 import httpx
@@ -21,21 +22,22 @@ from app.sync.ownership import run_ownership
 
 @pytest.mark.parametrize("lane", ["sync", "backfill"])
 @pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("kind", ["steps", "floors", "total-calories"])
 async def test_repeated_pauses_resume_committed_pages_and_complete(
-    sessions, monkeypatch, lane, reset
+    sessions, monkeypatch, lane, reset, kind
 ):
     monkeypatch.setattr(pagination, "MAX_PAGES_PER_CALL", 2)
-    runner = Runner(sessions, lane, "steps")
-    missing = point(kind="steps")
+    runner = Runner(sessions, lane, kind)
+    missing = point(kind=kind)
     async with sessions.begin() as session:
-        await store_records(session, REGISTRY["steps"], [missing])
-        session.add(SyncState(data_type="steps", last_successful_sync=START))
+        await store_records(session, REGISTRY[kind], [missing])
+        session.add(SyncState(data_type=kind, last_successful_sync=START))
         if lane == "backfill":
             runner.job_id = uuid.uuid4()
             session.add(
                 BackfillJob(
                     id=runner.job_id,
-                    data_type="steps",
+                    data_type=kind,
                     window_start=START,
                     window_end=END,
                     retry_count=ABANDON_AFTER_RETRIES - 1,
@@ -47,16 +49,22 @@ async def test_repeated_pauses_resume_committed_pages_and_complete(
 
     def handler(request):
         nonlocal expired
-        token = request.url.params.get("pageToken")
+        params = json.loads(request.content) if request.method == "POST" else request.url.params
+        token = params.get("pageToken")
         tokens.append(token)
         if reset and token == "p1" and not expired:
             expired = True
             wire = b'{"error":{"message":"INVALID_PAGE_TOKEN"}}'
             code = 400
         else:
-            record = point(kind="steps")
+            record = point(kind=kind)
             records.append(record)
             wire = body(record, token=None if terminal else f"p{len(records)}")
+            wire = (
+                wire.replace(b'"dataPoints":', b'"rollupDataPoints":')
+                if kind == "total-calories"
+                else wire
+            )
             code = 200
         wires.append(wire)
         return httpx.Response(code, content=wire)
@@ -73,9 +81,9 @@ async def test_repeated_pauses_resume_committed_pages_and_complete(
             assert not any(e.kind in {"completed", "failed"} or e.last_page for e in events)
             assert (await status(sessions, runner))["retrieval"] == "incomplete"
             async with sessions() as session:
-                state = await session.get(SyncState, "steps")
+                state = await session.get(SyncState, kind)
                 job = state if lane == "sync" else await session.get(BackfillJob, runner.job_id)
-                owner = "steps" if lane == "sync" else str(runner.job_id)
+                owner = kind if lane == "sync" else str(runner.job_id)
                 fetch = await session.get(FetchRound, (lane, owner))
                 first_start = first_start or fetch.started_at
                 assert fetch.started_at == first_start
@@ -93,7 +101,7 @@ async def test_repeated_pauses_resume_committed_pages_and_complete(
                 else:
                     assert (as_utc(job.window_start), as_utc(job.window_end)) == (START, END)
                     assert job.retry_count == ABANDON_AFTER_RETRIES - 1 and job.completed_at is None
-            async with run_ownership(sessions, "steps", wait=False) as acquired:
+            async with run_ownership(sessions, kind, wait=False) as acquired:
                 assert acquired is not None
             assert [r.body for r in await stored(sessions)] == wires
         terminal = True
@@ -107,7 +115,7 @@ async def test_repeated_pauses_resume_committed_pages_and_complete(
         raw = list(await session.scalars(select(RawHealthData)))
         assert {r.google_data_point_id for r in raw} == {r["name"] for r in [missing, *records]}
         assert all(r.source_deleted_at is None for r in raw)
-        state = await session.get(SyncState, "steps")
+        state = await session.get(SyncState, kind)
         job = state if lane == "sync" else await session.get(BackfillJob, runner.job_id)
         assert job.status == JobStatus.completed
         assert (job.last_page_token if lane == "sync" else job.page_token) is None

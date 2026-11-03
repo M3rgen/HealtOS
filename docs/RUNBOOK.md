@@ -846,6 +846,14 @@ after ten more attempts.
 
 If Google simply has no accessible data for that range, leaving the window abandoned is harmless.
 
+### Re-fetching a period whose windows are already completed
+
+A plain `health-mirror backfill` never re-reads a range whose windows are `completed`; it only
+plans before the first and after the last window. To fetch such a period again with retrieval
+receipts, add new `pending` windows for it and run `backfill --data-type`. A one-off backfill of a
+past period (prerequisites, window SQL, monitoring, stop/resume, verification) follows a separate
+maintainer runbook that is not part of the published tree.
+
 ## Kapsama ve çekim fişleri — 20261025_0015
 
 Önce `alembic upgrade head` çalıştırılır. Migration `retrieval_receipts`, `retrieval_events`
@@ -862,6 +870,12 @@ Aynı tokenla eski fiş tahmin edilmez. Geri alınan sayfanın dönüş sayısı
 olayı eklenir; fiş güncellenmez. Devam, kaydedilmiş sayfanın token özetine bağlanır; eski
 fişsiz token son sayfaya ulaşsa bile eksiksizlik kanıtlamaz. Token sıfırlanınca ayrı bir ilk
 sayfa denemesi açılır. Hata, iptal veya süreç kesintisi yarım denemeyi başarıya dönüştürmez.
+Google aynı denemede daha önce verdiği bir `nextPageToken`'ı tekrar verirse (döngüsel sayfa),
+o sayfanın kayıtları ve yanıtları normal sayfa gibi saklanır, ama sayfa olayı yazılmaz,
+checkpoint ve `last_successful_sync` ilerlemez; çekim `RepeatedPageTokenError
+(repeated_page_token)` ile başarısız olur ve dönüş sayısı hata olayında kalır. Sonraki çekim
+aynı tokendan devam eder; tekrar gelen kayıtlar yinelenmez. Google düzelince zincir son
+sayfaya ulaşıp günü kanıtlayabilir.
 
 Sistem → Kapsama → Ayrıntıları aç üzerinden dönem ve veri türü seçilir. Uzun içerik pencere
 içinde kayar. `GET /api/sync/coverage` mevcut oturum/bearer kimlik doğrulamasını kullanır:
@@ -879,18 +893,25 @@ sayar. Yanıt başına 12 KiB; en çok 2000 fiş, 5000 olay üstverisi, dönemle
 `has_value` mevcut uygunluk/dışlama kurallarını kullanır; kaynaklar ayrı satırlarda kalır.
 `presence_basis=eligible_record` olan türlerde bu, dışlanmamış kayıt varlığıdır; skalerin
 veya ölçüm sıklığının doğruluğunu kanıtlamaz. `retrieval` bundan bağımsızdır:
-`completed_with_records`, `completed_empty`, `incomplete`, `unknown`. Dönen kayıtlar dışlanan
+`completed_with_records`, `completed_empty`, `incomplete`, `not_attempted`, `unknown`. Dönen kayıtlar dışlanan
 kayıtları da içerir; eklenen/güncellenen satır sayısı değildir. `returned_records` günün
 kanıtlanmış dönüş gözlemlerini sayar (yeniden çekimler dahil); gün belirlenemiyorsa null.
-Pencere toplamı günlere dağıtılmaz. Fişsiz geçmişe “hiç çekilmedi” denmez.
+Pencere toplamı günlere dağıtılmaz. Fişsiz geçmişe “hiç çekilmedi” denmez: `not_attempted`
+yalnız hiçbir denemenin dokunmadığı ve (civil saat farkı payı dahil) ilk fişten
+(`receipts_since`) sonra başlayan kapalı gündür; o andan beri her Google okuması fiş bırakır.
+Daha eski fişsiz gün `unknown` kalır.
 
 Günlük filtreler civil tarihe, uyku bitiş zamanına, diğer oturumlar civil başlangıç için
 saat farkı sınırlarına göre değerlendirilir. Fiziksel günler seçilen saat diliminde 23/25
 saat olabilir; saniye hassasiyeti ve rollup dakika hizalaması korunur. Bugün kapalı gün
 sayılmaz; kanıt ufku ilk sayfa denemesinin başlangıcıdır. Gece yarısını geçen veya sonraki
 gün devam eden sorgu, ilk sayfa başlarken gelecekte olan günü tamamlanmış göstermez. Zaman filtresi
-olmayan kataloglarda günlük değer/çekim kanıtı yoktur (`no_time_filter`). Umay'ın şema 1
-kapsama kartı ve 12 KiB sınırı aynı kalır; bu HTTP raporuyla birleştirilmez.
+olmayan kataloglarda günlük değer/çekim kanıtı yoktur (`no_time_filter`). Umay'ın kapsama
+kartı (şema 2, 12 KiB) aynı fiş okuyucusunu kullanır: her metrikte kapalı günleri çekim
+durumuna göre sayar ve değersiz günleri `without_value` altında `empty_response`,
+`returned_without_value`, `not_retrieved`, `incomplete`, `unknown` diye ayırır; tek metrik
+istenince ardışık boşluk dönemlerini (`gaps`, en çok 31) listeler. Fiş bütçesini aşan dönem
+küçük parçalarla okunur; tek gün yine aşarsa `unknown` ve `retrieval_evidence_limit` olur.
 
 ## Uzlaştırma fark geçmişi — 20261025_0016
 
@@ -992,3 +1013,45 @@ aynı `element_hash`'i alabilir (`1e400`, `2e999` ve `Infinity` hepsi inf olur).
 her öğenin baytı kendi batch'inin `raw_body`'sinde ve `webhook_batch_items` sırasındadır, öğe
 de zaten reddedilir. `raw_json` NULL satır varken `alembic downgrade 20261025_0020` hiçbir şeyi
 değiştirmeden reddedilir.
+
+## jsonb'nin tutamadığı Google kayıtları — 20261102_0023
+
+Webhook gövdelerindeki sorunun (0021) eşitleme yanı: Google'ın döndürdüğü tek bir kayıt jsonb'nin
+tutamayacağı bir değer taşıyorsa (`\u0000`, eşsiz vekil, `NaN`/`Infinity`/`1e400`) sayfa her
+denemede geri alınıyor, o veri türü hiç ilerlemiyordu. Artık böyle kayıt sayfa saklanmadan önce,
+aynı transaction içinde `raw_health_data_rejections` tablosuna ayrılır; sayfanın geri kalanı
+saklanır, sonraki sayfa istenir, tür ilerler. Hiçbir değer temizlenmez ya da değiştirilmez,
+arşivdeki hiçbir satır ezilmez. Google'ın gönderdiği baytlar her zamanki gibi sayfanın
+`raw_api_responses` satırındadır (her alışverişe bir satır; yanıt tekilleştirmesi yoktur);
+reddetme satırı ona `response_id` ve `ordinal` (sayfadaki sıra) ile bağlanır, ayrıca kaydın
+ayrıştırılmış kopyasını ASCII kaçışlarıyla `element_json` içinde tutar.
+
+Migration yalnız üç yeni tablo, indeksleri ve koruma tetikleyicilerini ekler; mevcut bir tabloya
+ALTER ya da yabancı anahtar yoktur, bu yüzden mevcut tablolarda kilit almaz ve gece yedeği
+(`pg_dump`) sırasında da çalışır. Üç tablo da yalnız-eklemedir (UPDATE/DELETE/TRUNCATE reddedilir;
+`health-mirror verify` denetler). Tablolardan birinde satır varken `alembic downgrade 20261102_0022`
+hiçbir şeyi değiştirmeden reddedilir.
+
+Reddetme olan bir tur kaynakta silinme işaretlemez (reddedilen kayıt arşivdeki bir kaydın yeni
+hali olabilir; tur onu gösteremez). İşaretleme reddetmesiz ilk tura kalır; kayıt Google'da
+düzelince ya da pencereden çıkınca bu kendiliğinden olur. Çekim fişinde reddedilen kayıt
+`returned_count` ve `returned_times` içinde kalır (Google onu döndürdü; kapsama o günü boş saymaz),
+`unplaced_count`'a eklenmez; sayısı `retrieval_event_rejections` içinde ayrıdır.
+
+`/health` onaylanmamış reddedilen kayıt varken `degraded` ve `rejected_google_records` gösterir,
+`rejected_records` onaylanmamış farklı kayıt sayısıdır. Bakım:
+
+```sh
+docker compose exec app health-mirror rejections                 # son 20 kayıt, yalnız üst veri (JSON)
+docker compose exec -T app health-mirror rejections --element 7 > kayit.json   # 7 numaralı kaydın kendisi
+docker compose exec -T app health-mirror export-response <response_id> > page.json   # geldiği yanıt, bayt bayt
+docker compose exec app health-mirror rejections --ack 7         # 7'ye kadar (dahil) bakıldı
+```
+
+Onay `raw_rejection_acks` tablosuna eklenir (o da yalnız-ekleme), geri alınmaz ve yalnız ileri
+gider: daha küçük bir numara bir şey yazmaz. Onaydan sonra aynı kayıt (aynı veri türü ve
+`element_sha256`) yeniden reddedilirse sağlık yeşil kalır; yeni bir kayıt reddedilince yine
+`degraded` olur. Onay kayıtları arşivden çıkarmaz ya da arşive almaz: reddedilen kayıt
+`raw_health_data`'ya girmez, panel ve Umay onu görmez. Kaydı kurtarmak için kaynağı
+`export-response` ile alın; değerin nasıl temsil edileceği (ör. jsonb dışı bir sütun) ayrı bir
+bakımcı kararıdır.

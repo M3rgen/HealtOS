@@ -94,10 +94,14 @@ def receipts(socket):
 
 async def tool(chat, bridge, arguments):
     await chat.on_server_request(
-        {"id": "private-rpc-id"},
+        {"id": f"private-rpc-id-{len(chat.tools.seen)}"},
         "item/tool/call",
         {"threadId": chat.thread_id, "tool": "health_archive", "arguments": arguments},
     )
+    tasks = tuple(chat.tools.tasks)
+    await asyncio.gather(*tasks, return_exceptions=True)
+    for task in tasks:
+        await chat.on_tool_result(task)
     reply = bridge.sent[-1]["result"]
     return json.loads(reply["contentItems"][0]["text"]), reply["success"]
 
@@ -161,7 +165,7 @@ async def test_inventory_and_coverage_counts_describe_metadata_not_the_archive(
     assert call["metadata_dates"] == {"first": str(DAY), "last": str(DAY)}
     card, _ = await tool(chat, bridge, {"action": "coverage", **QUERY, "data_type": "steps"})
     assert card == actual_reads[-1]
-    assert card["schema_version"] == "1" and card["metrics"][0]["sampling"]["sample_count"] == 3
+    assert card["schema_version"] == "2" and card["metrics"][0]["sampling"]["sample_count"] == 3
     call = receipts(socket)[-1]["calls"][-1]
     assert call["counts"]["metadata_items"] == 1 and call["counts"]["raw_records"] == 0
     assert call["data_dates"] is None

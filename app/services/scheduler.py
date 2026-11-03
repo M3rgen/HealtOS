@@ -3,13 +3,13 @@ from __future__ import annotations
 import logging
 
 from apscheduler.events import EVENT_JOB_MISSED, JobExecutionEvent
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.config import Settings
 from app.core.logging import event
 from app.services.derived import DerivedRefresh
 from app.services.identity_reconciler import IdentityReconciler
 from app.services.pipeline_health import PipelineHealthService
+from app.services.scheduler_shutdown import AppScheduler
 from app.services.watchdog import PipelineWatchdog
 from app.sync.reconciliation import ReconciliationService
 
@@ -36,8 +36,8 @@ def build_scheduler(
     pipeline_health: PipelineHealthService | None = None,
     identity: IdentityReconciler | None = None,
     derived: DerivedRefresh | None = None,
-) -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone="UTC")
+) -> AppScheduler:
+    scheduler = AppScheduler(timezone="UTC")
     scheduler.add_listener(log_missed_job, EVENT_JOB_MISSED)
     if settings.reconciliation_enabled:
         scheduler.add_job(

@@ -18,6 +18,7 @@ from app.models.state import (
     WebhookEvent,
     WebhookNotification,
 )
+from app.services.raw_rejections import summary as rejection_summary
 
 
 class PipelineStatus(StrEnum):
@@ -45,6 +46,8 @@ class PipelineSnapshot:
     reasons: tuple[str, ...] = ()
     oldest_frequent_sync: datetime | None = None
     data_freshness_checked_at: datetime | None = None
+    # Distinct rejected Google records not yet acknowledged (health-mirror rejections).
+    rejected_records: int = 0
 
     def as_dict(
         self,
@@ -69,6 +72,7 @@ class PipelineSnapshot:
             "pending_notifications": self.pending_notifications,
             "failed_notifications": self.failed_notifications,
             "failed_syncs": self.failed_syncs,
+            "rejected_records": self.rejected_records,
             "stale_streams": list(self.stale_streams),
             "reasons": list(self.reasons),
             "data_freshness": {
@@ -95,10 +99,11 @@ def effective_time_expression():
 class PipelineHealthService:
     """Derive pipeline health exclusively from persisted local state.
 
-    Small state tables (sync_state, webhook tables, reliability_state) are read on every
-    call. The raw_health_data freshness summary is the only part that touches the large
-    table; it is cached and recomputed at most once per refresh interval (hourly by
-    default, plus an hourly scheduler job), so frequent /health polling never scans it.
+    Small state tables (sync_state, webhook tables, reliability_state, rejected Google
+    records and their acknowledgement) are read on every call. The raw_health_data
+    freshness summary is the only part that touches the large table; it is cached and
+    recomputed at most once per refresh interval (hourly by default, plus an hourly
+    scheduler job), so frequent /health polling never scans it.
     """
 
     def __init__(
@@ -217,6 +222,7 @@ class PipelineHealthService:
         ).all()
         freshness = await self._freshness_summary(session, now)
         reliability = await session.get(ReliabilityState, 1)
+        rejected_records = (await rejection_summary(session))["unacknowledged"]
 
         sync_by_type = {name: as_utc(value) for name, value in sync_rows}
         stale_after = timedelta(minutes=self.settings.pipeline_stale_threshold_minutes)
@@ -264,6 +270,11 @@ class PipelineHealthService:
             if status == PipelineStatus.healthy:
                 status = PipelineStatus.degraded
             reasons.append("scheduler_not_running")
+        if rejected_records:
+            # Sync goes on; a maintainer acknowledges what was set apart.
+            if status == PipelineStatus.healthy:
+                status = PipelineStatus.degraded
+            reasons.append("rejected_google_records")
 
         return PipelineSnapshot(
             status=status,
@@ -284,6 +295,7 @@ class PipelineHealthService:
             reasons=tuple(reasons),
             oldest_frequent_sync=oldest_frequent_sync,
             data_freshness_checked_at=freshness.checked_at,
+            rejected_records=rejected_records,
         )
 
 

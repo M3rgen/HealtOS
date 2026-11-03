@@ -216,7 +216,7 @@ def test_scope_matches_daily_seconds_rollup_sleep_civil_and_unbounded():
     end = datetime(2026, 9, 1, 1, 0, 30, 999, UTC)
     assert query_scope(REGISTRY["heart-rate"], start, end)[:2] == (
         start.replace(microsecond=0),
-        end.replace(microsecond=0),
+        end.replace(second=31, microsecond=0),
     )
     assert query_scope(REGISTRY["daily-resting-heart-rate"], start, end)[:2] == (START, END)
     lower, upper, _, basis = query_scope(REGISTRY["total-calories"], start, end)
@@ -328,7 +328,7 @@ async def test_repeated_token_does_not_create_completion(sessions, runner):
     with pytest.raises(RuntimeError, match="repeated"):
         await runner.run(Client(Page([], "repeat"), Page([], "repeat")))
     _, events = await rows(sessions)
-    assert [e.kind for e in events] == ["page", "page", "failed"]
+    assert [e.kind for e in events] == ["page", "failed"]
     assert (await status(sessions, runner))["retrieval"] == "incomplete"
 
 
@@ -341,11 +341,11 @@ async def test_verifier_checks_new_sqlite_triggers(sessions):
         ]
 
 
-async def test_resume_after_repeated_token_still_cannot_prove_completeness(sessions, runner):
+async def test_resume_after_repeated_token_can_complete_the_valid_chain(sessions, runner):
     with pytest.raises(RuntimeError, match="repeated"):
         await runner.run(Client(Page([], "repeat"), Page([], "repeat")))
     await runner.run(Client(Page([], None)))
-    assert (await status(sessions, runner))["retrieval"] == "incomplete"
+    assert (await status(sessions, runner))["retrieval"] == "completed_empty"
 
 
 async def test_webhook_processing_uses_the_production_receipt_writer(sessions):

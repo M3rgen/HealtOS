@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -16,7 +15,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.core.logging import event
+from app.core.logging import error_diagnostics, event
 from app.core.provenance import provenance
 from app.core.timeutil import as_utc
 from app.models.state import (
@@ -29,6 +28,8 @@ from app.models.state import (
 )
 from app.parsers.common import canonical_json
 from app.services.webhook_metadata import (
+    UNPARSEABLE,
+    UNPARSED_BODY,
     UNREPRESENTABLE,
     NotificationWindowError,
     extract_notification,
@@ -36,8 +37,10 @@ from app.services.webhook_metadata import (
     jsonb_storable,
     notification_data,
     notification_windows,
+    parse_webhook_body,
 )
 from app.services.webhook_status import WebhookStatusService
+from app.sync.errors import error_code, error_summary
 from app.sync.incremental import IncrementalSync, stale_running_cutoff
 from app.sync.ownership import NOTIFICATION_NAMESPACE, OwnershipLost, run_ownership
 
@@ -111,8 +114,8 @@ class WebhookBatchProcessor:
                 raise ValueError(f"Unknown webhook batch: {batch_hash}")
             payload = stored.raw_json
             if payload is None and stored.raw_body is not None:
-                # jsonb could not hold this body (or it is JSON null): read the signed bytes.
-                payload = json.loads(stored.raw_body)
+                # A body-only archive may also exceed the parser's limits.
+                payload = parse_webhook_body(stored.raw_body)
         return await self._prepare_batch(
             batch_hash,
             payload,
@@ -182,14 +185,21 @@ class WebhookBatchProcessor:
                     select(OAuthToken.health_user_id).where(OAuthToken.subject == "me")
                 )
                 for ordinal, item in enumerate(elements, start=1):
-                    element_digest = _element_hash(item)
+                    # Without parsed boundaries the whole body is one rejected item.
+                    # Domain separation avoids colliding with a canonical JSON hash;
+                    # different raw bodies must never collapse onto a shared sentinel.
+                    element_digest = (
+                        hashlib.sha256(f"unparsed:{batch_hash}".encode()).hexdigest()
+                        if item is UNPARSED_BODY
+                        else _element_hash(item)
+                    )
                     storable = jsonb_storable(item)
                     # An element jsonb cannot hold keeps nothing derived; its bytes stay
                     # in the batch raw_body at this ordinal.
                     extracted, validation_error = (
                         extract_notification(item, expected_user_id, self.supported_data_types)
                         if storable
-                        else ({}, UNREPRESENTABLE)
+                        else ({}, UNPARSEABLE if item is UNPARSED_BODY else UNREPRESENTABLE)
                     )
                     if validation_error is None:
                         try:
@@ -382,19 +392,39 @@ class WebhookBatchProcessor:
                     self.status.observe(session, "notification_rejected")
             result = "rejected"
         except Exception as exc:
-            async with sessions.begin() as session:
-                notification = await session.get(WebhookNotification, element_hash)
-                notification.status = "failed"
-                notification.last_error = str(exc)[:2000]
-                if self.status:
-                    self.status.observe(session, "processing_failed")
-            logger.exception(
-                "Webhook notification processing failed",
-                extra={"event": "WEBHOOK_ELEMENT_FAILED", "data_type": data_type},
-            )
+            await self._record_element_failure(element_hash, data_type, exc, sessions)
             result = "failed"
         await self._finalize_related_batches(element_hash, sessions)
         return result
+
+    async def _record_element_failure(
+        self, element_hash: str, data_type: str, exc: Exception, sessions
+    ) -> None:
+        """Keep only safe diagnostics at the processing boundary.
+
+        Database exceptions can embed raw records in their SQL parameters. Batch
+        finalization copies this summary, so truncating exception text is not enough.
+        Signed bodies and Google responses remain untouched in their raw archives.
+        """
+        summary = error_summary(exc)
+        async with sessions.begin() as session:
+            notification = await session.get(WebhookNotification, element_hash)
+            notification.status = "failed"
+            notification.last_error = summary
+            if self.status:
+                self.status.observe(session, "processing_failed")
+        # Never attach the exception, its traceback or its cause/context to the record;
+        # formatting and downstream handlers must receive only these safe fields.
+        logger.error(
+            "Webhook notification processing failed",
+            extra={
+                "event": "WEBHOOK_ELEMENT_FAILED",
+                "data_type": data_type,
+                "error_type": type(exc).__name__,
+                "error_code": error_code(exc),
+                **error_diagnostics(exc),
+            },
+        )
 
     async def _run_incremental(
         self,

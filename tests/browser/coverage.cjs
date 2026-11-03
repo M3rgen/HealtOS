@@ -14,7 +14,7 @@ const sizes = [{width:1440,height:900}, {width:1280,height:720},
   {width:390,height:844}, {width:320,height:700}];
 const names = ['heart-rate', 'sleep', 'steps', 'weight', 'exercise'];
 const days = Array.from({length:31}, (_, i) => ({date:`2026-10-${String(i + 1).padStart(2,'0')}`,
-  closed:true, has_value:i%3 === 0, retrieval:['completed_with_records','completed_empty','unknown','incomplete'][i%4],
+  closed:true, has_value:i%3 === 0, retrieval:['completed_with_records','completed_empty','unknown','incomplete','not_attempted'][i%5],
   returned_records:i%4===0?2:i%4===1?0:null, reason:null}));
 
 run(async () => {
@@ -42,7 +42,7 @@ run(async () => {
         return route.fulfill({json:{supported_data_types:names,
           types:selected.map(name=>({data_type:name,presence_basis:'metric_value',days:requestedDays,
             source_regimes:[{source:'kaynak-örnek',value_days:10,record_count:20}],exclusions:{quarantined:1}})),
-          summary:{days_without_value:20*selected.length,unknown_days:8*selected.length,incomplete_days:7*selected.length},
+          summary:{days_without_value:20*selected.length,unknown_days:8*selected.length,incomplete_days:7*selected.length,not_attempted_days:5*selected.length},
           next_offset:!query.get('data_type')&&offset+limit<names.length?offset+limit:null}});
       });
       await page.goto(BASE);
@@ -67,6 +67,8 @@ run(async () => {
       assert.match(await page.locator('#coverage-results').textContent(),/Değer yok/);
       assert.match(await page.locator('#coverage-results').textContent(),/Google boş döndü/);
       assert.match(await page.locator('#coverage-results').textContent(),/Çekimin tamamlandığı bilinmiyor/);
+      assert.match(await page.locator('#coverage-results').textContent(),/Hiç çekilmedi/);
+      assert.match(await page.locator('#coverage-summary').textContent(),/hiç çekilmemiş/);
       await page.locator('.coverage-dialog-body').focus();
       await page.keyboard.press('End');
       await page.locator('.coverage-days li').last().scrollIntoViewIfNeeded();

@@ -193,7 +193,7 @@ def test_schema_root_and_existing_actions_are_kept():
 
 async def test_empty_archive_has_no_values_and_unknown_retrieval(archive):
     card = await read_health(query("2026-09-01", "2026-09-07"))
-    assert card["schema_version"] == "1"
+    assert card["schema_version"] == "2"
     assert (card["requested_days"], card["closed_days"]) == (7, 7)
     assert "retrieval_receipts_unavailable" in card["reason_codes"]
     assert "today_partial_excluded" not in card["reason_codes"]
@@ -445,18 +445,26 @@ COVERAGE_PARAGRAPH = (
     'karşılaştırılabilirlik bilgisini denetle. "Kayıt var"ı "gün eksiksiz" sayma; eksik,\n'
     "geç gelen, dışlanmış veya ölçüm yöntemi değişmiş veriyi ayır.\n"
 )
-# sha256 of INSTRUCTIONS before the coverage paragraph (with the sleep_assumptions sentence of
-# the sleep total change): earlier sentences stay unchanged around the interpretation protocol.
-PREVIOUS_INSTRUCTIONS_SHA256 = "7634cb82daad143557f7dba44e0467988e47e164a7716f867800709ce22a382b"
+# SHA256 of the complete health rules before issue 239, from "Sağlık sorularında" onwards.
+# Pin coverage, the interpretation protocol and tool authority independently of voice/followups.
+HEALTH_INSTRUCTIONS_SHA256 = "2e23d054c31bc1ebc19af2a7bd005971520c9b8fdf6e7ba91ebf55c79cec872c"
 
 
-def test_instructions_add_the_coverage_paragraph_and_keep_the_rest():
-    assert COVERAGE_PARAGRAPH in codex_chat.INSTRUCTIONS
-    previous = codex_chat.INSTRUCTIONS.replace(COVERAGE_PARAGRAPH, "", 1)
-    # Issue 46 inserts the health protocol; the pre-existing text remains pinned.
-    before, protocol = previous.split("Sağlık yorum protokolü:\n", 1)
-    previous = before + "Karşılaştırmalarda" + protocol.split("Karşılaştırmalarda", 1)[1]
-    assert hashlib.sha256(previous.encode()).hexdigest() == PREVIOUS_INSTRUCTIONS_SHA256
+def test_instruction_sections_preserve_all_health_rules():
+    health = codex_chat.HEALTH_INSTRUCTIONS
+    heading, rules = health.split("\n", 1)
+    assert heading == "Sağlık kanıtı, yorum ve araç yetkileri:"
+    assert COVERAGE_PARAGRAPH in rules
+    assert hashlib.sha256(rules.encode()).hexdigest() == HEALTH_INSTRUCTIONS_SHA256
+    # The pinned rules must still reach the model exactly once, after the voice/context sections.
+    instructions = codex_chat.INSTRUCTIONS
+    assert instructions.count(health) == 1
+    assert instructions.endswith(health)
+    assert (
+        instructions.index(codex_chat.IDENTITY_INSTRUCTIONS)
+        < instructions.index(codex_chat.FOLLOWUP_INSTRUCTIONS)
+        < instructions.index(health)
+    )
 
 
 async def test_relay_answers_a_coverage_call_end_to_end(archive):
@@ -483,7 +491,7 @@ async def test_relay_answers_a_coverage_call_end_to_end(archive):
         assert reply["id"] == "tool-1"
         assert reply["result"]["success"] is True
         card = json.loads(reply["result"]["contentItems"][0]["text"])
-        assert card["schema_version"] == "1"
+        assert card["schema_version"] == "2"
         assert coverage_of(card, "steps")["value_days"] == 1
         assert coverage_of(card, "steps")["days_without_value"] == 1
     finally:

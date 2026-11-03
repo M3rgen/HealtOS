@@ -56,6 +56,7 @@ def test_legacy_model_exports_are_the_same_objects(module, names):
         "identity_queries",
         "identity_guards",
         "raw_versions",
+        "raw_rejections",
         "manual_flags",
         "retrieval",
         "webhook_status",
@@ -74,7 +75,7 @@ def test_cold_imports_register_models_and_guards_once_in_archive_order(first):
         from app.db.base import Base
         from app.models import identity, identity_constants, identity_guards, identity_tables
         from app.models import derived_invalidation, manual_flags, raw_versions, retrieval
-        from app.models import webhook_status
+        from app.models import raw_rejections, webhook_status
 
         assert 'app.services.identity' not in sys.modules
         assert 'app.services.raw_history' not in sys.modules
@@ -82,8 +83,8 @@ def test_cold_imports_register_models_and_guards_once_in_archive_order(first):
         mappers = set(Base.registry.mappers)
         tables = dict(Base.metadata.tables)
         for name in ('identity_queries', 'identity_tables', 'identity_constants',
-                     'identity_guards', 'raw_versions', 'manual_flags', 'retrieval',
-                     'webhook_status', 'identity'):
+                     'identity_guards', 'raw_versions', 'raw_rejections', 'manual_flags',
+                     'retrieval', 'webhook_status', 'identity'):
             importlib.import_module('app.models.' + name)
         importlib.reload(identity)
         assert tuple(Base.metadata.dispatch.after_create) == listeners
@@ -113,6 +114,7 @@ def test_cold_imports_register_models_and_guards_once_in_archive_order(first):
                 *getattr(raw_versions, ddl),
                 *getattr(identity_guards, ddl),
                 *getattr(manual_flags, ddl),
+                *getattr(raw_rejections, ddl),
                 *getattr(retrieval, ddl),
                 *getattr(webhook_status, ddl),
                 *getattr(derived_invalidation, ddl),
@@ -133,6 +135,7 @@ def test_cold_imports_register_models_and_guards_once_in_archive_order(first):
             raw_versions.SQLITE_TRIGGER_SQL
             | identity_guards.SQLITE_TRIGGER_SQL
             | manual_flags.SQLITE_TRIGGER_SQL
+            | raw_rejections.SQLITE_TRIGGER_SQL
             | retrieval.SQLITE_TRIGGER_SQL
             | webhook_status.SQLITE_TRIGGER_SQL
             | derived_invalidation.SQLITE_TRIGGER_SQL

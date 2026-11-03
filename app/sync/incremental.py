@@ -95,6 +95,7 @@ class IncrementalSync:
             "sequence": self.sequence,
             "inserted": stats.inserted,
             "updated": stats.updated,
+            "rejected": stats.rejected,
             "failed": failed,
         }
 
@@ -302,8 +303,12 @@ class IncrementalSync:
         sessions,
         budget,
     ) -> None:
+        # Records of this round set apart as unstorable (app/services/raw_rejections.py).
+        rejected = 0
+
         async def restart() -> None:
-            nonlocal round_started, fetched_since
+            nonlocal round_started, fetched_since, rejected
+            rejected = 0
             round_started = await receipt.reset()
             # Even a saved-token continuation now fetches the entire window. Only
             # sightings since this new attempt can prevent source-deletion marks.
@@ -316,16 +321,18 @@ class IncrementalSync:
                 async with sessions.begin() as session:
                     page_stats = await store_page(session, spec, page, fetch_started=round_started)
                     state = await session.get(SyncState, data_type)
-                    state.last_page_token = page.next_page_token
+                    if not page.cyclic:  # A repeated token is never a resume point.
+                        state.last_page_token = page.next_page_token
                     state.records_downloaded += len(page.data_points)
                     # Heartbeat per page; run ownership also protects slow network waits.
                     state.updated_at = datetime.now(UTC)
                     await receipt.page(session, page)
                     await record_changes(session, data_type, page_stats, page=True)
                 total.add(page_stats)
+                rejected += page_stats.rejected
                 receipt.committed(page)
             except BaseException as failure:
-                receipt.unstored = page
+                receipt.received = page
                 # The page's records rolled back; what Google sent is still kept, also when
                 # the task was cancelled (restart, deploy) between fetching and storing.
                 await self.client.keep_after(page.responses, failure)
@@ -340,7 +347,10 @@ class IncrementalSync:
             )
             state.last_page_token = None
             deleted = 0
-            if fetched_since is not None:
+            # A rejected record may be an archived one, sent again: it was returned, but
+            # this round cannot show it. The round still advances; marking waits for a
+            # round without rejections (a record missing meanwhile is marked then).
+            if fetched_since is not None and not rejected:
                 deleted = await mark_source_deletions(session, spec, start, end, fetched_since)
             await record_changes(session, data_type, StoreStats(source_deleted=deleted))
             receipt.event(session, "completed")

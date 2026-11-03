@@ -175,6 +175,7 @@ async def test_incremental_run_reports_per_run_outcome(sessions):
         "sequence": 1,
         "inserted": 1,
         "updated": 0,
+        "rejected": 0,
         "failed": False,
     }
     await service.run("heart-rate")
@@ -182,6 +183,7 @@ async def test_incremental_run_reports_per_run_outcome(sessions):
         "sequence": 2,
         "inserted": 0,
         "updated": 0,
+        "rejected": 0,
         "failed": False,
     }
 
@@ -196,6 +198,7 @@ async def test_incremental_run_reports_per_run_outcome(sessions):
         "sequence": 3,
         "inserted": 0,
         "updated": 0,
+        "rejected": 0,
         "failed": True,
     }
     async with sessions() as session:
